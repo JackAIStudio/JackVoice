@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>JackVoice 需要麦克风权限来完成语音听写。录音会发送至你配置的云端识别服务，并按你选择的期限保存在本机。</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>JackVoice 需要辅助功能权限，才能在听写结束后自动粘贴文本。</string>
+  </dict>
+</plist>

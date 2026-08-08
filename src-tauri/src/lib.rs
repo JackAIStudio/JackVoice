@@ -1,0 +1,467 @@
+pub mod asr;
+mod audio;
+mod credentials;
+mod delivery;
+mod history;
+mod hotwords;
+mod onboarding;
+mod overlay;
+mod normalize;
+mod session;
+mod settings;
+mod storage;
+mod volc_hotword_api;
+
+use audio::InputDeviceInfo;
+use delivery::DeliveryResult;
+use session::{AppState, SaveHotwordsResult, UiState};
+use hotwords::ReplacementRule;
+use tauri::{AppHandle, Manager};
+use tauri_plugin_global_shortcut::{
+    Builder as ShortcutBuilder, GlobalShortcutExt, Shortcut, ShortcutState,
+};
+use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_opener::OpenerExt;
+
+#[tauri::command]
+fn get_state(state: tauri::State<'_, AppState>) -> UiState {
+    state.snapshot()
+}
+
+#[tauri::command]
+fn get_history(state: tauri::State<'_, AppState>) -> history::HistoryData {
+    history::load(&state.data_dir())
+}
+
+#[tauri::command]
+fn delete_history_record(
+    record_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<history::HistoryData, String> {
+    history::delete_record(&state.data_dir(), record_id.trim())?;
+    Ok(history::load(&state.data_dir()))
+}
+
+#[tauri::command]
+fn clear_history(state: tauri::State<'_, AppState>) -> Result<history::HistoryData, String> {
+    history::clear(&state.data_dir())?;
+    Ok(history::load(&state.data_dir()))
+}
+
+/// 以二进制 IPC 返回 WAV，前端只在用户点击播放时按需读取。
+#[tauri::command]
+fn get_history_audio(
+    record_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = history::read_audio(&state.data_dir(), record_id.trim())?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
+fn reveal_history_audio(
+    record_id: String,
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let path = history::audio_path_for_record(&state.data_dir(), record_id.trim())?;
+    app.opener()
+        .reveal_item_in_dir(path)
+        .map_err(|e| format!("无法在文件夹中显示音频：{e}"))
+}
+
+#[tauri::command]
+fn get_hotwords(state: tauri::State<'_, AppState>) -> Vec<String> {
+    hotwords::load(&state.data_dir())
+}
+
+#[tauri::command]
+async fn save_hotwords(
+    words: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<SaveHotwordsResult, String> {
+    state.save_hotwords_and_maybe_sync(words).await
+}
+
+#[tauri::command]
+fn get_replacements(state: tauri::State<'_, AppState>) -> Vec<ReplacementRule> {
+    hotwords::load_replacements(&state.data_dir())
+}
+
+#[tauri::command]
+async fn save_replacements(
+    rules: Vec<ReplacementRule>,
+    state: tauri::State<'_, AppState>,
+) -> Result<SaveHotwordsResult, String> {
+    state.save_replacements_and_maybe_sync(rules).await
+}
+
+/// 把本地词典同步到当前配置的火山热词表（整表覆盖，权重统一 10）。
+#[tauri::command]
+async fn sync_volc_hotword_table(
+    state: tauri::State<'_, AppState>,
+) -> Result<UiState, String> {
+    state.sync_volc_hotword_table().await
+}
+
+#[tauri::command]
+fn update_shortcut(
+    shortcut: String,
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiState, String> {
+    let trimmed = shortcut.trim().to_string();
+    let new_shortcut: Shortcut = trimmed
+        .parse()
+        .map_err(|_| "快捷键格式无效，可参考 CommandOrControl+Shift+K 形式。".to_string())?;
+    let old_shortcut = state.snapshot().shortcut;
+    let global_shortcut = app.global_shortcut();
+    let _ = global_shortcut.unregister_all();
+    if let Err(err) = global_shortcut.register(new_shortcut) {
+        if let Ok(old) = old_shortcut.parse::<Shortcut>() {
+            let _ = global_shortcut.register(old);
+        }
+        return Err(format!("无法注册该快捷键（可能与其他应用冲突）：{err}"));
+    }
+    state.set_shortcut(trimmed)
+}
+
+#[tauri::command]
+fn set_launch_at_login(
+    enabled: bool,
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiState, String> {
+    let autolaunch = app.autolaunch();
+    if enabled {
+        autolaunch
+            .enable()
+            .map_err(|e| format!("开启开机启动失败：{e}"))?;
+    } else {
+        autolaunch
+            .disable()
+            .map_err(|e| format!("关闭开机启动失败：{e}"))?;
+    }
+    state.set_launch_at_login_flag(enabled)
+}
+
+#[tauri::command]
+fn list_input_devices(state: tauri::State<'_, AppState>) -> Result<UiState, String> {
+    state.refresh_input_devices()
+}
+
+#[tauri::command]
+fn set_input_device(
+    device_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiState, String> {
+    state.set_input_device(device_id)
+}
+
+#[tauri::command]
+fn start_mic_test(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<UiState, String> {
+    state.start_mic_test(app)
+}
+
+#[tauri::command]
+fn stop_mic_test(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<UiState, String> {
+    state.stop_mic_test(app)
+}
+
+#[tauri::command]
+fn save_volc_settings(
+    api_key: String,
+    resource_id: String,
+    boosting_table_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiState, String> {
+    state.save_volc_settings(api_key, resource_id, boosting_table_id)
+}
+
+#[tauri::command]
+fn set_input_gain(gain_db: f32, state: tauri::State<'_, AppState>) -> Result<UiState, String> {
+    state.set_input_gain(gain_db)
+}
+
+#[tauri::command]
+fn set_audio_retention(
+    retention: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiState, String> {
+    state.set_audio_retention(retention)
+}
+
+#[tauri::command]
+fn get_permissions() -> onboarding::PermissionStatus {
+    onboarding::current_status()
+}
+
+/// Ask macOS to show the Accessibility trust prompt and open System Settings.
+/// Returns the (still likely unchanged) permission status right after.
+#[tauri::command]
+fn request_accessibility_permission() -> Result<onboarding::PermissionStatus, String> {
+    let _ = onboarding::request_accessibility_prompt();
+    Ok(onboarding::current_status())
+}
+
+/// Re-read permission status (e.g. after the user toggled the switch in
+/// System Settings and came back).
+#[tauri::command]
+fn check_permissions() -> onboarding::PermissionStatus {
+    onboarding::current_status()
+}
+
+#[tauri::command]
+fn complete_onboarding(state: tauri::State<'_, AppState>) -> Result<UiState, String> {
+    state.complete_onboarding()
+}
+
+#[tauri::command]
+fn update_recognition_options(
+    semantic_punctuation_enabled: bool,
+    max_sentence_silence_ms: u32,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiState, String> {
+    state.update_recognition_options(semantic_punctuation_enabled, max_sentence_silence_ms)
+}
+
+#[tauri::command]
+async fn toggle_dictation(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiState, String> {
+    state.toggle(app).await
+}
+
+#[tauri::command]
+async fn cancel_dictation(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiState, String> {
+    state.cancel(app).await
+}
+
+#[tauri::command]
+fn save_overlay_position(app: AppHandle, x: f64, y: f64) -> Result<(), String> {
+    crate::overlay::save_overlay_position(app, x, y)
+}
+
+#[tauri::command]
+fn reset_overlay_position(app: AppHandle) -> Result<(), String> {
+    crate::overlay::reset_overlay_position(app)
+}
+
+#[tauri::command]
+fn start_overlay_drag(app: AppHandle) -> Result<(), String> {
+    crate::overlay::start_overlay_drag(app)
+}
+
+/// Re-copy the last dictation result to the clipboard. Used by the manual
+/// "copy" button that appears when auto-insertion was not detected.
+#[tauri::command]
+fn copy_last_transcript(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<DeliveryResult, String> {
+    let text = state.snapshot().transcript.trim().to_string();
+    if text.is_empty() {
+        return Err("没有可复制的文本。".into());
+    }
+    app.clipboard()
+        .write_text(text)
+        .map_err(|e| format!("复制到剪贴板失败：{e}"))?;
+    Ok(DeliveryResult {
+        pasted: false,
+        copied: true,
+        message: "已复制到剪贴板。".into(),
+    })
+}
+
+/// Hide the capsule from the frontend (e.g. after manual copy or timeout).
+#[tauri::command]
+fn dismiss_overlay(app: AppHandle) -> Result<(), String> {
+    crate::overlay::hide_overlay(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn open_settings_window(app: AppHandle) -> Result<(), String> {
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.set_focus();
+        Ok(())
+    } else {
+        Err("设置窗口不存在。".into())
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        // 同一客户端身份重复启动时，唤起已经运行的窗口。正式版和开发版
+        // Bundle ID 不同，跨身份互斥由共享数据目录中的进程锁负责。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // 正在听写时不要抢焦点：否则自动粘贴的目标应用会被设置窗口顶掉。
+            let dictating = app
+                .try_state::<AppState>()
+                .map(|state| {
+                    let phase = state.snapshot().phase;
+                    matches!(phase.as_str(), "connecting" | "recording" | "finalizing")
+                })
+                .unwrap_or(false);
+            if dictating {
+                eprintln!("[single-instance] 重复实例已忽略（正在听写中，不抢占焦点）");
+                return;
+            }
+            eprintln!("[single-instance] 检测到重复实例，唤起已有 JackVoice 窗口");
+            if let Some(main) = app.get_webview_window("main") {
+                let _ = main.show();
+                let _ = main.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .macos_launcher(tauri_plugin_autostart::MacosLauncher::LaunchAgent)
+                .build(),
+        )
+        .plugin(
+            ShortcutBuilder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state != ShortcutState::Pressed {
+                        return;
+                    }
+                    let app_handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(state) = app_handle.try_state::<AppState>() {
+                            let _ = state.toggle(app_handle.clone()).await;
+                        }
+                    });
+                })
+                .build(),
+        )
+        .setup(|app| {
+            let directories = storage::prepare_directories(app.handle())
+                .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+            let instance_guard = match storage::acquire_shared_instance_lock(&directories.shared) {
+                Ok(guard) => guard,
+                Err(error) if error == storage::INSTANCE_CONFLICT_MESSAGE => {
+                    eprintln!("[single-instance] {error}");
+                    app.cleanup_before_exit();
+                    std::process::exit(0);
+                }
+                Err(error) => return Err(Box::<dyn std::error::Error>::from(error)),
+            };
+            let state = AppState::new(
+                directories.shared,
+                directories.variant,
+                directories.production_variant,
+            )
+            .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+            app.manage(instance_guard);
+            app.manage(state);
+            let _ = crate::overlay::ensure_overlay(app.handle());
+
+            // First run (onboarding not finished yet): show the main window so
+            // the user can walk through the permission setup. The window is
+            // otherwise hidden by design (background dictation app).
+            if !app.state::<AppState>().snapshot().onboarding_completed {
+                if let Some(main) = app.get_webview_window("main") {
+                    eprintln!("[onboarding] showing main window for first-run setup");
+                    match main.show() {
+                        Ok(()) => {
+                            eprintln!(
+                                "[onboarding] window shown, visible={:?}",
+                                main.is_visible()
+                            );
+                            let _ = main.set_position(tauri::LogicalPosition::new(80.0, 80.0));
+                            let _ = main.set_focus();
+                        }
+                        Err(e) => eprintln!("[onboarding] show failed: {e}"),
+                    }
+                } else {
+                    eprintln!("[onboarding] main window not found");
+                }
+            }
+
+            // Register the user-configured hands-free shortcut (fallback: Alt+Space).
+            let saved_shortcut = app.state::<AppState>().snapshot().shortcut;
+            let registered = saved_shortcut
+                .parse::<Shortcut>()
+                .ok()
+                .and_then(|sc| app.global_shortcut().register(sc).ok())
+                .is_some();
+            if !registered {
+                app.global_shortcut()
+                    .register("Alt+Space")
+                    .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+            }
+
+            // Keep the OS launch-at-login state in sync with saved settings.
+            let want_autostart = app.state::<AppState>().snapshot().launch_at_login;
+            let autolaunch = app.autolaunch();
+            if let Ok(is_enabled) = autolaunch.is_enabled() {
+                if want_autostart && !is_enabled {
+                    let _ = autolaunch.enable();
+                } else if !want_autostart && is_enabled {
+                    let _ = autolaunch.disable();
+                }
+            }
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_state,
+            get_history,
+            delete_history_record,
+            clear_history,
+            get_history_audio,
+            reveal_history_audio,
+            get_hotwords,
+            save_hotwords,
+            get_replacements,
+            save_replacements,
+            sync_volc_hotword_table,
+            update_shortcut,
+            set_launch_at_login,
+            list_input_devices,
+            set_input_device,
+            start_mic_test,
+            stop_mic_test,
+            save_volc_settings,
+            set_input_gain,
+            set_audio_retention,
+            get_permissions,
+            request_accessibility_permission,
+            check_permissions,
+            complete_onboarding,
+            update_recognition_options,
+            toggle_dictation,
+            cancel_dictation,
+            save_overlay_position,
+            reset_overlay_position,
+            start_overlay_drag,
+            copy_last_transcript,
+            dismiss_overlay,
+            open_settings_window
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building JackVoice")
+        .run(|app, event| {
+            // Clicking the Dock icon should open settings manually.
+            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+                if !has_visible_windows {
+                    if let Some(main) = app.get_webview_window("main") {
+                        let _ = main.show();
+                        let _ = main.set_focus();
+                    }
+                }
+            }
+        });
+}
+
+// Silence unused import warning if compiler tree-shakes differently.
+#[allow(dead_code)]
+type _InputDeviceInfo = InputDeviceInfo;

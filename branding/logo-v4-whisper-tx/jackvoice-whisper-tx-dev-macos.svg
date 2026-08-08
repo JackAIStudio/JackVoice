@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">JackVoice Whisper TX development macOS app icon</title>
+  <desc id="desc">The JackVoice development icon placed inside the macOS optical safe area.</desc>
+
+  <g transform="translate(96 96) scale(0.8125)">
+    <rect width="1024" height="1024" rx="228" fill="#17171A"/>
+    <rect x="242" y="282" width="540" height="460" rx="128" fill="#F7F7F4"/>
+    <circle cx="316" cy="346" r="20" fill="#17171A"/>
+    <path
+      d="M320 558
+         C354 558 360 552 390 552
+         C430 552 442 574 476 574
+         C520 574 530 532 570 532
+         C612 532 646 558 704 558"
+      fill="none"
+      stroke="#17171A"
+      stroke-width="28"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+    <rect x="570" y="720" width="370" height="190" rx="64" fill="#FF8A1F"/>
+    <text
+      x="755"
+      y="846"
+      fill="#17120E"
+      font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+      font-size="92"
+      font-weight="800"
+      letter-spacing="4"
+      text-anchor="middle"
+    >DEV</text>
+  </g>
+</svg>

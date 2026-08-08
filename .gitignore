@@ -1,0 +1,45 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+*.dmg
+*.app
+
+# 本地 Logo 探索稿：未被当前产品或构建引用，不进入版本历史。
+/branding/logo/
+/branding/logo-v2/
+/branding/logo-v3-wireless/
+/branding/recommended/
+/branding/recommended-v2/
+
+# 开发版只提交桌面构建配置实际引用的图标。其余平台尺寸由
+# `npm run icons` 从 branding/logo-v4-whisper-tx 的 SVG 随时再生。
+/src-tauri/icons-dev/*
+!/src-tauri/icons-dev/32x32.png
+!/src-tauri/icons-dev/128x128.png
+!/src-tauri/icons-dev/128x128@2x.png
+!/src-tauri/icons-dev/icon.icns
+!/src-tauri/icons-dev/icon.ico
+
+# 本地 Cargo 构建目录配置（含机器相关路径，不入库）
+.cargo/config.toml
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

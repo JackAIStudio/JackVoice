@@ -1,0 +1,6 @@
+# 阻止 pkg-config 探测到系统安装的 abseil（Homebrew），
+# 强制 webrtc-audio-processing-sys 使用内置 vendored abseil 静态编译，
+# 避免打包后的应用动态链接 Homebrew 库导致 Team ID 不匹配无法启动。
+[env]
+PKG_CONFIG_LIBDIR = ""
+PKG_CONFIG_PATH = ""

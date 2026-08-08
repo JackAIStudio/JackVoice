@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Runtime copy of branding/logo-v4-whisper-tx/jackvoice-whisper-tx-app.svg. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">JackVoice</title>
+  <desc id="desc">A compact wireless microphone transmitter capturing a low-amplitude whisper signal.</desc>
+  <rect width="1024" height="1024" rx="228" fill="#17171A"/>
+  <rect x="242" y="282" width="540" height="460" rx="128" fill="#F7F7F4"/>
+  <circle cx="316" cy="346" r="20" fill="#17171A"/>
+  <path
+    d="M320 558
+       C354 558 360 552 390 552
+       C430 552 442 574 476 574
+       C520 574 530 532 570 532
+       C612 532 646 558 704 558"
+    fill="none"
+    stroke="#17171A"
+    stroke-width="28"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JackVoice Overlay</title>
+    <link rel="stylesheet" href="/src/overlay.css" />
+    <script type="module" src="/src/overlay.ts" defer></script>
+    <style>
+      html, body {
+        background: transparent !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="capsule" id="capsule">
+      <button id="cancel-btn" class="icon-btn" title="取消">×</button>
+      <div class="content" id="drag-region">
+        <div id="overlay-status" class="status">正在听写</div>
+        <div id="overlay-text" class="text empty">等待语音…</div>
+      </div>
+      <button id="confirm-btn" class="icon-btn primary" title="结束并确认">✓</button>
+      <button id="copy-btn" class="copy-btn hidden" title="复制到剪贴板">复制</button>
+    </div>
+  </body>
+</html>
