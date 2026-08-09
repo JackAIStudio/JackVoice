@@ -1,0 +1,59 @@
+name: Bug 报告
+description: 报告可以稳定复现的问题；提交前请先移除隐私数据。
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私与安全确认
+      options:
+        - label: 我已删除 API Key、Token、录音、私人转写文本、个人路径和其他敏感信息。
+          required: true
+        - label: 这不是尚未修复的安全漏洞；安全问题应使用私密漏洞报告入口。
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: JackVoice 版本或提交
+      placeholder: 例如 v0.1.0 或提交 SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 操作系统
+      options:
+        - macOS 15
+        - macOS 14
+        - macOS 13
+        - macOS 12
+        - Windows（实验支持）
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: 请提供最小、稳定、已脱敏的复现步骤。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 脱敏日志
+      description: 可选。请再次确认其中没有凭据、录音内容、私人转写或个人路径。
+      render: shell

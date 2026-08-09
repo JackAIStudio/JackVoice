@@ -80,7 +80,10 @@ enum SaucServerFrame {
         final_flag: bool,
         payload: Vec<u8>,
     },
-    Error { code: u32, message: String },
+    Error {
+        code: u32,
+        message: String,
+    },
     Ignored,
 }
 
@@ -124,7 +127,7 @@ impl SaucDecoder {
 
         // 服务端响应可能用正序号（0b0001）或负序号（0b0010 / 0b0011）
         // 标记最终结果；只要 flags 指示带 sequence 都需要对齐读取。
-        let has_sequence = matches!(flags, 0b0001 | 0b0010 | 0b0011);
+        let has_sequence = matches!(flags, 0b0001..=0b0011);
         let mut offset = 4usize;
         let mut sequence = 0i32;
         if has_sequence {
@@ -174,8 +177,7 @@ fn parse_volc_error_payload(payload: &[u8]) -> (u32, String) {
     // 优先按二进制错误帧解析：error_code(u32) + message_size(u32) + UTF-8。
     if payload.len() >= 8 {
         let code = u32::from_be_bytes(payload[..4].try_into().expect("code slice"));
-        let size =
-            u32::from_be_bytes(payload[4..8].try_into().expect("size slice")) as usize;
+        let size = u32::from_be_bytes(payload[4..8].try_into().expect("size slice")) as usize;
         if payload.len() >= 8 + size {
             let raw = String::from_utf8_lossy(&payload[8..8 + size]).into_owned();
             // 部分实现把 error frame 的 payload 段当 JSON 返回（code + size + JSON），
@@ -200,10 +202,7 @@ fn parse_volc_error_payload(payload: &[u8]) -> (u32, String) {
             .and_then(|v| v.as_str())
             .unwrap_or("火山引擎返回未知错误")
             .to_string();
-        let code = value
-            .pointer("/code")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+        let code = value.pointer("/code").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         return (code, message);
     }
     (0, String::from_utf8_lossy(payload).into_owned())
@@ -268,7 +267,7 @@ impl RealtimeSession {
         let api_key = config.api_key.trim().to_string();
         if api_key.is_empty() {
             return Err(AsrError::Message(
-                "尚未配置豆包录音识别 APP Key，请先在设置里保存。".into(),
+                "尚未配置豆包录音识别 API Key，请先在设置里保存。".into(),
             ));
         }
         let resource_id = if config.resource_id.trim().is_empty() {
@@ -341,10 +340,7 @@ impl RealtimeSession {
                 HeaderValue::from_str(&connect_id)
                     .map_err(|e| AsrError::Message(format!("生成连接 ID 失败：{e}")))?,
             );
-            headers.insert(
-                "X-Api-Sequence",
-                HeaderValue::from_static("-1"),
-            );
+            headers.insert("X-Api-Sequence", HeaderValue::from_static("-1"));
         }
 
         let (ws_stream, _) = connect_async(ws_request)
@@ -367,14 +363,12 @@ impl RealtimeSession {
         tokio::time::timeout(Duration::from_secs(15), async {
             let mut decoder = SaucDecoder::new();
             while let Some(msg) = read.next().await {
-                let msg = msg.map_err(|e| AsrError::Message(format!("读取火山引擎响应失败：{e}")))?;
+                let msg =
+                    msg.map_err(|e| AsrError::Message(format!("读取火山引擎响应失败：{e}")))?;
                 match msg {
                     Message::Binary(bytes) => {
                         decoder.push(&bytes);
-                        for frame in decoder
-                            .take_frames()
-                            .map_err(|e| AsrError::Message(e))?
-                        {
+                        for frame in decoder.take_frames().map_err(AsrError::Message)? {
                             match frame {
                                 SaucServerFrame::Response { .. } => return Ok(()),
                                 SaucServerFrame::Error { code, message } => {
@@ -387,16 +381,12 @@ impl RealtimeSession {
                         }
                     }
                     Message::Close(_) => {
-                        return Err(AsrError::Message(
-                            "火山引擎连接在启动前被关闭。".into(),
-                        ));
+                        return Err(AsrError::Message("火山引擎连接在启动前被关闭。".into()));
                     }
                     _ => {}
                 }
             }
-            Err(AsrError::Message(
-                "火山引擎连接在启动前意外结束。".into(),
-            ))
+            Err(AsrError::Message("火山引擎连接在启动前意外结束。".into()))
         })
         .await
         .map_err(|_| AsrError::Message("火山引擎实时识别连接超时。".into()))??;
@@ -605,7 +595,9 @@ impl RealtimeSession {
                 terminal = Some(Ok(normalize::normalize(&last_text)));
             }
             let _ = result_tx.send(terminal.unwrap_or_else(|| {
-                Err(AsrError::Message("火山引擎会话在返回最终结果前结束。".into()))
+                Err(AsrError::Message(
+                    "火山引擎会话在返回最终结果前结束。".into(),
+                ))
             }));
         });
 
@@ -652,16 +644,26 @@ impl RealtimeSession {
     }
 }
 
+/// 向真实识别服务发送会话初始化请求，验证 API Key 与资源 ID。
+///
+/// 该测试不打开麦克风，也不发送音频；服务端接受初始化请求后立即关闭会话。
+pub async fn test_connection(config: VolcAsrConfig) -> Result<(), AsrError> {
+    let session = RealtimeSession::connect(config, false, 1300, Vec::new(), |_| {}).await?;
+    session.cancel().await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod volc_protocol_tests {
     use super::*;
 
     fn server_response_frame(flags: u8, sequence: i32, payload: &[u8]) -> Vec<u8> {
-        let mut frame = Vec::new();
-        frame.push(0b0001_0001);
-        frame.push((SAUC_MSG_SERVER_FULL_RESPONSE << 4) | flags);
-        frame.push((SAUC_SERIALIZATION_JSON << 4) | SAUC_COMPRESSION_NONE);
-        frame.push(0x00);
+        let mut frame = vec![
+            0b0001_0001,
+            (SAUC_MSG_SERVER_FULL_RESPONSE << 4) | flags,
+            (SAUC_SERIALIZATION_JSON << 4) | SAUC_COMPRESSION_NONE,
+            0x00,
+        ];
         frame.extend_from_slice(&sequence.to_be_bytes());
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(payload);
@@ -679,10 +681,7 @@ mod volc_protocol_tests {
         assert_eq!(start[0], 0b0001_0001);
         assert_eq!(start[1], SAUC_MSG_FULL_CLIENT_REQUEST << 4);
         assert_eq!(start[2], SAUC_SERIALIZATION_JSON << 4);
-        assert_eq!(
-            u32::from_be_bytes(start[4..8].try_into().unwrap()),
-            2
-        );
+        assert_eq!(u32::from_be_bytes(start[4..8].try_into().unwrap()), 2);
         assert_eq!(&start[8..], b"{}");
 
         let audio = volc_frame(
@@ -693,10 +692,7 @@ mod volc_protocol_tests {
         );
         assert_eq!(audio[1], SAUC_MSG_AUDIO_ONLY_REQUEST << 4);
         assert_eq!(audio[2], SAUC_SERIALIZATION_RAW << 4);
-        assert_eq!(
-            u32::from_be_bytes(audio[4..8].try_into().unwrap()),
-            3200
-        );
+        assert_eq!(u32::from_be_bytes(audio[4..8].try_into().unwrap()), 3200);
 
         let last = volc_frame(
             SAUC_MSG_AUDIO_ONLY_REQUEST,
@@ -748,7 +744,13 @@ mod volc_protocol_tests {
 
         let frames = decoder.take_frames().unwrap();
         assert_eq!(frames.len(), 2);
-        assert!(matches!(frames[1], SaucServerFrame::Response { final_flag: true, .. }));
+        assert!(matches!(
+            frames[1],
+            SaucServerFrame::Response {
+                final_flag: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -798,8 +800,8 @@ mod volc_protocol_tests {
     #[test]
     fn inline_hotwords_drop_invalid_and_truncate() {
         let words = vec![
-            "标点，词".to_string(),                    // 标点剥离后变成“标点词”
-            "B roll".to_string(),                     // 空格会被吞掉
+            "标点，词".to_string(), // 标点剥离后变成“标点词”
+            "B roll".to_string(),   // 空格会被吞掉
             "合法词".to_string(),
         ];
         let corpus = volc_corpus("", &words);
@@ -819,5 +821,4 @@ mod volc_protocol_tests {
         assert_eq!(corpus["boosting_table_id"], "table-123");
         assert!(corpus.get("context").is_none());
     }
-
 }

@@ -11,6 +11,7 @@
   --mint: #2ad6aa;
   --mint-dark: #147b65;
   --danger: #c23d3d;
+  --warning: #9a6816;
 }
 
 * {
@@ -903,6 +904,24 @@ kbd.shortcut {
   line-height: 1.6;
 }
 
+.set-desc.warn {
+  color: var(--warning);
+}
+
+.external-help-link {
+  display: inline-block;
+  margin-top: 5px;
+  color: var(--mint-dark);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+  text-decoration: none;
+}
+
+.external-help-link:hover {
+  text-decoration: underline;
+}
+
 .field-error {
   margin: -6px 0 12px;
   font-size: 12px;
@@ -1031,6 +1050,36 @@ select:focus,
   gap: 10px;
   flex-wrap: wrap;
   justify-content: flex-end;
+}
+
+.credential-control {
+  display: flex;
+  min-width: 330px;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 7px;
+}
+
+.connection-test-status {
+  min-height: 18px;
+  max-width: 430px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: right;
+}
+
+.connection-test-status.testing {
+  color: var(--warning);
+}
+
+.connection-test-status.ok {
+  color: #1c9e6a;
+  font-weight: 600;
+}
+
+.connection-test-status.warn {
+  color: var(--danger);
 }
 
 .check {
@@ -1240,6 +1289,10 @@ input[type="range"]#gain-db {
 
 .ob-key-row .inline-fields {
   max-width: 300px;
+}
+
+.ob-key-row .credential-control {
+  min-width: 300px;
 }
 
 .privacy-confirm {

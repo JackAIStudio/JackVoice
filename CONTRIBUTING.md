@@ -12,6 +12,8 @@
 ```bash
 npm ci
 npm run build
+cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
+cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
 cargo test --locked --manifest-path src-tauri/Cargo.toml
 ```
 

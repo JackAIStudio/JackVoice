@@ -4,9 +4,9 @@ mod credentials;
 mod delivery;
 mod history;
 mod hotwords;
+mod normalize;
 mod onboarding;
 mod overlay;
-mod normalize;
 mod session;
 mod settings;
 mod storage;
@@ -14,14 +14,14 @@ mod volc_hotword_api;
 
 use audio::InputDeviceInfo;
 use delivery::DeliveryResult;
-use session::{AppState, SaveHotwordsResult, UiState};
 use hotwords::ReplacementRule;
+use session::{AppState, SaveHotwordsResult, UiState};
 use tauri::{AppHandle, Manager};
+use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{
     Builder as ShortcutBuilder, GlobalShortcutExt, Shortcut, ShortcutState,
 };
-use tauri_plugin_autostart::ManagerExt;
-use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 #[tauri::command]
@@ -99,9 +99,7 @@ async fn save_replacements(
 
 /// 把本地词典同步到当前配置的火山热词表（整表覆盖，权重统一 10）。
 #[tauri::command]
-async fn sync_volc_hotword_table(
-    state: tauri::State<'_, AppState>,
-) -> Result<UiState, String> {
+async fn sync_volc_hotword_table(state: tauri::State<'_, AppState>) -> Result<UiState, String> {
     state.sync_volc_hotword_table().await
 }
 
@@ -177,6 +175,15 @@ fn save_volc_settings(
     state: tauri::State<'_, AppState>,
 ) -> Result<UiState, String> {
     state.save_volc_settings(api_key, resource_id, boosting_table_id)
+}
+
+#[tauri::command]
+async fn test_volc_connection(
+    api_key: String,
+    resource_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    state.test_volc_connection(api_key, resource_id).await
 }
 
 #[tauri::command]
@@ -296,12 +303,47 @@ fn open_settings_window(app: AppHandle) -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+fn open_external_url(url: String, app: AppHandle) -> Result<(), String> {
+    // Only open the official help destinations rendered by the app. Keeping
+    // this allowlist here prevents the command from becoming an arbitrary URL
+    // launcher if untrusted text ever reaches the webview.
+    const VOLC_API_KEY_CONSOLE: &str = "https://console.volcengine.com/speech/new/";
+    const VOLC_HOTWORD_GUIDE: &str = "https://www.volcengine.com/docs/6561/155739?lang=zh";
+    if !matches!(url.as_str(), VOLC_API_KEY_CONSOLE | VOLC_HOTWORD_GUIDE) {
+        return Err("该链接不在 JackVoice 的官方帮助链接列表中。".into());
+    }
+    app.opener()
+        .open_url(url, None::<String>)
+        .map_err(|error| format!("无法使用系统浏览器打开链接：{error}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         // 同一客户端身份重复启动时，唤起已经运行的窗口。正式版和开发版
-        // Bundle ID 不同，跨身份互斥由共享数据目录中的进程锁负责。
+        // 使用不同 Bundle ID，但共享业务数据，跨版本并行运行由共享锁阻止。
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // Debug-only diagnostic: ask the already running development
+            // instance to validate its in-memory credential without ever
+            // printing or forwarding the secret through a second process.
+            #[cfg(debug_assertions)]
+            if _argv.iter().any(|arg| arg == "--test-volc-connection") {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(state) = app.try_state::<AppState>() {
+                        match state
+                            .test_volc_connection(String::new(), String::new())
+                            .await
+                        {
+                            Ok(message) => eprintln!("[volc-connection-test] {message}"),
+                            Err(message) => eprintln!("[volc-connection-test] {message}"),
+                        }
+                    }
+                });
+                return;
+            }
+
             // 正在听写时不要抢焦点：否则自动粘贴的目标应用会被设置窗口顶掉。
             let dictating = app
                 .try_state::<AppState>()
@@ -344,7 +386,7 @@ pub fn run() {
         )
         .setup(|app| {
             let directories = storage::prepare_directories(app.handle())
-                .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+                .map_err(Box::<dyn std::error::Error>::from)?;
             let instance_guard = match storage::acquire_shared_instance_lock(&directories.shared) {
                 Ok(guard) => guard,
                 Err(error) if error == storage::INSTANCE_CONFLICT_MESSAGE => {
@@ -358,8 +400,9 @@ pub fn run() {
                 directories.shared,
                 directories.variant,
                 directories.production_variant,
+                credentials::CredentialMode::from_identifier(&app.config().identifier),
             )
-            .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+            .map_err(Box::<dyn std::error::Error>::from)?;
             app.manage(instance_guard);
             app.manage(state);
             let _ = crate::overlay::ensure_overlay(app.handle());
@@ -372,10 +415,7 @@ pub fn run() {
                     eprintln!("[onboarding] showing main window for first-run setup");
                     match main.show() {
                         Ok(()) => {
-                            eprintln!(
-                                "[onboarding] window shown, visible={:?}",
-                                main.is_visible()
-                            );
+                            eprintln!("[onboarding] window shown, visible={:?}", main.is_visible());
                             let _ = main.set_position(tauri::LogicalPosition::new(80.0, 80.0));
                             let _ = main.set_focus();
                         }
@@ -431,6 +471,7 @@ pub fn run() {
             start_mic_test,
             stop_mic_test,
             save_volc_settings,
+            test_volc_connection,
             set_input_gain,
             set_audio_retention,
             get_permissions,
@@ -445,13 +486,18 @@ pub fn run() {
             start_overlay_drag,
             copy_last_transcript,
             dismiss_overlay,
-            open_settings_window
+            open_settings_window,
+            open_external_url
         ])
         .build(tauri::generate_context!())
         .expect("error while building JackVoice")
         .run(|app, event| {
             // Clicking the Dock icon should open settings manually.
-            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } = event
+            {
                 if !has_visible_windows {
                     if let Some(main) = app.get_webview_window("main") {
                         let _ = main.show();

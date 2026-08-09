@@ -13,7 +13,10 @@ pub const INSTANCE_CONFLICT_MESSAGE: &str =
 
 #[derive(Debug)]
 pub struct AppDirectories {
+    /// Recognition settings, history, recordings and hotwords are shared by
+    /// production and development so developers work with the same data.
     pub shared: PathBuf,
+    /// Operating-system/client state remains separate for each app identity.
     pub variant: PathBuf,
     pub production_variant: PathBuf,
 }
@@ -38,7 +41,7 @@ pub fn prepare_directories(app: &AppHandle) -> Result<AppDirectories, String> {
         fs::create_dir_all(&shared)
             .map_err(|error| format!("创建 JackVoice 共享数据目录失败：{error}"))?;
         fs::create_dir_all(&production_variant)
-            .map_err(|error| format!("创建 JackVoice 正式版数据目录失败：{error}"))?;
+            .map_err(|error| format!("创建 JackVoice 正式版状态目录失败：{error}"))?;
         move_production_overlay_out_of_shared(&shared, &production_variant)?;
         set_private_tree_permissions(&shared)?;
         set_private_tree_permissions(&production_variant)
@@ -122,6 +125,7 @@ fn with_migration_lock<T>(
 fn open_lock_file(path: &Path) -> Result<File, String> {
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)

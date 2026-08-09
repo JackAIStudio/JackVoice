@@ -95,10 +95,7 @@ pub fn probe_insertion_target(process_name: Option<&str>) -> InsertionProbe {
         let selector = match process_name {
             Some(name) if !name.trim().is_empty() => {
                 let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
-                format!(
-                    "set p to first application process whose name is \"{}\"",
-                    escaped
-                )
+                format!("set p to first application process whose name is \"{escaped}\"")
             }
             _ => "set p to first application process whose frontmost is true".to_string(),
         };
@@ -131,7 +128,7 @@ pub fn probe_insertion_target(process_name: Option<&str>) -> InsertionProbe {
             ),
             selector = selector
         );
-        return run_probe_script(&script);
+        run_probe_script(&script)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -202,7 +199,7 @@ fn classify_probe_line(line: &str) -> InsertionProbe {
     let ins = parts.next().unwrap_or("").trim();
 
     let ins_line = ins.parse::<f64>().ok();
-    let has_caret = matches!(ins_line, Some(v) if v >= 0.0 && v < 1_000_000_000.0);
+    let has_caret = matches!(ins_line, Some(v) if (0.0..1_000_000_000.0).contains(&v));
     let probe = if TEXT_ROLES.contains(&role) || has_caret {
         InsertionProbe::Insertable
     } else {
