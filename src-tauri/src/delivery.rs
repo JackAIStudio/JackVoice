@@ -95,10 +95,7 @@ pub fn probe_insertion_target(process_name: Option<&str>) -> InsertionProbe {
         let selector = match process_name {
             Some(name) if !name.trim().is_empty() => {
                 let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
-                format!(
-                    "set p to first application process whose name is \"{}\"",
-                    escaped
-                )
+                format!("set p to first application process whose name is \"{escaped}\"")
             }
             _ => "set p to first application process whose frontmost is true".to_string(),
         };

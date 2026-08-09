@@ -856,7 +856,7 @@ impl AppState {
         {
             let mut ui = self.ui.lock();
             ui.phase = "connecting".into();
-            ui.status = format!("正在连接{}…", ASR_ENGINE_NAME);
+            ui.status = format!("正在连接{ASR_ENGINE_NAME}…");
             ui.transcript.clear();
             ui.last_delivery_message.clear();
             ui.audio_level = 0.0;
