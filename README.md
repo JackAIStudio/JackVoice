@@ -68,11 +68,13 @@ cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
 cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
 ```
 
-若更新原生音频依赖后出现 `absl_* not found`，通常是旧的 WebRTC 构建缓存残留。只清理本项目的 Cargo target 目录后重新构建即可：
+`npm run dev` 和桌面构建命令会固定使用项目内置的 Abseil；若检测到 WebRTC 曾使用 Homebrew Abseil 生成的不兼容缓存，启动脚本会只清理并重建该依赖。一般不再需要手动清理整个 Cargo target 目录。
+
+若绕过 npm 脚本直接执行 Cargo 并再次混入了系统 Abseil，可手动只清理对应依赖后重试：
 
 ```bash
-cargo clean --manifest-path src-tauri/Cargo.toml
-cargo test --locked --manifest-path src-tauri/Cargo.toml
+cargo clean --manifest-path src-tauri/Cargo.toml -p webrtc-audio-processing-sys
+npm run dev
 ```
 
 ### 配置识别服务
