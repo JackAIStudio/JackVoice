@@ -1,5 +1,8 @@
-use crate::asr::{ASR_ENGINE_ID, ASR_ENGINE_NAME, RealtimeSession, TranscriptUpdate, VolcAsrConfig};
+use crate::asr::{
+    RealtimeSession, TranscriptUpdate, VolcAsrConfig, ASR_ENGINE_ID, ASR_ENGINE_NAME,
+};
 use crate::audio::{self, AudioCapture, InputDeviceInfo};
+use crate::credentials::{CredentialMode, CredentialSource};
 use crate::delivery::{self, DeliveryResult};
 use crate::history::{AudioRecorder, RecognitionContext};
 use crate::settings::{self, AppSettings};
@@ -34,6 +37,8 @@ pub struct UiState {
     pub transcript: String,
     pub has_volc_api_key: bool,
     pub masked_volc_api_key: String,
+    pub volc_credential_source: String,
+    pub volc_credential_warning: String,
     pub volc_resource_id: String,
     pub volc_boosting_table_id: String,
     pub semantic_punctuation_enabled: bool,
@@ -67,6 +72,8 @@ impl Default for UiState {
             transcript: String::new(),
             has_volc_api_key: false,
             masked_volc_api_key: String::new(),
+            volc_credential_source: CredentialSource::Missing.as_str().into(),
+            volc_credential_warning: String::new(),
             volc_resource_id: "volc.seedasr.sauc.duration".into(),
             volc_boosting_table_id: String::new(),
             semantic_punctuation_enabled: true,
@@ -102,6 +109,7 @@ struct MonitorSession {
 pub struct AppState {
     shared_data_dir: PathBuf,
     variant_data_dir: PathBuf,
+    credential_mode: CredentialMode,
     settings: Mutex<AppSettings>,
     ui: Mutex<UiState>,
     active: Mutex<Option<ActiveSession>>,
@@ -117,6 +125,7 @@ impl AppState {
         shared_data_dir: PathBuf,
         variant_data_dir: PathBuf,
         production_variant_data_dir: PathBuf,
+        credential_mode: CredentialMode,
     ) -> Result<Self, String> {
         let mut settings = settings::load_settings(
             &shared_data_dir,
@@ -124,21 +133,50 @@ impl AppState {
             &production_variant_data_dir,
         )?;
         let legacy_api_key = settings.volc_api_key.trim().to_string();
-        let stored_api_key = crate::credentials::load_volc_api_key()?;
-        if stored_api_key.is_empty() && !legacy_api_key.is_empty() {
-            crate::credentials::save_volc_api_key(&legacy_api_key)?;
-            settings.volc_api_key = legacy_api_key;
-            settings::save_settings(&shared_data_dir, &variant_data_dir, &settings)?;
-        } else {
-            settings.volc_api_key = stored_api_key;
+        let loaded = crate::credentials::load_volc_api_key(credential_mode, &variant_data_dir);
+        let mut credential_source = loaded.source;
+        let mut credential_warning = loaded.warning;
+        let mut legacy_migration_complete = legacy_api_key.is_empty();
+
+        if !loaded.value.is_empty() {
+            settings.volc_api_key = loaded.value;
             if !legacy_api_key.is_empty() {
                 settings::save_settings(&shared_data_dir, &variant_data_dir, &settings)?;
+                legacy_migration_complete = true;
             }
+        } else if !legacy_api_key.is_empty() {
+            // Very early builds wrote the key to settings.json. Move it to the
+            // credential entry for the current build identity. Failure remains
+            // recoverable and never aborts startup.
+            match crate::credentials::save_volc_api_key(
+                credential_mode,
+                &variant_data_dir,
+                &legacy_api_key,
+            ) {
+                Ok(source) => {
+                    settings.volc_api_key = legacy_api_key;
+                    credential_source = source;
+                    settings::save_settings(&shared_data_dir, &variant_data_dir, &settings)?;
+                    legacy_migration_complete = true;
+                }
+                Err(error) => {
+                    settings.volc_api_key = legacy_api_key;
+                    credential_source = CredentialSource::Session;
+                    credential_warning =
+                        format!("旧版 API Key 本次仍可使用，但无法安全迁移：{error}");
+                }
+            }
+        } else {
+            settings.volc_api_key.clear();
         }
-        settings::remove_legacy_settings_backup(&shared_data_dir)?;
+        if legacy_migration_complete {
+            settings::remove_legacy_settings_backup(&shared_data_dir)?;
+        }
         crate::history::apply_audio_retention(&shared_data_dir, &settings.audio_retention)?;
         let mut ui = UiState::default();
         apply_settings_to_ui(&mut ui, &settings);
+        ui.volc_credential_source = credential_source.as_str().into();
+        ui.volc_credential_warning = credential_warning;
         // NOTE: intentionally do NOT enumerate audio devices at startup. On
         // macOS, touching CoreAudio input devices (even just listing them)
         // triggers the system microphone permission prompt. The user should
@@ -148,6 +186,7 @@ impl AppState {
         Ok(Self {
             shared_data_dir,
             variant_data_dir,
+            credential_mode,
             settings: Mutex::new(settings),
             ui: Mutex::new(ui),
             active: Mutex::new(None),
@@ -391,7 +430,11 @@ impl AppState {
         }
         let mut settings = self.settings.lock();
         let api_key = api_key.trim().to_string();
-        crate::credentials::save_volc_api_key(&api_key)?;
+        let credential_source = crate::credentials::save_volc_api_key(
+            self.credential_mode,
+            &self.variant_data_dir,
+            &api_key,
+        )?;
         settings.volc_api_key = api_key;
         let resource_id = resource_id.trim().to_string();
         settings.volc_resource_id = if resource_id.is_empty() {
@@ -403,12 +446,62 @@ impl AppState {
         self.save_settings(&settings)?;
         let mut ui = self.ui.lock();
         apply_settings_to_ui(&mut ui, &settings);
+        ui.volc_credential_source = credential_source.as_str().into();
+        ui.volc_credential_warning.clear();
         ui.status = if settings.volc_api_key.is_empty() {
-            "豆包识别配置已保存（APP Key 为空）。".into()
+            "豆包识别配置已保存（API Key 为空）。".into()
         } else {
             "豆包识别配置已保存。".into()
         };
         Ok(ui.clone())
+    }
+
+    /// 使用真实识别服务验证 API Key 与资源 ID，但不打开麦克风或发送音频。
+    /// 输入框为空时测试当前已保存的 API Key，便于用户随时重新验证。
+    pub async fn test_volc_connection(
+        &self,
+        api_key: String,
+        resource_id: String,
+    ) -> Result<String, String> {
+        if self.active.lock().is_some() {
+            return Err("正在听写中，请先结束听写再测试识别连接。".into());
+        }
+
+        let settings = self.settings.lock().clone();
+        let api_key = if api_key.trim().is_empty() {
+            settings.volc_api_key.trim().to_string()
+        } else {
+            api_key.trim().to_string()
+        };
+        if api_key.is_empty() {
+            return Err("请先填写或保存豆包语音 API Key。".into());
+        }
+        let resource_id = if resource_id.trim().is_empty() {
+            settings.volc_resource_id.trim().to_string()
+        } else {
+            resource_id.trim().to_string()
+        };
+        let config = VolcAsrConfig {
+            api_key,
+            resource_id,
+            // 连接测试只验证 Key 与识别资源，不让可选热词表影响结果。
+            boosting_table_id: String::new(),
+        };
+
+        match crate::asr::test_connection(config).await {
+            Ok(()) => {
+                let message = "连接测试通过：API Key 与资源 ID 已生效。".to_string();
+                self.ui.lock().status = message.clone();
+                Ok(message)
+            }
+            Err(error) => {
+                let raw = error.to_string();
+                eprintln!("[volc-connection-test] {raw}");
+                let message = format_volc_connection_error(&raw);
+                self.ui.lock().status = message.clone();
+                Err(message)
+            }
+        }
     }
 
     /// 保存本地热词；若当前是火山引擎且已配置热词表 ID，则自动同步热词表。
@@ -544,7 +637,7 @@ impl AppState {
         }
         let settings = self.settings.lock().clone();
         if settings.volc_api_key.trim().is_empty() {
-            return Err("请先填写豆包录音识别 APP Key。".into());
+            return Err("请先填写豆包录音识别 API Key。".into());
         }
 
         let local_words = crate::hotwords::load(&self.shared_data_dir);
@@ -643,9 +736,7 @@ impl AppState {
         {
             settings.audio_retention = previous;
             if let Err(rollback_error) = self.save_settings(&settings) {
-                return Err(format!(
-                    "{error}；恢复原录音策略时也失败：{rollback_error}"
-                ));
+                return Err(format!("{error}；恢复原录音策略时也失败：{rollback_error}"));
             }
             return Err(error);
         }
@@ -690,7 +781,6 @@ impl AppState {
         ui.status = "设置完成，开始使用 JackVoice。".into();
         Ok(ui.clone())
     }
-
 
     pub async fn cancel(&self, app: AppHandle) -> Result<UiState, String> {
         // Silent cancel: stop capture/session and hide overlay.
@@ -748,9 +838,19 @@ impl AppState {
         let settings = self.settings.lock().clone();
         if settings.volc_api_key.trim().is_empty() {
             let mut ui = self.ui.lock();
-            ui.phase = "idle".into();
-            ui.status = "请先填写豆包录音识别 APP Key。".into();
-            return Err(ui.status.clone());
+            ui.phase = "error".into();
+            ui.status = if ui.volc_credential_warning.is_empty() {
+                "未配置豆包录音识别 API Key，请打开 JackVoice 设置 → 识别。".into()
+            } else {
+                ui.volc_credential_warning.clone()
+            };
+            ui.audio_level = 0.0;
+            let message = ui.status.clone();
+            let _ = app.emit("jackvoice://state", ui.clone());
+            drop(ui);
+            crate::overlay::show_overlay(&app);
+            schedule_error_overlay_hide(&app, epoch);
+            return Err(message);
         }
 
         {
@@ -874,12 +974,8 @@ impl AppState {
         };
 
         tokio::spawn(async move {
-            let session_result = RealtimeSession::connect(
-                volc_config,
-                semantic,
-                silence,
-                hotwords,
-                {
+            let session_result =
+                RealtimeSession::connect(volc_config, semantic, silence, hotwords, {
                     let app = app_for_task.clone();
                     let replacement_rules_for_updates = replacement_rules.clone();
                     move |update: TranscriptUpdate| {
@@ -898,9 +994,8 @@ impl AppState {
                             let _ = app.emit("jackvoice://state", ui.clone());
                         }
                     }
-                },
-            )
-            .await;
+                })
+                .await;
 
             let session = match session_result {
                 Ok(session) => session,
@@ -1038,7 +1133,8 @@ impl AppState {
 
             match session.finish().await {
                 Ok(final_text) => {
-                    let final_text = crate::hotwords::apply_replacements(&final_text, &replacement_rules);
+                    let final_text =
+                        crate::hotwords::apply_replacements(&final_text, &replacement_rules);
                     let saved_audio = if final_text.trim().is_empty() {
                         None
                     } else {
@@ -1121,10 +1217,13 @@ impl AppState {
                     }
                 }
                 Err(err) => {
+                    let raw = err.to_string();
+                    eprintln!("[asr-connect] {raw}");
+                    let message = format_volc_connection_error(&raw);
                     if let Some(state) = app_for_task.try_state::<AppState>() {
                         let mut ui = state.ui.lock();
                         ui.phase = "error".into();
-                        ui.status = err.to_string();
+                        ui.status = message;
                         ui.audio_level = 0.0;
                         let _ = app_for_task.emit("jackvoice://state", ui.clone());
                         *state.active.lock() = None;
@@ -1207,6 +1306,34 @@ fn mic_notice_message(notice: &audio::AudioNotice) -> String {
     }
 }
 
+/// 将服务端/网络层的原始连接错误转成用户能采取行动的提示。
+/// 原始错误仍写入开发日志，便于定位火山引擎返回的具体状态。
+fn format_volc_connection_error(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("unauthenticated")
+        || raw.contains("未认证")
+        || raw.contains("鉴权失败")
+    {
+        return format!(
+            "API Key 未通过认证。请确认填写的是豆包语音新版控制台中的 APP Key，而不是 Access Key、Secret Key 或其他产品的 API Key。服务端错误：{raw}"
+        );
+    }
+    if lower.contains("403")
+        || lower.contains("requested grant not found")
+        || raw.contains("服务未授权")
+    {
+        return format!(
+            "豆包语音服务拒绝访问。请确认当前项目已开通该识别资源，并核对资源 ID。服务端错误：{raw}"
+        );
+    }
+    if lower.contains("timed out") || raw.contains("超时") {
+        return format!("连接豆包语音服务超时，请检查网络后重试。原始错误：{raw}");
+    }
+    format!("豆包语音连接测试失败：{raw}")
+}
+
 /// Keep an error capsule visible long enough to read, then hide it. If a
 /// newer session started in the meantime (epoch changed) or the phase moved
 /// on, do nothing.
@@ -1228,3 +1355,28 @@ fn schedule_error_overlay_hide(app: &AppHandle, epoch: u64) {
 
 #[allow(dead_code)]
 pub type SharedDelivery = DeliveryResult;
+
+#[cfg(test)]
+mod volc_connection_error_tests {
+    use super::format_volc_connection_error;
+
+    #[test]
+    fn explains_unauthenticated_key() {
+        let message = format_volc_connection_error("HTTP error: 401 Unauthorized");
+        assert!(message.contains("API Key 未通过认证"));
+        assert!(message.contains("APP Key"));
+    }
+
+    #[test]
+    fn explains_missing_resource_grant() {
+        let message = format_volc_connection_error("requested grant not found (403)");
+        assert!(message.contains("服务拒绝访问"));
+        assert!(message.contains("资源 ID"));
+    }
+
+    #[test]
+    fn preserves_unknown_service_error() {
+        let message = format_volc_connection_error("remote closed the connection");
+        assert!(message.contains("remote closed the connection"));
+    }
+}

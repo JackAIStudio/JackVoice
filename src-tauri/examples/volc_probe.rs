@@ -1,4 +1,4 @@
-// End-to-end ASR probe using an environment variable or the OS credential store.
+// End-to-end ASR probe using explicit development environment variables.
 //
 // Usage:
 //   cargo run --example volc_probe -- /path/to/audio.pcm [hotword1,hotword2]
@@ -23,22 +23,15 @@ async fn main() {
     };
     println!("[probe] engine: 火山引擎 豆包流式语音识别模型 2.0");
 
-    let settings_path = data_dir().join("settings.json");
-    let settings = std::fs::read_to_string(&settings_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .unwrap_or_default();
     let volc_key = load_api_key();
     let volc_config = VolcAsrConfig {
         api_key: volc_key,
         resource_id: std::env::var("JACKVOICE_VOLC_RESOURCE_ID")
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .or_else(|| settings["volcResourceId"].as_str().map(str::to_string))
             .unwrap_or_else(|| "volc.seedasr.sauc.duration".to_string()),
         boosting_table_id: std::env::var("JACKVOICE_VOLC_BOOSTING_TABLE_ID")
             .ok()
-            .or_else(|| settings["volcBoostingTableId"].as_str().map(str::to_string))
             .unwrap_or_default(),
     };
 
@@ -95,47 +88,8 @@ async fn main() {
 }
 
 fn load_api_key() -> String {
-    if let Ok(value) = std::env::var("JACKVOICE_VOLC_API_KEY") {
-        if !value.trim().is_empty() {
-            return value;
-        }
-    }
-    let entry = keyring::Entry::new("com.jackvoice.shared", "volc-api-key")
-        .expect("cannot access OS credential store");
-    let value = entry.get_password().unwrap_or_default();
-    assert!(
-        !value.trim().is_empty(),
-        "no Volcengine APP Key configured; save one in JackVoice or set JACKVOICE_VOLC_API_KEY"
-    );
-    value
-}
-
-fn data_dir() -> std::path::PathBuf {
-    if let Ok(value) = std::env::var("JACKVOICE_DATA_DIR") {
-        if !value.trim().is_empty() {
-            return value.into();
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").expect("HOME is unavailable");
-        return std::path::PathBuf::from(home)
-            .join("Library/Application Support/com.jackvoice.shared");
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let app_data = std::env::var("APPDATA").expect("APPDATA is unavailable");
-        return std::path::PathBuf::from(app_data).join("com.jackvoice.shared");
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
-            return std::path::PathBuf::from(data_home).join("com.jackvoice.shared");
-        }
-        let home = std::env::var("HOME").expect("HOME is unavailable");
-        std::path::PathBuf::from(home).join(".local/share/com.jackvoice.shared")
-    }
+    std::env::var("JACKVOICE_VOLC_API_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .expect("set JACKVOICE_VOLC_API_KEY before running the development probe")
 }

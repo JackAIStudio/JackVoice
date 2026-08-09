@@ -348,7 +348,7 @@ impl AudioRecorder {
     }
 
     pub fn write_pcm(&mut self, pcm: &[u8]) -> Result<(), String> {
-        if pcm.len() % 2 != 0 {
+        if pcm.len() & 1 != 0 {
             return Err("PCM16 音频长度不是偶数。".into());
         }
         let next_len = self

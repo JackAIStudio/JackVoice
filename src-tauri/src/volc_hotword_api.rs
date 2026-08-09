@@ -90,7 +90,7 @@ pub async fn update_boosting_table(
     let api_key = api_key.trim();
     let table_id = table_id.trim();
     if api_key.is_empty() {
-        return Err("请先配置豆包录音识别 APP Key。".into());
+        return Err("请先配置豆包录音识别 API Key。".into());
     }
     if table_id.is_empty() {
         return Err("请先在设置里填写热词表 ID。".into());
@@ -110,9 +110,7 @@ pub async fn update_boosting_table(
         );
 
     let client = reqwest::Client::new();
-    let url = format!(
-        "{VOLC_PROXY_URL}?Action=UpdateBoostingTable&Version={VOLC_API_VERSION}"
-    );
+    let url = format!("{VOLC_PROXY_URL}?Action=UpdateBoostingTable&Version={VOLC_API_VERSION}");
     let response = client
         .post(url)
         .header("X-Api-Key", api_key)
@@ -193,8 +191,8 @@ pub async fn get_boosting_table_name(api_key: &str, table_id: &str) -> Result<St
             api_error_message(&raw, status)
         ));
     }
-    let env: ApiEnvelope<GetResult> = serde_json::from_str(&raw)
-        .map_err(|e| format!("解析热词表查询响应失败：{e}"))?;
+    let env: ApiEnvelope<GetResult> =
+        serde_json::from_str(&raw).map_err(|e| format!("解析热词表查询响应失败：{e}"))?;
     Ok(env
         .result
         .and_then(|r| r.boosting_table)
@@ -229,7 +227,7 @@ pub async fn update_correct_table(
     let api_key = api_key.trim();
     let table_id = table_id.trim();
     if api_key.is_empty() {
-        return Err("请先配置豆包录音识别 APP Key。".into());
+        return Err("请先配置豆包录音识别 API Key。".into());
     }
     if table_id.is_empty() {
         return Err("请先在设置里填写替换词表 ID。".into());
@@ -300,7 +298,6 @@ pub async fn update_correct_table(
     })
 }
 
-
 /// 创建火山替换词表。注意：创建接口字段名是 `TableName`，不是 `CorrectTableName`。
 /// 部分账号下 `UpdateCorrectTable` 会稳定返回 InternalError，此时应改走创建新表。
 #[allow(dead_code)]
@@ -312,7 +309,7 @@ pub async fn create_correct_table(
     let api_key = api_key.trim();
     let table_name = table_name.trim();
     if api_key.is_empty() {
-        return Err("请先配置豆包录音识别 APP Key。".into());
+        return Err("请先配置豆包录音识别 API Key。".into());
     }
     if table_name.is_empty() {
         return Err("替换词表名称不能为空。".into());
@@ -401,10 +398,7 @@ pub async fn upsert_correct_table(
             Ok(sync) => return Ok(sync),
             Err(update_err) => {
                 // 火山部分账号 UpdateCorrectTable 会稳定 500；降级为创建新表。
-                let name = format!(
-                    "jvfix{}",
-                    &uuid_like_suffix()
-                );
+                let name = format!("jvfix{}", &uuid_like_suffix());
                 match create_correct_table(api_key, &name, file_content).await {
                     Ok(mut sync) => {
                         if sync.table_id.is_empty() {

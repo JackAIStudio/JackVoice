@@ -12,7 +12,7 @@ const VARIANT_SETTINGS_FILE: &str = "variant-settings.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
-    /// 豆包流式录音识别所需的 APP Key（X-Api-Key）。
+    /// 豆包流式录音识别所需的 API Key（控制台字段名为 APP Key，请求头为 X-Api-Key）。
     #[serde(default)]
     pub volc_api_key: String,
     /// 豆包流式录音识别资源 ID，默认小时版 Seed-ASR 2.0。
@@ -345,9 +345,11 @@ mod tests {
         let root = test_dir("split");
         let shared = root.join("shared");
         let variant = root.join("variant");
-        let mut settings = AppSettings::default();
-        settings.volc_api_key = "secret".into();
-        settings.onboarding_completed = true;
+        let settings = AppSettings {
+            volc_api_key: "secret".into(),
+            onboarding_completed: true,
+            ..AppSettings::default()
+        };
 
         save_settings(&shared, &variant, &settings).unwrap();
 

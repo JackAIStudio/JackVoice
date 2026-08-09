@@ -5,6 +5,8 @@
 ## 如何验证
 
 - [ ] `npm run build`
+- [ ] `cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check`
+- [ ] `cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings`
 - [ ] `cargo test --locked --manifest-path src-tauri/Cargo.toml`
 - [ ] 已在受影响平台手动验证
 

@@ -288,13 +288,18 @@
               </h3>
               <div class="set-row">
                 <div>
-                  <div class="set-title">豆包录音识别 APP Key</div>
-                  <div class="set-desc">保存在系统凭证库中，不会写入 JackVoice 的设置文件。</div>
+                  <div class="set-title">豆包录音识别 API Key</div>
+                  <div class="set-desc" id="volc-credential-hint">正式版使用系统凭据库；开发版使用隔离的私有凭据文件。</div>
+                  <a class="external-help-link" data-external-link href="https://console.volcengine.com/speech/new/">前往豆包语音控制台获取 APP Key（即这里的 API Key）↗</a>
                 </div>
-                <div class="inline-fields">
-                  <span id="masked-volc-key" class="masked-key">未配置</span>
-                  <input id="volc-api-key" class="text-input" type="password" placeholder="豆包语音 APP Key" autocomplete="off" />
-                  <button id="save-volc-btn" class="btn ghost small">保存</button>
+                <div class="credential-control">
+                  <div class="inline-fields">
+                    <span id="masked-volc-key" class="masked-key">未配置</span>
+                    <input id="volc-api-key" class="text-input" type="password" placeholder="火山控制台 APP Key" autocomplete="off" />
+                    <button id="save-volc-btn" class="btn ghost small">保存并测试</button>
+                    <button id="test-volc-btn" class="btn ghost small">测试连接</button>
+                  </div>
+                  <div id="volc-connection-status" class="connection-test-status" role="status" aria-live="polite"></div>
                 </div>
               </div>
               <div class="set-row">
@@ -310,6 +315,7 @@
                 <div>
                   <div class="set-title">热词表 ID（可选）</div>
                   <div class="set-desc">在控制台 → 豆包语音 → 自学习平台创建热词表后填入 ID，可支持完整 5000 词；留空则自动直传本地词库前 100 字。</div>
+                  <a class="external-help-link" data-external-link href="https://www.volcengine.com/docs/6561/155739?lang=zh">查看官方热词表创建与 ID 获取说明 ↗</a>
                 </div>
                 <div class="inline-fields">
                   <input id="volc-table-id" class="text-input" type="text" placeholder="boosting_table_id" autocomplete="off" />
@@ -441,12 +447,17 @@
             </div>
             <div class="set-row ob-key-row">
               <div>
-                <div class="set-title">豆包录音识别 APP Key（可选）</div>
-                <div class="set-desc" id="ob-key-desc">豆包语音新版控制台的 APP Key；也可稍后再到「设置 → 识别」里配置。</div>
+                <div class="set-title">豆包录音识别 API Key</div>
+                <div class="set-desc" id="ob-key-desc">开始听写前需要配置；也可稍后再到「设置 → 识别」里填写。</div>
+                <a class="external-help-link" data-external-link href="https://console.volcengine.com/speech/new/">前往豆包语音控制台获取 APP Key（即这里的 API Key）↗</a>
               </div>
-              <div class="inline-fields">
-                <input id="ob-volc-api-key" class="text-input" type="password" placeholder="豆包语音 APP Key" autocomplete="off" />
-                <button id="ob-save-volc-key" class="btn ghost small">保存</button>
+              <div class="credential-control">
+                <div class="inline-fields">
+                  <input id="ob-volc-api-key" class="text-input" type="password" placeholder="火山控制台 APP Key" autocomplete="off" />
+                  <button id="ob-save-volc-key" class="btn ghost small">保存并测试</button>
+                  <button id="ob-test-volc-key" class="btn ghost small">测试连接</button>
+                </div>
+                <div id="ob-key-test-status" class="connection-test-status" role="status" aria-live="polite"></div>
               </div>
             </div>
           </section>

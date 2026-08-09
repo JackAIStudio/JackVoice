@@ -1,7 +1,7 @@
 use crate::storage;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 火山引擎识别形：平台会吞空格/标点；长连写实测可用，放宽到 32。
 pub const VOLC_MAX_HOTWORD_CHARS: usize = 32;
@@ -20,22 +20,22 @@ pub struct ReplacementRule {
     pub to: String,
 }
 
-fn hotwords_path(dir: &PathBuf) -> PathBuf {
+fn hotwords_path(dir: &Path) -> PathBuf {
     dir.join("hotwords.json")
 }
 
-fn replacements_path(dir: &PathBuf) -> PathBuf {
+fn replacements_path(dir: &Path) -> PathBuf {
     dir.join(REPLACEMENTS_FILE)
 }
 
-pub fn load(dir: &PathBuf) -> Vec<String> {
+pub fn load(dir: &Path) -> Vec<String> {
     fs::read_to_string(hotwords_path(dir))
         .ok()
         .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
         .unwrap_or_default()
 }
 
-pub fn load_replacements(dir: &PathBuf) -> Vec<ReplacementRule> {
+pub fn load_replacements(dir: &Path) -> Vec<ReplacementRule> {
     fs::read_to_string(replacements_path(dir))
         .ok()
         .and_then(|raw| serde_json::from_str::<Vec<ReplacementRule>>(&raw).ok())
@@ -115,7 +115,7 @@ pub fn recognition_words(words: &[String]) -> Vec<String> {
 }
 
 /// 仅使用用户配置的替换规则（不会从热词自动生成）。
-pub fn user_replacement_rules(dir: &PathBuf) -> Vec<(String, String)> {
+pub fn user_replacement_rules(dir: &Path) -> Vec<(String, String)> {
     sanitize_replacements(&load_replacements(dir))
         .into_iter()
         .map(|r| (r.from, r.to))
@@ -190,12 +190,12 @@ pub fn apply_replacements(text: &str, rules: &[(String, String)]) -> String {
     out
 }
 
-pub fn save(dir: &PathBuf, words: &[String]) -> Result<(), String> {
+pub fn save(dir: &Path, words: &[String]) -> Result<(), String> {
     let raw = serde_json::to_vec_pretty(words).map_err(|e| e.to_string())?;
     storage::write_atomic(&hotwords_path(dir), &raw, true)
 }
 
-pub fn save_replacements(dir: &PathBuf, rules: &[ReplacementRule]) -> Result<(), String> {
+pub fn save_replacements(dir: &Path, rules: &[ReplacementRule]) -> Result<(), String> {
     let cleaned = sanitize_replacements(rules);
     let raw = serde_json::to_vec_pretty(&cleaned).map_err(|e| e.to_string())?;
     storage::write_atomic(&replacements_path(dir), &raw, true)

@@ -189,19 +189,18 @@ fn audio_thread(
         );
     }
 
-    let first_stream =
-        match build_input_stream(
-            &resolved.device,
-            pcm_sink.clone(),
-            err_tx.clone(),
-            input_gain_db,
-        ) {
-            Ok(stream) => stream,
-            Err(err) => {
-                let _ = ready_tx.send(Err(err));
-                return;
-            }
-        };
+    let first_stream = match build_input_stream(
+        &resolved.device,
+        pcm_sink.clone(),
+        err_tx.clone(),
+        input_gain_db,
+    ) {
+        Ok(stream) => stream,
+        Err(err) => {
+            let _ = ready_tx.send(Err(err));
+            return;
+        }
+    };
     if let Err(err) = first_stream.play() {
         let _ = ready_tx.send(Err(format!("启动麦克风失败：{err}")));
         return;
@@ -220,18 +219,34 @@ fn audio_thread(
                 }
 
                 let previous = resolved.name.clone();
-                let mut rebuilt =
-                    try_rebuild_stream(&host, preferred.as_deref(), &pcm_sink, &err_tx, input_gain_db);
+                let mut rebuilt = try_rebuild_stream(
+                    &host,
+                    preferred.as_deref(),
+                    &pcm_sink,
+                    &err_tx,
+                    input_gain_db,
+                );
                 if rebuilt.is_none() {
                     // No usable mic right now; tell the UI, then keep retrying.
-                    emit_notice(&notice_sink, AudioNotice::DeviceLost { previous: previous.clone() });
+                    emit_notice(
+                        &notice_sink,
+                        AudioNotice::DeviceLost {
+                            previous: previous.clone(),
+                        },
+                    );
                 }
                 while rebuilt.is_none() {
                     match control_rx.recv_timeout(RECONNECT_RETRY_WAIT) {
                         Err(RecvTimeoutError::Disconnected) | Ok(ControlMsg::Stop) => return,
                         Ok(ControlMsg::StreamError) | Err(RecvTimeoutError::Timeout) => {}
                     }
-                    rebuilt = try_rebuild_stream(&host, preferred.as_deref(), &pcm_sink, &err_tx, input_gain_db);
+                    rebuilt = try_rebuild_stream(
+                        &host,
+                        preferred.as_deref(),
+                        &pcm_sink,
+                        &err_tx,
+                        input_gain_db,
+                    );
                 }
                 let (new_stream, new_resolved) = rebuilt.unwrap();
                 emit_notice(
@@ -269,9 +284,13 @@ fn try_rebuild_stream(
     input_gain_db: f32,
 ) -> Option<(Stream, ResolvedInput)> {
     let resolved = resolve_input_device(host, preferred).ok()?;
-    let stream =
-        build_input_stream(&resolved.device, pcm_sink.clone(), err_tx.clone(), input_gain_db)
-            .ok()?;
+    let stream = build_input_stream(
+        &resolved.device,
+        pcm_sink.clone(),
+        err_tx.clone(),
+        input_gain_db,
+    )
+    .ok()?;
     stream.play().ok()?;
     Some((stream, resolved))
 }
@@ -348,8 +367,7 @@ fn build_input_stream(
                     let mono: Vec<i16> = data
                         .chunks(channels)
                         .map(|frame| {
-                            let sum: i32 =
-                                frame.iter().map(|s| (*s as i32) - 32768).sum();
+                            let sum: i32 = frame.iter().map(|s| (*s as i32) - 32768).sum();
                             (sum / channels.max(1) as i32) as i16
                         })
                         .collect();
@@ -401,7 +419,9 @@ fn resolve_input_device(
         // back to the system default so dictation can continue; the UI is
         // told via AudioNotice::FallbackAtStart.
         let (device, name) = default_or_first_input(host).ok_or_else(|| {
-            format!("麦克风「{preferred}」不可用，且没有其他可用麦克风。请检查连接或系统麦克风权限。")
+            format!(
+                "麦克风「{preferred}」不可用，且没有其他可用麦克风。请检查连接或系统麦克风权限。"
+            )
         })?;
         return Ok(ResolvedInput {
             device,
@@ -476,7 +496,7 @@ impl Resampler {
     fn new(in_rate: u32, out_rate: u32, gain_db: f32) -> Self {
         let agc = webrtc_audio_processing::Processor::new(16_000)
             .ok()
-            .map(|processor| {
+            .inspect(|processor| {
                 use webrtc_audio_processing::config::{
                     AdaptiveDigital, Config as WapConfig, GainController, GainController2,
                 };
@@ -500,7 +520,6 @@ impl Resampler {
                     ..Default::default()
                 };
                 processor.set_config(config);
-                processor
             });
         let agc_frame_size = agc
             .as_ref()
@@ -699,5 +718,4 @@ mod tests {
             "manual offset did not raise the level: {base_peak:.4} -> {boosted_peak:.4}"
         );
     }
-
 }

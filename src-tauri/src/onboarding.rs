@@ -43,8 +43,7 @@ mod macos {
     pub fn request_accessibility_prompt() -> bool {
         let key = CFString::new("AXTrustedCheckOptionPrompt");
         let value = CFBoolean::true_value();
-        let options =
-            CFDictionary::from_CFType_pairs(&[(key.as_CFType(), value.as_CFType())]);
+        let options = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), value.as_CFType())]);
         unsafe {
             AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef() as CFDictionaryRef) != 0
         }
@@ -82,7 +81,6 @@ mod macos {
             Err(_) => false,
         }
     }
-
 }
 
 #[cfg(target_os = "macos")]

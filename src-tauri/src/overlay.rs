@@ -161,10 +161,7 @@ fn frontmost_app_name() -> Option<String> {
 #[cfg(target_os = "macos")]
 fn activate_app(name: &str) {
     use std::process::Command;
-    let script = format!(
-        "tell application \"{}\" to activate",
-        name.replace('"', "")
-    );
+    let script = format!("tell application \"{}\" to activate", name.replace('"', ""));
     // Block until activation completes so a subsequent Cmd+V is guaranteed to
     // target this app instead of whatever was frontmost mid-transition.
     let _ = Command::new("osascript").arg("-e").arg(script).status();

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "overlay",
+  "description": "Minimal capability for the dictation overlay",
+  "windows": ["overlay"],
+  "permissions": ["core:default"]
+}

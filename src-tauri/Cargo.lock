@@ -2281,6 +2281,7 @@ dependencies = [
  "openssl",
  "parking_lot",
  "reqwest",
+ "security-framework",
  "serde",
  "serde_json",
  "tauri",

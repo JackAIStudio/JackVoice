@@ -10,6 +10,8 @@ type UiState = {
   transcript: string;
   hasVolcApiKey: boolean;
   maskedVolcApiKey: string;
+  volcCredentialSource: string;
+  volcCredentialWarning: string;
   volcResourceId: string;
   volcBoostingTableId: string;
   semanticPunctuationEnabled: boolean;
@@ -299,9 +301,41 @@ function applyState(state: UiState) {
 
   const volcMasked = $("#masked-volc-key");
   if (volcMasked) {
+    const sourceSuffix =
+      state.volcCredentialSource === "environment"
+        ? " · 环境变量覆盖"
+        : state.volcCredentialSource === "developmentFile"
+          ? " · 开发版本地凭据"
+          : state.volcCredentialSource === "session"
+            ? " · 仅本次运行"
+            : "";
     volcMasked.textContent = state.hasVolcApiKey
-      ? `已配置：${state.maskedVolcApiKey}`
-      : "未配置";
+      ? `已配置：${state.maskedVolcApiKey}${sourceSuffix}`
+      : state.volcCredentialWarning
+        ? "暂不可用"
+        : "未配置";
+  }
+  const credentialDescription = state.volcCredentialWarning || (() => {
+    switch (state.volcCredentialSource) {
+      case "environment":
+        return "开发版正在使用 JACKVOICE_VOLC_API_KEY 覆盖值；不会访问正式版凭据。";
+      case "developmentFile":
+        return "已保存在开发版私有凭据文件中，不会读取或覆盖正式版 API Key。";
+      case "session":
+        return "开发版仅在本次运行的内存中使用此 Key，退出后不会保留。";
+      case "legacyMigration":
+        return "旧版凭据已静默迁移到正式版系统凭据条目。";
+      case "systemStore":
+        return "已安全保存在系统凭据库中，正常读取不会要求输入系统密码。";
+      default:
+        return "开始听写前需要配置。正式版使用系统凭据库，开发版使用隔离的私有凭据文件。";
+    }
+  })();
+  for (const selector of ["#volc-credential-hint", "#ob-key-desc"]) {
+    const hint = $(selector);
+    if (!hint) continue;
+    hint.textContent = credentialDescription;
+    hint.classList.toggle("warn", !!state.volcCredentialWarning);
   }
   const volcResource = $("#volc-resource-id") as HTMLInputElement | null;
   if (volcResource && document.activeElement !== volcResource) {
@@ -319,7 +353,7 @@ function applyState(state: UiState) {
     syncBtn.disabled = !canSync;
     syncBtn.title = canSync
       ? "手动同步热词表到云端（替换词仅本地）"
-      : "需已配置豆包录音识别 APP Key 与热词表 ID";
+      : "需已配置豆包录音识别 API Key 与热词表 ID";
   }
 
   const semantic = $("#semantic-punctuation") as HTMLInputElement | null;
@@ -1196,6 +1230,15 @@ async function toggleDictation() {
   }
 }
 
+async function openExternalLink(url: string) {
+  try {
+    await invoke("open_external_url", { url });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    window.alert(`无法打开链接：${message}`);
+  }
+}
+
 async function saveVolcSettings() {
   const apiKey = (($("#volc-api-key") as HTMLInputElement | null)?.value ?? "").trim();
   const resourceId = (($("#volc-resource-id") as HTMLInputElement | null)?.value ?? "").trim();
@@ -1209,10 +1252,70 @@ async function saveVolcSettings() {
     applyState(state);
     const input = $("#volc-api-key") as HTMLInputElement | null;
     if (input) input.value = "";
+    await testVolcConnection({
+      inputSelector: "#volc-api-key",
+      resourceSelector: "#volc-resource-id",
+      statusSelector: "#volc-connection-status",
+      buttonSelector: "#test-volc-btn",
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    window.alert(message);
+    setVolcConnectionStatus("#volc-connection-status", message, "warn");
     if (currentState) applyState(currentState);
+  }
+}
+
+type VolcConnectionTestOptions = {
+  inputSelector: string;
+  resourceSelector?: string;
+  statusSelector: string;
+  buttonSelector: string;
+};
+
+function setVolcConnectionStatus(
+  selector: string,
+  message: string,
+  kind: "testing" | "ok" | "warn",
+) {
+  const status = $(selector);
+  if (!status) return;
+  status.className = `connection-test-status ${kind}`;
+  status.textContent = message;
+}
+
+async function testVolcConnection(options: VolcConnectionTestOptions): Promise<boolean> {
+  const input = $(options.inputSelector) as HTMLInputElement | null;
+  const resourceInput = options.resourceSelector
+    ? ($(options.resourceSelector) as HTMLInputElement | null)
+    : null;
+  const button = $(options.buttonSelector) as HTMLButtonElement | null;
+  const apiKey = (input?.value ?? "").trim();
+  const resourceId = (resourceInput?.value || currentState?.volcResourceId || "").trim();
+  const originalLabel = button?.textContent || "测试连接";
+
+  if (button) {
+    button.disabled = true;
+    button.textContent = "测试中…";
+  }
+  setVolcConnectionStatus(
+    options.statusSelector,
+    "正在连接豆包语音服务验证 API Key 与资源 ID…",
+    "testing",
+  );
+
+  try {
+    const message = await invoke<string>("test_volc_connection", { apiKey, resourceId });
+    setVolcConnectionStatus(options.statusSelector, `✓ ${message}`, "ok");
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setVolcConnectionStatus(options.statusSelector, message, "warn");
+    return false;
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalLabel;
+    }
   }
 }
 
@@ -1449,11 +1552,35 @@ function bindOnboarding() {
       if (desc) {
         desc.textContent = state.hasVolcApiKey
           ? `已配置：${state.maskedVolcApiKey}`
-          : "豆包语音新版控制台的 APP Key；也可稍后再到「设置 → 识别」里配置。";
+          : "开始听写前需要配置；也可稍后再到「设置 → 识别」里填写。";
+        desc.classList.remove("warn");
       }
+      await testVolcConnection({
+        inputSelector: "#ob-volc-api-key",
+        statusSelector: "#ob-key-test-status",
+        buttonSelector: "#ob-test-volc-key",
+      });
     } catch (error) {
       console.error("save onboarding volc key failed", error);
+      const desc = $("#ob-key-desc");
+      if (desc) {
+        desc.textContent = error instanceof Error ? error.message : String(error);
+        desc.classList.add("warn");
+      }
+      setVolcConnectionStatus(
+        "#ob-key-test-status",
+        error instanceof Error ? error.message : String(error),
+        "warn",
+      );
     }
+  });
+
+  $("#ob-test-volc-key")?.addEventListener("click", () => {
+    void testVolcConnection({
+      inputSelector: "#ob-volc-api-key",
+      statusSelector: "#ob-key-test-status",
+      buttonSelector: "#ob-test-volc-key",
+    });
   });
 }
 
@@ -1514,7 +1641,24 @@ function bindSettingsModal() {
   $("#gain-db")?.addEventListener("input", () => void onGainChanged());
 
   $("#save-volc-btn")?.addEventListener("click", () => void saveVolcSettings());
+  $("#test-volc-btn")?.addEventListener("click", () => {
+    void testVolcConnection({
+      inputSelector: "#volc-api-key",
+      resourceSelector: "#volc-resource-id",
+      statusSelector: "#volc-connection-status",
+      buttonSelector: "#test-volc-btn",
+    });
+  });
   $("#save-options-btn")?.addEventListener("click", () => void saveOptions());
+}
+
+function bindExternalLinks() {
+  document.querySelectorAll<HTMLAnchorElement>("a[data-external-link]").forEach((link) => {
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      void openExternalLink(link.href);
+    });
+  });
 }
 
 function bindHome() {
@@ -1582,6 +1726,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   bindDict();
   bindSettingsModal();
   bindOnboarding();
+  bindExternalLinks();
 
   await refreshState();
   await Promise.all([refreshHistory(), refreshHotwords(), refreshReplacements()]);

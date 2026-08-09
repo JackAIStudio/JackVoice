@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { platform } from "node:os";
 import { join } from "node:path";
 
@@ -33,15 +34,44 @@ function resolveCargoTargetDir() {
   return JSON.parse(metadata).target_directory;
 }
 
+function resolveBuildEnvironment(cargoTargetDir) {
+  const env = {
+    ...process.env,
+    CARGO_TARGET_DIR: cargoTargetDir,
+  };
+
+  // The bundled WebRTC audio processor uses Meson. On macOS, Meson may find a
+  // Homebrew Abseil installation through CMake while the Rust build script
+  // fails to discover the same installation through pkg-config. In that case
+  // the final Rust link cannot find libabsl_strings even though Meson compiled
+  // against it. Keep both build stages on the same library search path.
+  if (platform() === "darwin") {
+    try {
+      const abseilPrefix = execFileSync("brew", ["--prefix", "abseil"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+      const abseilLibDir = join(abseilPrefix, "lib");
+      if (existsSync(join(abseilLibDir, "libabsl_strings.dylib"))) {
+        env.LIBRARY_PATH = [abseilLibDir, env.LIBRARY_PATH]
+          .filter(Boolean)
+          .join(":");
+        console.log(`[JackVoice] Homebrew Abseil: ${abseilLibDir}`);
+      }
+    } catch {
+      // No Homebrew Abseil installation: Meson uses the bundled copy.
+    }
+  }
+
+  return env;
+}
+
 const cargoTargetDir = resolveCargoTargetDir();
 console.log(`[JackVoice] Cargo 构建缓存: ${cargoTargetDir}`);
 
 const child = spawn(npmCommand, args, {
   cwd: process.cwd(),
-  env: {
-    ...process.env,
-    CARGO_TARGET_DIR: cargoTargetDir,
-  },
+  env: resolveBuildEnvironment(cargoTargetDir),
   stdio: "inherit",
 });
 
@@ -60,12 +90,22 @@ child.on("exit", (code, signal) => {
       "JackVoice Dev.app",
     );
     try {
+      // Repeated local bundles can retain Finder metadata or quarantine xattrs
+      // from an older .app directory. codesign may appear to succeed while a
+      // strict verification still rejects those attributes, so normalize the
+      // freshly bundled development app before applying its ad-hoc signature.
+      execFileSync("xattr", ["-cr", appPath], { stdio: "inherit" });
       // Tauri's --no-sign avoids using the production Developer ID. Apply a
       // local ad-hoc signature so macOS still validates the development app's
       // resource envelope and keeps it distinct from the release identity.
       execFileSync(
         "codesign",
         ["--force", "--deep", "--sign", "-", appPath],
+        { stdio: "inherit" },
+      );
+      execFileSync(
+        "codesign",
+        ["--verify", "--deep", "--strict", "--verbose=2", appPath],
         { stdio: "inherit" },
       );
     } catch (error) {
