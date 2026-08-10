@@ -9,6 +9,8 @@ const FLAG_COMMAND: u64 = 0x0010_0000;
 const FLAG_FN: u64 = 0x0080_0000;
 const SHORTCUT_MODIFIER_MASK: u64 =
     FLAG_SHIFT | FLAG_CONTROL | FLAG_OPTION | FLAG_COMMAND | FLAG_FN;
+#[cfg(target_os = "macos")]
+static FN_SHORTCUT_MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
 pub struct ShortcutCaptureState {
@@ -46,6 +48,13 @@ pub fn uses_fn_modifier(accelerator: &str) -> bool {
     accelerator
         .split('+')
         .any(|token| token.trim().eq_ignore_ascii_case("fn"))
+}
+
+pub fn should_install_fn_monitor_at_startup(
+    onboarding_completed: bool,
+    accessibility_trusted: bool,
+) -> bool {
+    onboarding_completed && accessibility_trusted
 }
 
 pub fn validate_fn_shortcut(accelerator: &str) -> Result<(), String> {
@@ -276,7 +285,14 @@ pub fn install_fn_shortcut_monitor(app: AppHandle) {
     };
     use std::time::Duration;
 
-    let _ = std::thread::Builder::new()
+    if FN_SHORTCUT_MONITOR_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    let spawn_result = std::thread::Builder::new()
         .name("jackvoice-fn-shortcut".into())
         .spawn(move || {
             let mut waiting_for_permission_logged = false;
@@ -368,6 +384,10 @@ pub fn install_fn_shortcut_monitor(app: AppHandle) {
                 std::thread::sleep(Duration::from_secs(2));
             }
         });
+    if let Err(error) = spawn_result {
+        FN_SHORTCUT_MONITOR_STARTED.store(false, Ordering::Release);
+        eprintln!("[shortcut] 无法启动 Fn 全局快捷键监听：{error}");
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -413,5 +433,13 @@ mod tests {
         assert!(FunctionShortcut::parse("Fn").is_err());
         assert!(FunctionShortcut::parse("Fn+Escape").is_err());
         assert!(FunctionShortcut::parse("Fn+Fn+Space").is_err());
+    }
+
+    #[test]
+    fn native_monitor_never_starts_before_onboarding_or_permission() {
+        assert!(!should_install_fn_monitor_at_startup(false, false));
+        assert!(!should_install_fn_monitor_at_startup(false, true));
+        assert!(!should_install_fn_monitor_at_startup(true, false));
+        assert!(should_install_fn_monitor_at_startup(true, true));
     }
 }

@@ -6,6 +6,7 @@ type InputDeviceInfo = { id: string; name: string; isDefault: boolean };
 
 type UiState = {
   phase: string;
+  recognitionPhase: string;
   status: string;
   transcript: string;
   hasVolcApiKey: boolean;
@@ -29,7 +30,6 @@ type UiState = {
   muteSystemAudioDuringDictation: boolean;
   systemAudioMuteSupported: boolean;
   onboardingCompleted: boolean;
-  audioRetention: string;
   historyTextSize: string;
 };
 
@@ -68,6 +68,10 @@ type HistoryRecord = {
     inputGainDb: number;
     inputDeviceId: string;
   };
+  recognitionStatus?: "completed" | "noSpeech" | "failed";
+  recognitionError?: string;
+  recordingError?: string;
+  audioMissing?: boolean;
 };
 
 type HistoryStats = {
@@ -77,8 +81,6 @@ type HistoryStats = {
 };
 
 type HistoryData = { records: HistoryRecord[]; stats: HistoryStats };
-
-type PermissionStatus = { microphone: boolean; accessibility: boolean };
 
 // 火山引擎热词文本规范：识别形去空格/标点，最长 32 字。
 const VOLC_HOTWORD_MAX_CHARS = 32;
@@ -112,6 +114,8 @@ let dictationRecordingStartedAt: number | null = null;
 let lastDictationPhase = "idle";
 let credentialEditorOpen = false;
 let onboardingCredentialEditorOpen = false;
+let onboardingMicVerified = false;
+let onboardingAccessibilityGranted = false;
 
 const COPY_SUCCESS_ICON =
   '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4 4L19 6"/></svg>';
@@ -255,6 +259,8 @@ function phaseLabel(phase: string): string {
   switch (phase) {
     case "recording":
       return "正在听写";
+    case "starting":
+      return "正在启动录音";
     case "connecting":
       return "连接中";
     case "finalizing":
@@ -346,37 +352,36 @@ function applyState(state: UiState) {
   if (kbd) kbd.textContent = formatShortcut(state.shortcut || "Alt+Space");
 
   const phase = state.phase || "idle";
-  const setupRequired = phase === "idle" && !state.hasVolcApiKey;
-  const controlPhase = setupRequired ? "setup" : phase;
+  const controlPhase = phase;
   const consoleTitle = $("#console-title");
   if (consoleTitle) {
-    if (phase === "recording") consoleTitle.textContent = "正在听写";
+    if (phase === "recording") {
+      consoleTitle.textContent = state.recognitionPhase === "streaming" ? "正在听写" : "正在录音";
+    }
+    else if (phase === "starting") consoleTitle.textContent = "正在启动录音…";
     else if (phase === "connecting") consoleTitle.textContent = "正在连接…";
     else if (phase === "finalizing") consoleTitle.textContent = "正在整理文字…";
     else if (phase === "error") consoleTitle.textContent = "重试听写";
-    else if (setupRequired) consoleTitle.textContent = "完成设置";
     else consoleTitle.textContent = "开始听写";
   }
 
   const toggle = $("#toggle-btn") as HTMLButtonElement | null;
   if (toggle) {
     toggle.className = `dictation-control ${controlPhase}`;
-    toggle.disabled = phase === "connecting" || phase === "finalizing";
+    toggle.disabled = phase === "finalizing";
     toggle.title = state.status || phaseLabel(phase);
-    toggle.setAttribute("aria-pressed", String(phase === "recording"));
+    toggle.setAttribute("aria-pressed", String(phase === "starting" || phase === "recording"));
     toggle.setAttribute(
       "aria-label",
-      phase === "recording"
+      phase === "starting" || phase === "recording"
         ? "结束听写"
-        : setupRequired
-          ? "打开设置以完成听写配置"
-          : phase === "error"
+        : phase === "error"
             ? `重试听写：${state.status || "上次听写出错"}`
             : state.status || "开始听写",
     );
   }
 
-  kbd?.classList.toggle("hidden", phase !== "idle" || setupRequired);
+  kbd?.classList.toggle("hidden", phase !== "idle");
   syncDictationElapsed(phase);
 
   const notice = $("#dictation-notice");
@@ -442,7 +447,7 @@ function applyState(state: UiState) {
   if (onboardingHint) {
     onboardingHint.textContent = state.volcCredentialWarning || (state.hasVolcApiKey
       ? "已连接，可以直接继续。"
-      : "没有 App Key 也可以先完成引导，稍后再到设置中配置。");
+      : "可以跳过，稍后再到设置中配置；本地录音不受影响。");
     onboardingHint.classList.toggle("warn", !!state.volcCredentialWarning);
   }
   const onboardingEditButton = $("#ob-edit-volc-key") as HTMLButtonElement | null;
@@ -461,18 +466,8 @@ function applyState(state: UiState) {
   );
   $("#ob-cancel-volc-key")?.classList.toggle("hidden", !state.hasVolcApiKey);
 
-  const completeTitle = $("#ob-complete-title");
-  const completeCopy = $("#ob-complete-copy");
-  const completeDetail = $("#ob-complete-detail");
-  if (state.hasVolcApiKey) {
-    if (completeTitle) completeTitle.textContent = "准备就绪";
-    if (completeCopy) completeCopy.innerHTML = "现在按下 <kbd class=\"shortcut\">⌥ + Space</kbd> 开始语音输入；说完再按一次结束，文字会自动插入。";
-    if (completeDetail) completeDetail.textContent = "也可以点击主界面上的「开始听写」按钮。";
-  } else {
-    if (completeTitle) completeTitle.textContent = "基础设置已完成";
-    if (completeCopy) completeCopy.textContent = "还差语音服务连接。你可以先进入主界面，准备好 App Key 后再到设置中完成配置。";
-    if (completeDetail) completeDetail.textContent = "完成连接前，听写按钮会带你回到设置。";
-  }
+  renderOnboardingCompletion(state);
+  updateOnboardingNextLabel();
   const volcResource = $("#volc-resource-id") as HTMLInputElement | null;
   if (volcResource && document.activeElement !== volcResource) {
     volcResource.value = state.volcResourceId || "volc.seedasr.sauc.duration";
@@ -522,13 +517,6 @@ function applyState(state: UiState) {
   const gainLabel = $("#gain-db-label");
   if (gainLabel) {
     gainLabel.textContent = state.inputGainDb > 0 ? `增强 +${state.inputGainDb} dB` : "默认";
-  }
-
-  for (const selector of ["#audio-retention", "#ob-audio-retention"]) {
-    const retention = $(selector) as HTMLSelectElement | null;
-    if (retention && document.activeElement !== retention) {
-      retention.value = state.audioRetention || "thirtyDays";
-    }
   }
 
   const ob = $("#onboarding");
@@ -583,7 +571,9 @@ function applyMicUi(state: UiState) {
     if (devices.length === 0) {
       const opt = document.createElement("option");
       opt.value = "";
-      opt.textContent = "未检测到麦克风";
+      opt.textContent = state.onboardingCompleted
+        ? "未检测到麦克风"
+        : "授权并开始测试后可选择麦克风";
       obSelect.appendChild(opt);
       obSelect.disabled = true;
     } else {
@@ -725,6 +715,7 @@ function renderHistory(records: HistoryRecord[]) {
     day.appendChild(label);
 
     for (const record of group.items) {
+      const hasPlayableAudio = !!record.audio && !record.audioMissing;
       const row = document.createElement("div");
       row.className = `history-row${record.id === selectedHistoryId ? " active" : ""}`;
       row.dataset.historyRow = record.id;
@@ -745,27 +736,34 @@ function renderHistory(records: HistoryRecord[]) {
       time.className = "history-row-time";
       time.textContent = timeLabel(new Date(record.finishedAtMs));
       const duration = document.createElement("span");
-      duration.className = `history-row-duration${record.audio ? " audio" : ""}`;
+      duration.className = `history-row-duration${hasPlayableAudio ? " audio" : ""}`;
       duration.textContent = formatClipDuration(record.durationMs);
       meta.append(time, duration);
 
       const text = document.createElement("div");
       text.className = "history-row-text";
-      text.textContent = record.text;
+      text.textContent = record.text
+        || (record.recordingError
+          ? "本地录音异常 · 文件可能不完整"
+          : record.recognitionError
+            ? "录音已保存 · 实时识别未完成"
+            : "本次录音未生成文字");
 
       const actions = document.createElement("div");
       actions.className = "history-row-actions";
-      const copy = document.createElement("button");
-      copy.type = "button";
-      copy.className = "history-row-action";
-      copy.textContent = "复制";
-      copy.addEventListener("click", (event) => {
-        event.stopPropagation();
-        void copyHistoryText(record.text, copy);
-      });
-      actions.appendChild(copy);
+      if (record.text.trim()) {
+        const copy = document.createElement("button");
+        copy.type = "button";
+        copy.className = "history-row-action";
+        copy.textContent = "复制";
+        copy.addEventListener("click", (event) => {
+          event.stopPropagation();
+          void copyHistoryText(record.text, copy);
+        });
+        actions.appendChild(copy);
+      }
 
-      if (record.audio) {
+      if (hasPlayableAudio) {
         const play = document.createElement("button");
         play.type = "button";
         play.className = "history-row-action";
@@ -815,12 +813,14 @@ function renderHistoryDetail(record: HistoryRecord) {
 
   const actions = document.createElement("div");
   actions.className = "detail-actions";
-  const copy = document.createElement("button");
-  copy.type = "button";
-  copy.className = "detail-action";
-  copy.textContent = "复制文字";
-  copy.addEventListener("click", () => void copyHistoryText(record.text, copy));
-  actions.appendChild(copy);
+  if (record.text.trim()) {
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "detail-action";
+    copy.textContent = "复制文字";
+    copy.addEventListener("click", () => void copyHistoryText(record.text, copy));
+    actions.appendChild(copy);
+  }
   const close = document.createElement("button");
   close.type = "button";
   close.className = "detail-close";
@@ -833,7 +833,7 @@ function renderHistoryDetail(record: HistoryRecord) {
   const content = document.createElement("div");
   content.className = "detail-content";
 
-  if (record.audio) {
+  if (record.audio && !record.audioMissing) {
     const player = document.createElement("div");
     player.className = "detail-player";
     const playerMain = document.createElement("div");
@@ -891,8 +891,24 @@ function renderHistoryDetail(record: HistoryRecord) {
   } else {
     const noAudio = document.createElement("div");
     noAudio.className = "detail-no-audio";
-    noAudio.textContent = "本条记录没有保留本地录音";
+    noAudio.textContent = record.audioMissing
+      ? "录音文件已在本地录音文件夹中被删除或移动"
+      : "这是一条旧版文字记录，没有关联的本地录音";
     content.appendChild(noAudio);
+  }
+
+  if (record.recordingError) {
+    const recordingNotice = document.createElement("div");
+    recordingNotice.className = "detail-no-audio";
+    recordingNotice.textContent = `本地录音异常：${record.recordingError}`;
+    content.appendChild(recordingNotice);
+  }
+
+  if (record.recognitionError) {
+    const recognitionNotice = document.createElement("div");
+    recognitionNotice.className = "detail-no-audio";
+    recognitionNotice.textContent = `实时识别未完成：${record.recognitionError}`;
+    content.appendChild(recognitionNotice);
   }
 
   const transcriptLabel = document.createElement("div");
@@ -900,7 +916,7 @@ function renderHistoryDetail(record: HistoryRecord) {
   transcriptLabel.textContent = "听写文字";
   const transcript = document.createElement("div");
   transcript.className = "detail-transcript";
-  transcript.textContent = record.text;
+  transcript.textContent = record.text || "本次录音未生成听写文字。";
   content.append(transcriptLabel, transcript);
 
   const info = document.createElement("details");
@@ -918,13 +934,15 @@ function renderHistoryDetail(record: HistoryRecord) {
   };
   addInfo("完成时间", date.toLocaleString("zh-CN"));
   addInfo("文字", `${record.charCount} 字`);
-  if (record.audio) {
+  if (record.audio && !record.audioMissing) {
     addInfo(
       "本地录音",
       `WAV · ${record.audio.sampleRateHz / 1000} kHz · ${formatFileSize(record.audio.sizeBytes)}`,
     );
+  } else if (record.audioMissing) {
+    addInfo("本地录音", "文件已被删除或移动");
   } else {
-    addInfo("本地录音", "未保留");
+    addInfo("本地录音", "旧版记录未关联录音");
   }
   info.append(infoSummary, infoGrid);
   content.appendChild(info);
@@ -932,7 +950,7 @@ function renderHistoryDetail(record: HistoryRecord) {
   const footer = document.createElement("div");
   footer.className = "detail-footer";
   const footerStart = document.createElement("div");
-  if (record.audio) {
+  if (record.audio && !record.audioMissing) {
     const reveal = document.createElement("button");
     reveal.type = "button";
     reveal.className = "detail-action";
@@ -959,7 +977,7 @@ function renderHistoryDetail(record: HistoryRecord) {
 }
 
 async function deleteHistoryRecord(recordId: string) {
-  if (!window.confirm("删除这条听写记录及其本地录音？此操作无法撤销。")) return;
+  if (!window.confirm("删除这条应用内听写记录？本地录音文件会继续保留。")) return;
   if (historyPlayback?.recordId === recordId) stopHistoryPlayback();
   try {
     const data = await invoke<HistoryData>("delete_history_record", { recordId });
@@ -977,7 +995,7 @@ async function deleteHistoryRecord(recordId: string) {
 
 async function clearAllHistory() {
   if (historyRecords.length === 0) return;
-  if (!window.confirm("清空所有听写文本、录音和旧备份？此操作无法撤销。")) return;
+  if (!window.confirm("清空所有应用内听写记录？本地录音文件会继续保留。")) return;
   stopHistoryPlayback();
   try {
     const data = await invoke<HistoryData>("clear_history");
@@ -988,7 +1006,7 @@ async function clearAllHistory() {
     selectedHistoryId = null;
     renderStats(data.stats);
     renderHistory(data.records);
-    showToast("本地听写数据已清空", "success");
+    showToast("听写记录已清空，录音文件仍保留", "success");
   } catch (error) {
     await refreshHistory();
     showToast(`清空失败：${String(error)}`, "error");
@@ -1818,12 +1836,44 @@ async function onMicChanged() {
 }
 
 async function startMicTest() {
+  const onboardingVisible = !$("#onboarding")?.classList.contains("hidden");
+  if (onboardingVisible) {
+    setOnboardingMicHint("正在请求麦克风权限，请在系统弹窗中选择「允许」。", "warn");
+    // Paint the permission explanation before the synchronous native capture
+    // call can display a blocking macOS TCC dialog.
+    await waitForNextPaint();
+  }
   try {
     const state = await invoke<UiState>("start_mic_test");
+    onboardingMicVerified = true;
     applyState(state);
+    if (onboardingVisible) {
+      setOnboardingMicHint("✓ 麦克风已授权。对着麦克风说话，确认音量条会跳动。", "ok");
+    }
   } catch (error) {
+    onboardingMicVerified = false;
     console.error("mic test failed", error);
+    if (onboardingVisible) {
+      const message = error instanceof Error ? error.message : String(error);
+      setOnboardingMicHint(
+        `未能使用麦克风：${message} 如果刚才选择了「不允许」，请到系统设置的「隐私与安全性 → 麦克风」中开启 JackVoice。`,
+        "warn",
+      );
+    }
   }
+}
+
+function setOnboardingMicHint(message: string, tone: "ok" | "warn") {
+  const hint = $("#ob-mic-hint");
+  if (!hint) return;
+  hint.className = `ob-hint ${tone}`;
+  hint.textContent = message;
+}
+
+function waitForNextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
+  });
 }
 
 async function stopMicTest() {
@@ -1858,24 +1908,44 @@ async function setMuteSystemAudioDuringDictation(enabled: boolean) {
   }
 }
 
-async function setAudioRetention(retention: string) {
-  try {
-    const state = await invoke<UiState>("set_audio_retention", { retention });
-    applyState(state);
-    await refreshHistory();
-    showToast("录音保留策略已更新", "success");
-  } catch (error) {
-    window.alert(error instanceof Error ? error.message : String(error));
-    if (currentState) applyState(currentState);
-    await refreshHistory();
-  }
-}
-
 /* ---------------- 首次启动引导（Onboarding） ---------------- */
 
 const OB_STEP_COUNT = 6;
 let obStep = 0;
 let obBound = false;
+
+function updateOnboardingNextLabel() {
+  const next = $("#ob-next") as HTMLButtonElement | null;
+  if (!next) return;
+  if (obStep === OB_STEP_COUNT - 1) {
+    next.textContent = "开始使用";
+  } else if (obStep === 2 && !onboardingAccessibilityGranted) {
+    next.textContent = "暂时跳过";
+  } else if (obStep === 4 && !currentState?.hasVolcApiKey) {
+    next.textContent = "暂时跳过";
+  } else {
+    next.textContent = "下一步";
+  }
+}
+
+function renderOnboardingCompletion(state: UiState) {
+  const title = $("#ob-complete-title");
+  const copy = $("#ob-complete-copy");
+  const detail = $("#ob-complete-detail");
+  if (state.hasVolcApiKey && onboardingAccessibilityGranted) {
+    if (title) title.textContent = "准备就绪";
+    if (copy) copy.innerHTML = "现在按下 <kbd class=\"shortcut\">⌥ + Space</kbd> 开始语音输入；说完再按一次结束，文字会自动插入。";
+    if (detail) detail.textContent = "麦克风、实时识别和自动插入均已配置。";
+  } else if (state.hasVolcApiKey) {
+    if (title) title.textContent = "语音识别已就绪";
+    if (copy) copy.textContent = "你现在可以录音并生成识别文字；结果会保留在剪贴板和本地历史中。";
+    if (detail) detail.textContent = "稍后可在设置中开启辅助功能，让文字自动插入当前应用。";
+  } else {
+    if (title) title.textContent = "本地录音已就绪";
+    if (copy) copy.textContent = "你现在可以使用快捷键开始本地录音，录音会永久保存在本机。";
+    if (detail) detail.textContent = "稍后连接 App Key 可生成识别文字；开启辅助功能后可自动插入。";
+  }
+}
 
 function goObStep(n: number) {
   obStep = Math.max(0, Math.min(OB_STEP_COUNT - 1, n));
@@ -1891,18 +1961,13 @@ function goObStep(n: number) {
   if (label) label.textContent = `${obStep + 1} / ${OB_STEP_COUNT}`;
   const back = $("#ob-back") as HTMLButtonElement | null;
   if (back) back.disabled = obStep === 0;
-  const next = $("#ob-next") as HTMLButtonElement | null;
-  if (next) next.textContent = obStep === OB_STEP_COUNT - 1 ? "开始使用" : "下一步";
-  if (obStep === 1) {
-    void refreshMicPermissionHint();
-    void refreshMicDevices();
-  }
+  updateOnboardingNextLabel();
   if (obStep === 2) void refreshAccessibilityStatus();
+  if (obStep === 5 && currentState) renderOnboardingCompletion(currentState);
 }
 
-/** Lazily populate the microphone dropdown. The Rust side no longer
- *  enumerates audio devices at startup (that would trigger the macOS mic
- *  permission prompt before the user reaches the mic step). */
+/** Lazily populate the microphone dropdown in the regular settings view.
+ *  Onboarding deliberately waits for the explicit "测试麦克风" action. */
 async function refreshMicDevices() {
   try {
     const state = await invoke<UiState>("list_input_devices");
@@ -1912,33 +1977,18 @@ async function refreshMicDevices() {
   }
 }
 
-async function refreshMicPermissionHint() {
-  try {
-    const p = await invoke<PermissionStatus>("check_permissions");
-    const hint = $("#ob-mic-hint");
-    if (!hint) return;
-    if (p.microphone) {
-      hint.className = "ob-hint ok";
-      hint.textContent = "✓ 麦克风已授权，可以直接测试声音。";
-    } else {
-      hint.className = "ob-hint warn";
-      hint.textContent = "点击「测试麦克风」，系统会弹出授权窗口，请选择「允许」。";
-    }
-  } catch (error) {
-    console.error("check permissions failed", error);
-  }
-}
-
 async function refreshAccessibilityStatus() {
   try {
-    const p = await invoke<PermissionStatus>("check_permissions");
-    renderAccessibilityStatus(p.accessibility);
+    const granted = await invoke<boolean>("check_accessibility_permission");
+    renderAccessibilityStatus(granted);
   } catch (error) {
     console.error("check permissions failed", error);
   }
 }
 
 function renderAccessibilityStatus(granted: boolean) {
+  onboardingAccessibilityGranted = granted;
+  updateOnboardingNextLabel();
   const status = $("#ob-access-status");
   if (!status) return;
   if (granted) {
@@ -1956,6 +2006,13 @@ function bindOnboarding() {
   obBound = true;
 
   $("#ob-next")?.addEventListener("click", async () => {
+    if (obStep === 1) {
+      if (!onboardingMicVerified) {
+        setOnboardingMicHint("请先点击「测试麦克风」，确认 JackVoice 能够正常录音后再继续。", "warn");
+        return;
+      }
+      if (currentState?.micTesting) await stopMicTest();
+    }
     if (obStep === 3) {
       const confirmed = ($("#ob-privacy-confirm") as HTMLInputElement | null)?.checked ?? false;
       const error = $("#ob-privacy-error");
@@ -1968,10 +2025,19 @@ function bindOnboarding() {
     }
     if (currentState?.micTesting) await stopMicTest();
     try {
-      const state = await invoke<UiState>("complete_onboarding");
+      const privacyConfirmed =
+        ($("#ob-privacy-confirm") as HTMLInputElement | null)?.checked ?? false;
+      const state = await invoke<UiState>("complete_onboarding", { privacyConfirmed });
+      $("#ob-complete-error")?.classList.add("hidden");
       applyState(state);
     } catch (error) {
       console.error("complete onboarding failed", error);
+      const message = error instanceof Error ? error.message : String(error);
+      const errorElement = $("#ob-complete-error");
+      if (errorElement) {
+        errorElement.textContent = message;
+        errorElement.classList.remove("hidden");
+      }
     }
   });
 
@@ -1988,10 +2054,10 @@ function bindOnboarding() {
 
   $("#ob-access-btn")?.addEventListener("click", async () => {
     try {
-      const p = await invoke<PermissionStatus>("request_accessibility_permission");
-      renderAccessibilityStatus(p.accessibility);
+      const granted = await invoke<boolean>("request_accessibility_permission");
+      renderAccessibilityStatus(granted);
       const status = $("#ob-access-status");
-      if (status && !p.accessibility) {
+      if (status && !granted) {
         status.className = "ob-status";
         status.textContent =
           "已打开系统设置。请找到 JackVoice 并打开开关，然后回来点「我已开启，重新检测」。";
@@ -2003,8 +2069,8 @@ function bindOnboarding() {
 
   $("#ob-access-check")?.addEventListener("click", () => void refreshAccessibilityStatus());
 
-  $("#ob-audio-retention")?.addEventListener("change", (e) => {
-    void setAudioRetention((e.target as HTMLSelectElement).value);
+  $("#ob-privacy-confirm")?.addEventListener("change", () => {
+    $("#ob-privacy-error")?.classList.add("hidden");
   });
 
   $("#ob-save-volc-key")?.addEventListener("click", async () => {
@@ -2108,9 +2174,6 @@ function bindSettingsModal() {
     void setMuteSystemAudioDuringDictation(enabled);
   });
 
-  $("#audio-retention")?.addEventListener("change", (e) => {
-    void setAudioRetention((e.target as HTMLSelectElement).value);
-  });
   $("#history-text-size")?.addEventListener("change", (e) => {
     void setHistoryTextSize((e.target as HTMLSelectElement).value);
   });
@@ -2157,11 +2220,12 @@ function bindExternalLinks() {
 
 function bindHome() {
   $("#toggle-btn")?.addEventListener("click", () => {
-    if (currentState?.phase === "idle" && !currentState.hasVolcApiKey) {
-      openSettings();
-      return;
-    }
     void toggleDictation();
+  });
+  $("#open-audio-folder")?.addEventListener("click", () => {
+    void invoke("open_audio_folder").catch((error) => {
+      showToast(`无法打开录音文件夹：${String(error)}`, "error");
+    });
   });
   $("#dictation-notice-settings")?.addEventListener("click", openSettings);
   $("#clear-history")?.addEventListener("click", () => void clearAllHistory());

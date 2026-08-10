@@ -74,6 +74,14 @@ fn reveal_history_audio(
 }
 
 #[tauri::command]
+fn open_audio_folder(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let path = history::ensure_audio_dir(&state.data_dir())?;
+    app.opener()
+        .open_path(path.to_string_lossy().into_owned(), None::<String>)
+        .map_err(|e| format!("无法打开录音文件夹：{e}"))
+}
+
+#[tauri::command]
 fn get_hotwords(state: tauri::State<'_, AppState>) -> Vec<String> {
     hotwords::load(&state.data_dir())
 }
@@ -116,6 +124,9 @@ fn update_shortcut(
     let new_shortcut =
         if uses_fn {
             shortcut::validate_fn_shortcut(&trimmed)?;
+            if onboarding::accessibility_is_trusted() {
+                shortcut::install_fn_shortcut_monitor(app.clone());
+            }
             None
         } else {
             Some(trimmed.parse::<Shortcut>().map_err(|_| {
@@ -150,7 +161,16 @@ fn update_shortcut(
 }
 
 #[tauri::command]
-fn start_shortcut_recording(state: tauri::State<'_, shortcut::ShortcutCaptureState>) {
+fn start_shortcut_recording(
+    app: AppHandle,
+    state: tauri::State<'_, shortcut::ShortcutCaptureState>,
+) {
+    // The native event tap is only useful for capturing Fn combinations.
+    // Never create it before Accessibility has already been granted: doing so
+    // makes macOS show a permission dialog before the onboarding UI is ready.
+    if onboarding::accessibility_is_trusted() {
+        shortcut::install_fn_shortcut_monitor(app);
+    }
     state.start();
 }
 
@@ -239,14 +259,6 @@ fn set_input_gain(gain_db: f32, state: tauri::State<'_, AppState>) -> Result<UiS
 }
 
 #[tauri::command]
-fn set_audio_retention(
-    retention: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<UiState, String> {
-    state.set_audio_retention(retention)
-}
-
-#[tauri::command]
 fn set_history_text_size(
     size: String,
     state: tauri::State<'_, AppState>,
@@ -260,23 +272,40 @@ fn get_permissions() -> onboarding::PermissionStatus {
 }
 
 /// Ask macOS to show the Accessibility trust prompt and open System Settings.
-/// Returns the (still likely unchanged) permission status right after.
+/// Returns the (still likely unchanged) Accessibility status right after.
 #[tauri::command]
-fn request_accessibility_permission() -> Result<onboarding::PermissionStatus, String> {
-    let _ = onboarding::request_accessibility_prompt();
-    Ok(onboarding::current_status())
+fn request_accessibility_permission(app: AppHandle) -> Result<bool, String> {
+    let trusted = onboarding::request_accessibility_prompt();
+    if trusted {
+        shortcut::install_fn_shortcut_monitor(app);
+    }
+    Ok(trusted)
 }
 
-/// Re-read permission status (e.g. after the user toggled the switch in
-/// System Settings and came back).
+/// Re-read only Accessibility status after the user toggled the switch in
+/// System Settings. This must not query microphone authorization: on some
+/// macOS versions that query itself can start the microphone consent flow.
 #[tauri::command]
-fn check_permissions() -> onboarding::PermissionStatus {
-    onboarding::current_status()
+fn check_accessibility_permission(app: AppHandle) -> bool {
+    let trusted = onboarding::accessibility_is_trusted();
+    if trusted {
+        shortcut::install_fn_shortcut_monitor(app);
+    }
+    trusted
 }
 
 #[tauri::command]
-fn complete_onboarding(state: tauri::State<'_, AppState>) -> Result<UiState, String> {
-    state.complete_onboarding()
+fn complete_onboarding(
+    privacy_confirmed: bool,
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiState, String> {
+    onboarding::validate_completion(onboarding::microphone_permission(), privacy_confirmed)?;
+    let ui = state.complete_onboarding()?;
+    if onboarding::accessibility_is_trusted() {
+        shortcut::install_fn_shortcut_monitor(app);
+    }
+    Ok(ui)
 }
 
 #[tauri::command]
@@ -409,7 +438,10 @@ pub fn run() {
                 .try_state::<AppState>()
                 .map(|state| {
                     let phase = state.snapshot().phase;
-                    matches!(phase.as_str(), "connecting" | "recording" | "finalizing")
+                    matches!(
+                        phase.as_str(),
+                        "starting" | "connecting" | "recording" | "finalizing"
+                    )
                 })
                 .unwrap_or(false);
             if dictating {
@@ -466,13 +498,19 @@ pub fn run() {
             app.manage(instance_guard);
             app.manage(state);
             app.manage(shortcut::ShortcutCaptureState::default());
-            shortcut::install_fn_shortcut_monitor(app.handle().clone());
+            let initial_state = app.state::<AppState>().snapshot();
+            if shortcut::should_install_fn_monitor_at_startup(
+                initial_state.onboarding_completed,
+                onboarding::accessibility_is_trusted(),
+            ) {
+                shortcut::install_fn_shortcut_monitor(app.handle().clone());
+            }
             let _ = crate::overlay::ensure_overlay(app.handle());
 
             // First run (onboarding not finished yet): show the main window so
             // the user can walk through the permission setup. The window is
             // otherwise hidden by design (background dictation app).
-            if !app.state::<AppState>().snapshot().onboarding_completed {
+            if !initial_state.onboarding_completed {
                 if let Some(main) = app.get_webview_window("main") {
                     eprintln!("[onboarding] showing main window for first-run setup");
                     match main.show() {
@@ -525,6 +563,7 @@ pub fn run() {
             clear_history,
             get_history_audio,
             reveal_history_audio,
+            open_audio_folder,
             get_hotwords,
             save_hotwords,
             get_replacements,
@@ -543,11 +582,10 @@ pub fn run() {
             remove_volc_api_key,
             test_volc_connection,
             set_input_gain,
-            set_audio_retention,
             set_history_text_size,
             get_permissions,
             request_accessibility_permission,
-            check_permissions,
+            check_accessibility_permission,
             complete_onboarding,
             update_recognition_options,
             toggle_dictation,

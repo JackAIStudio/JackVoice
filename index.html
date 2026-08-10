@@ -56,6 +56,14 @@
             <button id="dictation-notice-settings" class="dictation-notice-action" type="button">打开设置</button>
           </section>
 
+          <section class="recording-storage" aria-label="本地录音">
+            <div class="recording-storage-copy">
+              <strong>本地录音</strong>
+              <span>每次听写都会完整保存在本机，JackVoice 不会自动删除。</span>
+            </div>
+            <button id="open-audio-folder" class="btn ghost small" type="button">打开录音文件夹</button>
+          </section>
+
           <div class="history-workbench">
             <header class="workbench-head">
               <div class="workbench-title">
@@ -238,22 +246,10 @@
               </h3>
               <div class="set-row">
                 <div>
-                  <div class="set-title">本地录音保留</div>
-                  <div class="set-desc">转写文本保存在本机；WAV 可选择不保存或自动到期。修改后会立即清理过期录音。</div>
+                  <div class="set-title">清空听写记录</div>
+                  <div class="set-desc">只清空应用内的文字记录；录音文件仍保留在本地录音文件夹。</div>
                 </div>
-                <select id="audio-retention">
-                  <option value="never">不保存录音</option>
-                  <option value="sevenDays">保存 7 天</option>
-                  <option value="thirtyDays" selected>保存 30 天</option>
-                  <option value="forever">永久保存</option>
-                </select>
-              </div>
-              <div class="set-row">
-                <div>
-                  <div class="set-title">清空本地听写数据</div>
-                  <div class="set-desc">删除所有转写文本、录音文件和旧备份。此操作无法撤销。</div>
-                </div>
-                <button id="settings-clear-history" class="btn danger small" type="button">清空全部</button>
+                <button id="settings-clear-history" class="btn danger small" type="button">清空记录</button>
               </div>
             </section>
 
@@ -437,24 +433,26 @@
 
           <!-- 1 · 麦克风 -->
           <section class="ob-pane" data-pane="1">
-            <h2>麦克风权限</h2>
+            <h2>麦克风权限 <span class="ob-requirement required">必需</span></h2>
             <p>听写需要麦克风采集你的声音。点击下方「测试麦克风」，系统会弹出授权窗口，请选择「允许」。</p>
             <div class="ob-mic-controls">
-              <select id="ob-mic-select"></select>
-              <button id="ob-mic-test-btn" class="btn dark small">测试麦克风</button>
-              <button id="ob-mic-stop-btn" class="btn ghost small hidden">停止</button>
+              <select id="ob-mic-select" disabled>
+                <option value="">授权并开始测试后可选择麦克风</option>
+              </select>
+              <button id="ob-mic-test-btn" class="btn dark small" type="button">测试麦克风</button>
+              <button id="ob-mic-stop-btn" class="btn ghost small hidden" type="button">停止</button>
             </div>
             <div id="ob-mic-meter" class="mic-meter hidden">
               <div class="segments" id="ob-level-segments" aria-hidden="true"></div>
             </div>
-            <p id="ob-mic-hint" class="ob-hint"></p>
+            <p id="ob-mic-hint" class="ob-hint warn">点击「测试麦克风」后，JackVoice 才会向系统申请权限。</p>
           </section>
 
           <!-- 2 · 辅助功能 -->
           <section class="ob-pane" data-pane="2">
-            <h2>辅助功能权限</h2>
+            <h2>辅助功能权限 <span class="ob-requirement optional">可跳过</span></h2>
             <p>听写结束后，JackVoice 会把文字自动插入你当前使用的应用（相当于帮你按一下粘贴）。这一步需要「辅助功能」权限。</p>
-            <p class="ob-detail">点击下方按钮，在系统设置里找到 JackVoice 并打开开关，然后回到这里点「我已开启」。</p>
+            <p class="ob-detail">不授权仍可录音和识别，结果会保留在剪贴板与历史中，但不会自动插入当前应用。</p>
             <div class="ob-action-row">
               <button id="ob-access-btn" class="btn dark">打开系统设置</button>
               <button id="ob-access-check" class="btn ghost">我已开启，重新检测</button>
@@ -464,21 +462,9 @@
 
           <!-- 3 · 数据与隐私 -->
           <section class="ob-pane" data-pane="3">
-            <h2>数据与隐私</h2>
+            <h2>数据与隐私 <span class="ob-requirement required">必需确认</span></h2>
             <p>听写时，麦克风音频会通过加密连接实时发送至你自行配置的火山引擎账号进行识别。</p>
-            <p>转写文本保存在本机。录音默认保留 30 天，你可以改为不保存、保存 7 天或永久保存。</p>
-            <div class="set-row">
-              <div>
-                <div class="set-title">本地录音保留</div>
-                <div class="set-desc">到期只删除 WAV，转写文本仍可在首页手动删除。</div>
-              </div>
-              <select id="ob-audio-retention">
-                <option value="never">不保存录音</option>
-                <option value="sevenDays">保存 7 天</option>
-                <option value="thirtyDays" selected>保存 30 天</option>
-                <option value="forever">永久保存</option>
-              </select>
-            </div>
+            <p>每次听写的本地录音都会永久保存在本机，不会自动到期或删除。你可以随时从首页打开录音文件夹自行管理。</p>
             <label class="privacy-confirm">
               <input id="ob-privacy-confirm" type="checkbox" />
               <span>我已了解音频的云端处理和本地保存方式</span>
@@ -488,12 +474,12 @@
 
           <!-- 4 · 识别服务 -->
           <section class="ob-pane" data-pane="4">
-            <h2>连接语音服务</h2>
-            <p>JackVoice 使用你自己的豆包语音服务。App Key 只需配置一次，保存后不会继续显示输入框。</p>
+            <h2>连接语音服务 <span class="ob-requirement optional">可跳过</span></h2>
+            <p>JackVoice 使用你自己的豆包语音服务。没有 App Key 也可以先使用本地录音，只是不会生成识别文字。</p>
             <div class="set-row ob-key-row">
               <div>
                 <div class="set-title">豆包语音 App Key</div>
-                <div class="set-desc" id="ob-key-desc">没有 App Key 也可以先完成引导，稍后再到设置中配置。</div>
+                <div class="set-desc" id="ob-key-desc">可以跳过，稍后再到设置中配置。</div>
                 <a class="external-help-link" data-external-link href="https://console.volcengine.com/speech/new/">前往豆包语音控制台获取 App Key ↗</a>
               </div>
               <div class="credential-control">
@@ -518,6 +504,7 @@
             <h2 id="ob-complete-title">准备就绪</h2>
             <p id="ob-complete-copy">现在按下 <kbd class="shortcut">⌥ + Space</kbd> 开始语音输入；说完再按一次结束，文字会自动插入。</p>
             <p id="ob-complete-detail" class="ob-detail">也可以点击主界面上的「开始听写」按钮。</p>
+            <p id="ob-complete-error" class="field-error hidden"></p>
           </section>
         </div>
 

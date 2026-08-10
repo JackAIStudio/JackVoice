@@ -39,9 +39,6 @@ pub struct AppSettings {
     pub input_gain_db: f32,
     #[serde(default)]
     pub onboarding_completed: bool,
-    /// 本地 WAV 的保留策略：never / sevenDays / thirtyDays / forever。
-    #[serde(default = "default_audio_retention")]
-    pub audio_retention: String,
     /// 首页听写文字大小：compact / standard / large。
     #[serde(default = "default_history_text_size")]
     pub history_text_size: String,
@@ -75,8 +72,6 @@ struct SharedSettings {
     shortcut: String,
     #[serde(default)]
     input_gain_db: f32,
-    #[serde(default)]
-    audio_retention: String,
     #[serde(default = "default_history_text_size")]
     history_text_size: String,
 }
@@ -93,7 +88,6 @@ impl Default for SharedSettings {
             selected_input_device_id: String::new(),
             shortcut: default_shortcut(),
             input_gain_db: 0.0,
-            audio_retention: String::new(),
             history_text_size: default_history_text_size(),
         }
     }
@@ -121,19 +115,8 @@ impl AppSettings {
     fn from_parts(
         shared: SharedSettings,
         variant: VariantSettings,
-        existing_shared_settings: bool,
+        _existing_shared_settings: bool,
     ) -> Self {
-        // 早期版本默认永久保存 WAV。旧设置中没有该字段时继续保留，
-        // 避免升级过程静默删除已有录音；全新安装才采用 30 天默认值。
-        let audio_retention = if shared.audio_retention.trim().is_empty() {
-            if existing_shared_settings {
-                "forever".to_string()
-            } else {
-                default_audio_retention()
-            }
-        } else {
-            normalize_audio_retention(&shared.audio_retention)
-        };
         Self {
             volc_api_key: shared.volc_api_key,
             volc_resource_id: shared.volc_resource_id,
@@ -147,7 +130,6 @@ impl AppSettings {
             mute_system_audio_during_dictation: variant.mute_system_audio_during_dictation,
             input_gain_db: shared.input_gain_db,
             onboarding_completed: variant.onboarding_completed,
-            audio_retention,
             history_text_size: normalize_history_text_size(&shared.history_text_size),
         }
     }
@@ -163,7 +145,6 @@ impl AppSettings {
             selected_input_device_id: self.selected_input_device_id.clone(),
             shortcut: self.shortcut.clone(),
             input_gain_db: self.input_gain_db,
-            audio_retention: normalize_audio_retention(&self.audio_retention),
             history_text_size: normalize_history_text_size(&self.history_text_size),
         }
     }
@@ -284,19 +265,8 @@ fn default_max_sentence_silence_ms() -> u32 {
     1300
 }
 
-fn default_audio_retention() -> String {
-    "thirtyDays".into()
-}
-
 fn default_history_text_size() -> String {
     "standard".into()
-}
-
-pub fn normalize_audio_retention(value: &str) -> String {
-    match value {
-        "never" | "sevenDays" | "thirtyDays" | "forever" => value.to_string(),
-        _ => default_audio_retention(),
-    }
 }
 
 pub fn normalize_history_text_size(value: &str) -> String {
@@ -365,7 +335,6 @@ mod tests {
 
         let dev = load_settings(&shared, &development, &production).unwrap();
         assert_eq!(dev.volc_api_key, "key");
-        assert_eq!(dev.audio_retention, "forever");
         assert_eq!(dev.history_text_size, "standard");
         assert!(!dev.semantic_smoothing_enabled);
         assert!(!dev.launch_at_login);
