@@ -46,6 +46,7 @@ async fn main() {
     let session = RealtimeSession::connect(
         volc_config,
         false,
+        false,
         1300,
         hotwords,
         move |u: TranscriptUpdate| {

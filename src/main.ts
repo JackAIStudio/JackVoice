@@ -15,6 +15,7 @@ type UiState = {
   volcResourceId: string;
   volcBoostingTableId: string;
   semanticPunctuationEnabled: boolean;
+  semanticSmoothingEnabled: boolean;
   maxSentenceSilenceMs: number;
   inputGainDb: number;
   selectedInputDeviceId: string;
@@ -29,6 +30,7 @@ type UiState = {
   systemAudioMuteSupported: boolean;
   onboardingCompleted: boolean;
   audioRetention: string;
+  historyTextSize: string;
 };
 
 type SaveHotwordsResult = {
@@ -61,6 +63,7 @@ type HistoryRecord = {
   recognition?: {
     hotwords: string[];
     semanticPunctuationEnabled: boolean;
+    semanticSmoothingEnabled: boolean;
     maxSentenceSilenceMs: number;
     inputGainDb: number;
     inputDeviceId: string;
@@ -107,6 +110,8 @@ let toastTimer: number | undefined;
 let dictationElapsedTimer: number | undefined;
 let dictationRecordingStartedAt: number | null = null;
 let lastDictationPhase = "idle";
+let credentialEditorOpen = false;
+let onboardingCredentialEditorOpen = false;
 
 const COPY_SUCCESS_ICON =
   '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4 4L19 6"/></svg>';
@@ -328,6 +333,15 @@ function renderDictationError(message: string) {
 function applyState(state: UiState) {
   currentState = state;
 
+  const historyTextSize = ["compact", "standard", "large"].includes(state.historyTextSize)
+    ? state.historyTextSize
+    : "standard";
+  document.documentElement.dataset.historyTextSize = historyTextSize;
+  const historyTextSizeSelect = $("#history-text-size") as HTMLSelectElement | null;
+  if (historyTextSizeSelect && document.activeElement !== historyTextSizeSelect) {
+    historyTextSizeSelect.value = historyTextSize;
+  }
+
   const kbd = $("#shortcut-kbd");
   if (kbd) kbd.textContent = formatShortcut(state.shortcut || "Alt+Space");
 
@@ -393,41 +407,71 @@ function applyState(state: UiState) {
 
   const volcMasked = $("#masked-volc-key");
   if (volcMasked) {
-    const sourceSuffix =
-      state.volcCredentialSource === "environment"
-        ? " · 环境变量覆盖"
-        : state.volcCredentialSource === "developmentFile"
-          ? " · 开发版本地凭据"
-          : state.volcCredentialSource === "session"
-            ? " · 仅本次运行"
-            : "";
-    volcMasked.textContent = state.hasVolcApiKey
-      ? `已配置：${state.maskedVolcApiKey}${sourceSuffix}`
-      : state.volcCredentialWarning
-        ? "暂不可用"
-        : "未配置";
+    volcMasked.className = `service-status ${state.hasVolcApiKey ? "connected" : "disconnected"}`;
+    volcMasked.innerHTML = `<i></i>${state.hasVolcApiKey ? "已连接" : "未连接"}`;
   }
-  const credentialDescription = state.volcCredentialWarning || (() => {
-    switch (state.volcCredentialSource) {
-      case "environment":
-        return "开发版正在使用 JACKVOICE_VOLC_API_KEY 覆盖值；不会访问正式版凭据。";
-      case "developmentFile":
-        return "已保存在开发版私有凭据文件中，不会读取或覆盖正式版 API Key。";
-      case "session":
-        return "开发版仅在本次运行的内存中使用此 Key，退出后不会保留。";
-      case "legacyMigration":
-        return "旧版凭据已静默迁移到正式版系统凭据条目。";
-      case "systemStore":
-        return "已安全保存在系统凭据库中，正常读取不会要求输入系统密码。";
-      default:
-        return "开始听写前需要配置。正式版使用系统凭据库，开发版使用隔离的私有凭据文件。";
-    }
-  })();
-  for (const selector of ["#volc-credential-hint", "#ob-key-desc"]) {
-    const hint = $(selector);
-    if (!hint) continue;
-    hint.textContent = credentialDescription;
-    hint.classList.toggle("warn", !!state.volcCredentialWarning);
+  const credentialDescription = state.volcCredentialWarning || (state.hasVolcApiKey
+    ? "已连接，可以开始听写。"
+    : "首次使用需要连接你自己的豆包语音服务。");
+  const credentialHint = $("#volc-credential-hint");
+  if (credentialHint) {
+    credentialHint.textContent = credentialDescription;
+    credentialHint.classList.toggle("warn", !!state.volcCredentialWarning);
+  }
+  const environmentManaged = state.volcCredentialSource === "environment";
+  const editVolcButton = $("#edit-volc-btn") as HTMLButtonElement | null;
+  if (editVolcButton) {
+    editVolcButton.textContent = environmentManaged
+      ? "由开发环境管理"
+      : state.hasVolcApiKey
+        ? "更换 App Key"
+        : "配置 App Key";
+    editVolcButton.disabled = environmentManaged;
+  }
+  $("#test-volc-btn")?.classList.toggle("hidden", !state.hasVolcApiKey);
+  $("#remove-volc-btn")?.classList.toggle(
+    "hidden",
+    !state.hasVolcApiKey || environmentManaged,
+  );
+  $("#volc-credential-editor")?.classList.toggle(
+    "hidden",
+    environmentManaged || (state.hasVolcApiKey && !credentialEditorOpen),
+  );
+
+  const onboardingHint = $("#ob-key-desc");
+  if (onboardingHint) {
+    onboardingHint.textContent = state.volcCredentialWarning || (state.hasVolcApiKey
+      ? "已连接，可以直接继续。"
+      : "没有 App Key 也可以先完成引导，稍后再到设置中配置。");
+    onboardingHint.classList.toggle("warn", !!state.volcCredentialWarning);
+  }
+  const onboardingEditButton = $("#ob-edit-volc-key") as HTMLButtonElement | null;
+  if (onboardingEditButton) {
+    onboardingEditButton.textContent = environmentManaged ? "由开发环境管理" : "更换 App Key";
+    onboardingEditButton.disabled = environmentManaged;
+  }
+  if (environmentManaged) onboardingCredentialEditorOpen = false;
+  $("#ob-key-summary")?.classList.toggle(
+    "hidden",
+    !state.hasVolcApiKey || onboardingCredentialEditorOpen,
+  );
+  $("#ob-key-editor")?.classList.toggle(
+    "hidden",
+    state.hasVolcApiKey && !onboardingCredentialEditorOpen,
+  );
+  $("#ob-cancel-volc-key")?.classList.toggle("hidden", !state.hasVolcApiKey);
+
+  const completeTitle = $("#ob-complete-title");
+  const completeCopy = $("#ob-complete-copy");
+  const completeDetail = $("#ob-complete-detail");
+  if (state.hasVolcApiKey) {
+    if (completeTitle) completeTitle.textContent = "准备就绪";
+    if (completeCopy) completeCopy.innerHTML = "现在按下 <kbd class=\"shortcut\">⌥ + Space</kbd> 开始语音输入；说完再按一次结束，文字会自动插入。";
+    if (completeDetail) completeDetail.textContent = "也可以点击主界面上的「开始听写」按钮。";
+  } else {
+    if (completeTitle) completeTitle.textContent = "基础设置已完成";
+    if (completeCopy) completeCopy.textContent = "还差语音服务连接。你可以先进入主界面，准备好 App Key 后再到设置中完成配置。";
+    if (completeDetail) completeDetail.textContent = "完成连接前，听写按钮会带你回到设置。";
   }
   const volcResource = $("#volc-resource-id") as HTMLInputElement | null;
   if (volcResource && document.activeElement !== volcResource) {
@@ -445,17 +489,30 @@ function applyState(state: UiState) {
     syncBtn.disabled = !canSync;
     syncBtn.title = canSync
       ? "手动同步热词表到云端（替换词仅本地）"
-      : "需已配置豆包录音识别 API Key 与热词表 ID";
+      : "需要先连接豆包语音并配置云端热词表";
   }
 
-  const semantic = $("#semantic-punctuation") as HTMLInputElement | null;
-  if (semantic && document.activeElement !== semantic) {
-    semantic.checked = !!state.semanticPunctuationEnabled;
+  const punctuation = $("#semantic-punctuation") as HTMLInputElement | null;
+  if (punctuation && document.activeElement !== punctuation) {
+    punctuation.checked = !!state.semanticPunctuationEnabled;
   }
-
-  const silence = $("#silence-ms") as HTMLInputElement | null;
+  const smoothing = $("#semantic-smoothing") as HTMLInputElement | null;
+  if (smoothing && document.activeElement !== smoothing) {
+    smoothing.checked = !!state.semanticSmoothingEnabled;
+  }
+  const silence = $("#silence-ms") as HTMLSelectElement | null;
   if (silence && document.activeElement !== silence) {
-    silence.value = String(state.maxSentenceSilenceMs || 1300);
+    silence.querySelector("option[data-current-value]")?.remove();
+    const value = String(state.maxSentenceSilenceMs || 1300);
+    if (!Array.from(silence.options).some((option) => option.value === value)) {
+      const seconds = (Number(value) / 1000).toLocaleString("zh-CN", {
+        maximumFractionDigits: 1,
+      });
+      const currentOption = new Option(`当前 · ${seconds} 秒`, value);
+      currentOption.dataset.currentValue = "true";
+      silence.add(currentOption, 0);
+    }
+    silence.value = value;
   }
 
   const gain = $("#gain-db") as HTMLInputElement | null;
@@ -463,7 +520,9 @@ function applyState(state: UiState) {
     gain.value = String(state.inputGainDb || 0);
   }
   const gainLabel = $("#gain-db-label");
-  if (gainLabel) gainLabel.textContent = `偏移 ${state.inputGainDb || 0} dB`;
+  if (gainLabel) {
+    gainLabel.textContent = state.inputGainDb > 0 ? `增强 +${state.inputGainDb} dB` : "默认";
+  }
 
   for (const selector of ["#audio-retention", "#ob-audio-retention"]) {
     const retention = $(selector) as HTMLSelectElement | null;
@@ -1437,12 +1496,17 @@ async function removeReplacement(from: string) {
 /* ---------------- 设置弹窗 ---------------- */
 
 function openSettings() {
+  credentialEditorOpen = !currentState?.hasVolcApiKey;
+  if (currentState) applyState(currentState);
   $("#settings-modal")?.classList.remove("hidden");
   void refreshMicDevices();
 }
 
 function closeSettings() {
   if (recordingShortcut) stopRecording();
+  credentialEditorOpen = false;
+  const input = $("#volc-api-key") as HTMLInputElement | null;
+  if (input) input.value = "";
   $("#settings-modal")?.classList.add("hidden");
 }
 
@@ -1583,25 +1647,64 @@ async function saveVolcSettings() {
   const apiKey = (($("#volc-api-key") as HTMLInputElement | null)?.value ?? "").trim();
   const resourceId = (($("#volc-resource-id") as HTMLInputElement | null)?.value ?? "").trim();
   const boostingTableId = (($("#volc-table-id") as HTMLInputElement | null)?.value ?? "").trim();
+  if (!apiKey) {
+    setVolcConnectionStatus("#volc-connection-status", "请先粘贴豆包语音 App Key。", "warn");
+    return;
+  }
+  const verified = await testVolcConnection({
+    inputSelector: "#volc-api-key",
+    resourceSelector: "#volc-resource-id",
+    statusSelector: "#volc-connection-status",
+    buttonSelector: "#save-volc-btn",
+  });
+  if (!verified) return;
   try {
     const state = await invoke<UiState>("save_volc_settings", {
       apiKey,
       resourceId,
       boostingTableId,
     });
+    credentialEditorOpen = false;
     applyState(state);
     const input = $("#volc-api-key") as HTMLInputElement | null;
     if (input) input.value = "";
-    await testVolcConnection({
-      inputSelector: "#volc-api-key",
-      resourceSelector: "#volc-resource-id",
-      statusSelector: "#volc-connection-status",
-      buttonSelector: "#test-volc-btn",
-    });
+    setVolcConnectionStatus("#volc-connection-status", "✓ 已连接，可以开始听写。", "ok");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     setVolcConnectionStatus("#volc-connection-status", message, "warn");
     if (currentState) applyState(currentState);
+  }
+}
+
+function setVolcCredentialEditor(open: boolean) {
+  credentialEditorOpen = open;
+  if (!open) {
+    const input = $("#volc-api-key") as HTMLInputElement | null;
+    if (input) input.value = "";
+  }
+  if (currentState) applyState(currentState);
+  if (open) {
+    window.setTimeout(() => ($("#volc-api-key") as HTMLInputElement | null)?.focus(), 0);
+  }
+}
+
+async function removeVolcApiKey() {
+  if (!window.confirm("移除豆包语音 App Key 后将无法继续听写。确定移除吗？")) return;
+  try {
+    const state = await invoke<UiState>("remove_volc_api_key");
+    credentialEditorOpen = true;
+    applyState(state);
+    setVolcConnectionStatus(
+      "#volc-connection-status",
+      "App Key 已移除，请重新配置后再开始听写。",
+      "warn",
+    );
+  } catch (error) {
+    setVolcConnectionStatus(
+      "#volc-connection-status",
+      error instanceof Error ? error.message : String(error),
+      "warn",
+    );
   }
 }
 
@@ -1639,7 +1742,7 @@ async function testVolcConnection(options: VolcConnectionTestOptions): Promise<b
   }
   setVolcConnectionStatus(
     options.statusSelector,
-    "正在连接豆包语音服务验证 API Key 与资源 ID…",
+    "正在验证豆包语音服务连接…",
     "testing",
   );
 
@@ -1662,7 +1765,7 @@ async function testVolcConnection(options: VolcConnectionTestOptions): Promise<b
 async function onGainChanged() {
   const gain = Number(($("#gain-db") as HTMLInputElement | null)?.value || 0);
   const gainLabel = $("#gain-db-label");
-  if (gainLabel) gainLabel.textContent = `偏移 ${gain} dB`;
+  if (gainLabel) gainLabel.textContent = gain > 0 ? `增强 +${gain} dB` : "默认";
   try {
     const state = await invoke<UiState>("set_input_gain", { gainDb: gain });
     applyState(state);
@@ -1673,14 +1776,35 @@ async function onGainChanged() {
   }
 }
 
-async function saveOptions() {
-  const semantic = ($("#semantic-punctuation") as HTMLInputElement | null)?.checked ?? true;
-  const silence = Number(($("#silence-ms") as HTMLInputElement | null)?.value || 1300);
-  const state = await invoke<UiState>("update_recognition_options", {
-    semanticPunctuationEnabled: semantic,
-    maxSentenceSilenceMs: silence,
-  });
-  applyState(state);
+async function setHistoryTextSize(size: string) {
+  try {
+    const state = await invoke<UiState>("set_history_text_size", { size });
+    applyState(state);
+  } catch (error) {
+    console.error("set history text size failed", error);
+    if (currentState) applyState(currentState);
+  }
+}
+
+async function saveRecognitionOptions() {
+  const semanticPunctuationEnabled =
+    ($("#semantic-punctuation") as HTMLInputElement | null)?.checked ?? true;
+  const semanticSmoothingEnabled =
+    ($("#semantic-smoothing") as HTMLInputElement | null)?.checked ?? false;
+  const maxSentenceSilenceMs = Number(
+    ($("#silence-ms") as HTMLSelectElement | null)?.value || 1300,
+  );
+  try {
+    const state = await invoke<UiState>("update_recognition_options", {
+      semanticPunctuationEnabled,
+      semanticSmoothingEnabled,
+      maxSentenceSilenceMs,
+    });
+    applyState(state);
+  } catch (error) {
+    window.alert(error instanceof Error ? error.message : String(error));
+    if (currentState) applyState(currentState);
+  }
 }
 
 async function onMicChanged() {
@@ -1879,11 +2003,6 @@ function bindOnboarding() {
 
   $("#ob-access-check")?.addEventListener("click", () => void refreshAccessibilityStatus());
 
-  $("#ob-autostart")?.addEventListener("change", (e) => {
-    const enabled = (e.target as HTMLInputElement).checked;
-    void setLaunchAtLogin(enabled);
-  });
-
   $("#ob-audio-retention")?.addEventListener("change", (e) => {
     void setAudioRetention((e.target as HTMLSelectElement).value);
   });
@@ -1891,26 +2010,26 @@ function bindOnboarding() {
   $("#ob-save-volc-key")?.addEventListener("click", async () => {
     const input = $("#ob-volc-api-key") as HTMLInputElement | null;
     const value = (input?.value ?? "").trim();
+    if (!value) {
+      setVolcConnectionStatus("#ob-key-test-status", "请先粘贴豆包语音 App Key。", "warn");
+      return;
+    }
+    const verified = await testVolcConnection({
+      inputSelector: "#ob-volc-api-key",
+      statusSelector: "#ob-key-test-status",
+      buttonSelector: "#ob-save-volc-key",
+    });
+    if (!verified) return;
     try {
       const state = await invoke<UiState>("save_volc_settings", {
         apiKey: value,
         resourceId: currentState?.volcResourceId || "volc.seedasr.sauc.duration",
         boostingTableId: currentState?.volcBoostingTableId || "",
       });
+      onboardingCredentialEditorOpen = false;
       applyState(state);
       if (input) input.value = "";
-      const desc = $("#ob-key-desc");
-      if (desc) {
-        desc.textContent = state.hasVolcApiKey
-          ? `已配置：${state.maskedVolcApiKey}`
-          : "开始听写前需要配置；也可稍后再到「设置 → 识别」里填写。";
-        desc.classList.remove("warn");
-      }
-      await testVolcConnection({
-        inputSelector: "#ob-volc-api-key",
-        statusSelector: "#ob-key-test-status",
-        buttonSelector: "#ob-test-volc-key",
-      });
+      setVolcConnectionStatus("#ob-key-test-status", "✓ 已连接，可以继续。", "ok");
     } catch (error) {
       console.error("save onboarding volc key failed", error);
       const desc = $("#ob-key-desc");
@@ -1926,12 +2045,16 @@ function bindOnboarding() {
     }
   });
 
-  $("#ob-test-volc-key")?.addEventListener("click", () => {
-    void testVolcConnection({
-      inputSelector: "#ob-volc-api-key",
-      statusSelector: "#ob-key-test-status",
-      buttonSelector: "#ob-test-volc-key",
-    });
+  $("#ob-edit-volc-key")?.addEventListener("click", () => {
+    onboardingCredentialEditorOpen = true;
+    if (currentState) applyState(currentState);
+    window.setTimeout(() => ($("#ob-volc-api-key") as HTMLInputElement | null)?.focus(), 0);
+  });
+  $("#ob-cancel-volc-key")?.addEventListener("click", () => {
+    onboardingCredentialEditorOpen = false;
+    const input = $("#ob-volc-api-key") as HTMLInputElement | null;
+    if (input) input.value = "";
+    if (currentState) applyState(currentState);
   });
 }
 
@@ -1988,6 +2111,9 @@ function bindSettingsModal() {
   $("#audio-retention")?.addEventListener("change", (e) => {
     void setAudioRetention((e.target as HTMLSelectElement).value);
   });
+  $("#history-text-size")?.addEventListener("change", (e) => {
+    void setHistoryTextSize((e.target as HTMLSelectElement).value);
+  });
   $("#settings-clear-history")?.addEventListener("click", () => void clearAllHistory());
 
   $("#mic-select")?.addEventListener("change", () => void onMicChanged());
@@ -1996,6 +2122,19 @@ function bindSettingsModal() {
 
   $("#gain-db")?.addEventListener("input", () => void onGainChanged());
 
+  $("#semantic-punctuation")?.addEventListener("change", () => {
+    void saveRecognitionOptions();
+  });
+  $("#semantic-smoothing")?.addEventListener("change", () => {
+    void saveRecognitionOptions();
+  });
+  $("#silence-ms")?.addEventListener("change", () => {
+    void saveRecognitionOptions();
+  });
+
+  $("#edit-volc-btn")?.addEventListener("click", () => setVolcCredentialEditor(true));
+  $("#cancel-volc-btn")?.addEventListener("click", () => setVolcCredentialEditor(false));
+  $("#remove-volc-btn")?.addEventListener("click", () => void removeVolcApiKey());
   $("#save-volc-btn")?.addEventListener("click", () => void saveVolcSettings());
   $("#test-volc-btn")?.addEventListener("click", () => {
     void testVolcConnection({
@@ -2005,7 +2144,6 @@ function bindSettingsModal() {
       buttonSelector: "#test-volc-btn",
     });
   });
-  $("#save-options-btn")?.addEventListener("click", () => void saveOptions());
 }
 
 function bindExternalLinks() {

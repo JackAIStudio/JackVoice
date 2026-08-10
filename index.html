@@ -210,6 +210,27 @@
             <section class="set-group">
               <h3>
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="4" width="18" height="14" rx="2" />
+                  <path d="M8 21h8" /><path d="M12 18v3" />
+                </svg>
+                显示
+              </h3>
+              <div class="set-row">
+                <div>
+                  <div class="set-title">听写文字大小</div>
+                  <div class="set-desc">调整首页记录和听写详情的正文字号。</div>
+                </div>
+                <select id="history-text-size">
+                  <option value="compact">紧凑</option>
+                  <option value="standard" selected>标准</option>
+                  <option value="large">大号</option>
+                </select>
+              </div>
+            </section>
+
+            <section class="set-group">
+              <h3>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
                   <path d="M9 12l2 2 4-4" />
                 </svg>
@@ -293,12 +314,12 @@
               </div>
               <div class="set-row">
                 <div>
-                  <div class="set-title">自动增益</div>
-                  <div class="set-desc">已启用实时自动增益（AGC），轻声说话会自动抬升到合适电平；下方为手动偏移，默认 0，识别效果不佳时可微调。</div>
+                  <div class="set-title">麦克风音量增强</div>
+                  <div class="set-desc">声音偏小时可以适当调高，通常保持默认即可。</div>
                 </div>
                 <div class="inline-fields">
                   <input id="gain-db" type="range" min="0" max="24" step="1" value="0" />
-                  <span id="gain-db-label" class="masked-key">偏移 0 dB</span>
+                  <span id="gain-db-label" class="masked-key">默认</span>
                 </div>
               </div>
             </section>
@@ -311,55 +332,64 @@
                 </svg>
                 识别
               </h3>
-              <div class="set-row">
+              <input id="volc-resource-id" type="hidden" />
+              <input id="volc-table-id" type="hidden" />
+              <div class="set-row credential-row">
                 <div>
-                  <div class="set-title">豆包录音识别 API Key</div>
-                  <div class="set-desc" id="volc-credential-hint">正式版使用系统凭据库；开发版使用隔离的私有凭据文件。</div>
-                  <a class="external-help-link" data-external-link href="https://console.volcengine.com/speech/new/">前往豆包语音控制台获取 APP Key（即这里的 API Key）↗</a>
+                  <div class="set-title">豆包语音</div>
+                  <div class="set-desc" id="volc-credential-hint">连接后即可开始听写。</div>
                 </div>
                 <div class="credential-control">
-                  <div class="inline-fields">
-                    <span id="masked-volc-key" class="masked-key">未配置</span>
-                    <input id="volc-api-key" class="text-input" type="password" placeholder="火山控制台 APP Key" autocomplete="off" />
-                    <button id="save-volc-btn" class="btn ghost small">保存并测试</button>
-                    <button id="test-volc-btn" class="btn ghost small">测试连接</button>
+                  <div class="credential-summary">
+                    <span id="masked-volc-key" class="service-status disconnected"><i></i>未连接</span>
+                    <button id="test-volc-btn" class="btn ghost small hidden" type="button">测试连接</button>
+                    <button id="edit-volc-btn" class="btn ghost small" type="button">配置 App Key</button>
+                  </div>
+                  <div id="volc-credential-editor" class="credential-editor hidden">
+                    <div class="inline-fields">
+                      <input id="volc-api-key" class="text-input" type="password" placeholder="粘贴豆包语音 App Key" autocomplete="off" />
+                      <button id="save-volc-btn" class="btn dark small" type="button">保存并验证</button>
+                      <button id="cancel-volc-btn" class="btn ghost small" type="button">取消</button>
+                    </div>
+                    <div class="credential-editor-footer">
+                      <a class="external-help-link" data-external-link href="https://console.volcengine.com/speech/new/">前往豆包语音控制台获取 App Key ↗</a>
+                      <button id="remove-volc-btn" class="text-button danger hidden" type="button">移除凭据</button>
+                    </div>
                   </div>
                   <div id="volc-connection-status" class="connection-test-status" role="status" aria-live="polite"></div>
                 </div>
               </div>
               <div class="set-row">
                 <div>
-                  <div class="set-title">资源 ID</div>
-                  <div class="set-desc">默认小时版 volc.seedasr.sauc.duration；购买并发版后改为 volc.seedasr.sauc.concurrent。</div>
+                  <div class="set-title">自动添加标点</div>
+                  <div class="set-desc">根据说话内容自动添加逗号、句号和问号。</div>
                 </div>
-                <div class="inline-fields">
-                  <input id="volc-resource-id" class="text-input" type="text" autocomplete="off" />
-                </div>
+                <label class="switch" aria-label="自动添加标点">
+                  <input id="semantic-punctuation" type="checkbox" checked />
+                  <span class="slider"></span>
+                </label>
               </div>
               <div class="set-row">
                 <div>
-                  <div class="set-title">热词表 ID（可选）</div>
-                  <div class="set-desc">在控制台 → 豆包语音 → 自学习平台创建热词表后填入 ID，可支持完整 5000 词；留空则自动直传本地词库前 100 字。</div>
-                  <a class="external-help-link" data-external-link href="https://www.volcengine.com/docs/6561/155739?lang=zh">查看官方热词表创建与 ID 获取说明 ↗</a>
+                  <div class="set-title">自动整理口语</div>
+                  <div class="set-desc">自动去掉“嗯、呃”和重复说法，让文字更简洁。开启后，文字可能与原话略有不同。</div>
                 </div>
-                <div class="inline-fields">
-                  <input id="volc-table-id" class="text-input" type="text" placeholder="boosting_table_id" autocomplete="off" />
-                </div>
+                <label class="switch" aria-label="自动整理口语">
+                  <input id="semantic-smoothing" type="checkbox" />
+                  <span class="slider"></span>
+                </label>
               </div>
               <div class="set-row">
                 <div>
-                  <div class="set-title">识别参数</div>
-                  <div class="set-desc">语义断句会下发给火山引擎标点；静音阈值作为 VAD 断句阈值（end_window_size）。</div>
+                  <div class="set-title">停顿后自动断句</div>
+                  <div class="set-desc">说话停顿达到所选时间后，自动结束当前句。</div>
                 </div>
-                <div class="inline-fields">
-                  <label class="check">
-                    <input id="semantic-punctuation" type="checkbox" checked />
-                    语义断句
-                  </label>
-                  <input id="silence-ms" class="num-input" type="number" min="200" step="100" value="1300" />
-                  <span class="set-desc">ms</span>
-                  <button id="save-options-btn" class="btn ghost small">保存参数</button>
-                </div>
+                <select id="silence-ms" aria-label="停顿后自动断句时间">
+                  <option value="800">较快 · 0.8 秒</option>
+                  <option value="1300" selected>标准 · 1.3 秒</option>
+                  <option value="2000">较慢 · 2 秒</option>
+                  <option value="3000">最长 · 3 秒</option>
+                </select>
               </div>
             </section>
           </div>
@@ -456,31 +486,27 @@
             <p id="ob-privacy-error" class="field-error hidden">请先确认你已了解数据处理方式。</p>
           </section>
 
-          <!-- 4 · 可选设置 -->
+          <!-- 4 · 识别服务 -->
           <section class="ob-pane" data-pane="4">
-            <h2>可选设置</h2>
-            <p>以下两项随时可以在「设置」里修改，可以稍后再填。</p>
-            <div class="set-row">
-              <div>
-                <div class="set-title">开机时启动应用</div>
-                <div class="set-desc">登录系统后自动在后台运行 JackVoice。</div>
-              </div>
-              <label class="switch">
-                <input id="ob-autostart" type="checkbox" />
-                <span class="slider"></span>
-              </label>
-            </div>
+            <h2>连接语音服务</h2>
+            <p>JackVoice 使用你自己的豆包语音服务。App Key 只需配置一次，保存后不会继续显示输入框。</p>
             <div class="set-row ob-key-row">
               <div>
-                <div class="set-title">豆包录音识别 API Key</div>
-                <div class="set-desc" id="ob-key-desc">开始听写前需要配置；也可稍后再到「设置 → 识别」里填写。</div>
-                <a class="external-help-link" data-external-link href="https://console.volcengine.com/speech/new/">前往豆包语音控制台获取 APP Key（即这里的 API Key）↗</a>
+                <div class="set-title">豆包语音 App Key</div>
+                <div class="set-desc" id="ob-key-desc">没有 App Key 也可以先完成引导，稍后再到设置中配置。</div>
+                <a class="external-help-link" data-external-link href="https://console.volcengine.com/speech/new/">前往豆包语音控制台获取 App Key ↗</a>
               </div>
               <div class="credential-control">
-                <div class="inline-fields">
-                  <input id="ob-volc-api-key" class="text-input" type="password" placeholder="火山控制台 APP Key" autocomplete="off" />
-                  <button id="ob-save-volc-key" class="btn ghost small">保存并测试</button>
-                  <button id="ob-test-volc-key" class="btn ghost small">测试连接</button>
+                <div id="ob-key-summary" class="credential-summary hidden">
+                  <span class="service-status connected"><i></i>已连接</span>
+                  <button id="ob-edit-volc-key" class="btn ghost small" type="button">更换 App Key</button>
+                </div>
+                <div id="ob-key-editor" class="credential-editor">
+                  <div class="inline-fields">
+                    <input id="ob-volc-api-key" class="text-input" type="password" placeholder="粘贴豆包语音 App Key" autocomplete="off" />
+                    <button id="ob-save-volc-key" class="btn dark small" type="button">保存并验证</button>
+                    <button id="ob-cancel-volc-key" class="btn ghost small hidden" type="button">取消</button>
+                  </div>
                 </div>
                 <div id="ob-key-test-status" class="connection-test-status" role="status" aria-live="polite"></div>
               </div>
@@ -489,9 +515,9 @@
 
           <!-- 5 · 完成 -->
           <section class="ob-pane" data-pane="5">
-            <h2>准备就绪</h2>
-            <p>一切就绪！现在按下 <kbd class="shortcut">⌥ + Space</kbd> 开始语音输入；说完再按一次结束，文字会自动插入。</p>
-            <p class="ob-detail">也可以点击主界面上的「开始听写」按钮。</p>
+            <h2 id="ob-complete-title">准备就绪</h2>
+            <p id="ob-complete-copy">现在按下 <kbd class="shortcut">⌥ + Space</kbd> 开始语音输入；说完再按一次结束，文字会自动插入。</p>
+            <p id="ob-complete-detail" class="ob-detail">也可以点击主界面上的「开始听写」按钮。</p>
           </section>
         </div>
 

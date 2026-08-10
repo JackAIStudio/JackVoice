@@ -238,6 +238,31 @@ fn volc_corpus(boosting_table_id: &str, hotwords: &[String]) -> Value {
     Value::Object(corpus)
 }
 
+fn recognition_request(
+    semantic_punctuation_enabled: bool,
+    semantic_smoothing_enabled: bool,
+    max_sentence_silence_ms: u32,
+    corpus: Value,
+) -> Value {
+    let mut request = json!({
+        "model_name": "bigmodel",
+        // 流式 + 非流式二遍识别：实时上屏，最终结果更准。
+        "enable_nonstream": true,
+        "enable_itn": true,
+        "enable_punc": semantic_punctuation_enabled,
+        "enable_ddc": semantic_smoothing_enabled,
+        "ssd_version": "200",
+        "show_utterances": true,
+        "result_type": "full",
+        "end_window_size": max_sentence_silence_ms.max(200),
+        "force_to_speech_time": 1000,
+    });
+    if !corpus.as_object().map(|map| map.is_empty()).unwrap_or(true) {
+        request["corpus"] = corpus;
+    }
+    request
+}
+
 /// select! 辅助：到点返回；未设置 deadline 时永久 pending。
 async fn sleep_until_opt(deadline: Option<std::time::Instant>) {
     match deadline {
@@ -258,6 +283,7 @@ impl RealtimeSession {
     pub async fn connect(
         config: VolcAsrConfig,
         semantic_punctuation_enabled: bool,
+        semantic_smoothing_enabled: bool,
         max_sentence_silence_ms: u32,
         hotwords: Vec<String>,
         mut on_update: impl FnMut(TranscriptUpdate) + Send + 'static,
@@ -265,7 +291,7 @@ impl RealtimeSession {
         let api_key = config.api_key.trim().to_string();
         if api_key.is_empty() {
             return Err(AsrError::Message(
-                "尚未配置豆包录音识别 API Key，请先在设置里保存。".into(),
+                "尚未配置豆包语音 App Key，请先在设置里保存。".into(),
             ));
         }
         let resource_id = if config.resource_id.trim().is_empty() {
@@ -276,23 +302,12 @@ impl RealtimeSession {
 
         // 组装识别参数；热词：平台热词表优先，否则请求级直传。替换词仅本地后处理。
         let corpus = volc_corpus(&config.boosting_table_id, &hotwords);
-        let mut request = json!({
-            "model_name": "bigmodel",
-            // 流式 + 非流式二遍识别：实时上屏，最终结果更准。
-            "enable_nonstream": true,
-            "enable_itn": true,
-            "enable_punc": semantic_punctuation_enabled,
-            // 保持 JackVoice 原则：不做“语义顺滑”润色。
-            "enable_ddc": false,
-            "ssd_version": "200",
-            "show_utterances": true,
-            "result_type": "full",
-            "end_window_size": max_sentence_silence_ms.max(200),
-            "force_to_speech_time": 1000,
-        });
-        if !corpus.as_object().map(|m| m.is_empty()).unwrap_or(true) {
-            request["corpus"] = corpus;
-        }
+        let request = recognition_request(
+            semantic_punctuation_enabled,
+            semantic_smoothing_enabled,
+            max_sentence_silence_ms,
+            corpus,
+        );
 
         let full_client_request = json!({
             "user": {
@@ -321,7 +336,7 @@ impl RealtimeSession {
             headers.insert(
                 "X-Api-Key",
                 HeaderValue::from_str(&api_key)
-                    .map_err(|e| AsrError::Message(format!("火山 API Key 无效：{e}")))?,
+                    .map_err(|e| AsrError::Message(format!("豆包语音 App Key 无效：{e}")))?,
             );
             headers.insert(
                 "X-Api-Resource-Id",
@@ -642,11 +657,11 @@ impl RealtimeSession {
     }
 }
 
-/// 向真实识别服务发送会话初始化请求，验证 API Key 与资源 ID。
+/// 向真实识别服务发送会话初始化请求，验证 App Key 与资源 ID。
 ///
 /// 该测试不打开麦克风，也不发送音频；服务端接受初始化请求后立即关闭会话。
 pub async fn test_connection(config: VolcAsrConfig) -> Result<(), AsrError> {
-    let session = RealtimeSession::connect(config, false, 1300, Vec::new(), |_| {}).await?;
+    let session = RealtimeSession::connect(config, false, false, 1300, Vec::new(), |_| {}).await?;
     session.cancel().await;
     Ok(())
 }
@@ -700,6 +715,19 @@ mod volc_protocol_tests {
         );
         assert_eq!(last[1], (SAUC_MSG_AUDIO_ONLY_REQUEST << 4) | 0b0010);
         assert_eq!(u32::from_be_bytes(last[4..8].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn recognition_options_map_to_user_selected_service_features() {
+        let enabled = recognition_request(true, true, 1300, json!({}));
+        assert_eq!(enabled["enable_punc"], true);
+        assert_eq!(enabled["enable_ddc"], true);
+        assert_eq!(enabled["end_window_size"], 1300);
+
+        let disabled = recognition_request(false, false, 100, json!({}));
+        assert_eq!(disabled["enable_punc"], false);
+        assert_eq!(disabled["enable_ddc"], false);
+        assert_eq!(disabled["end_window_size"], 200);
     }
 
     #[test]

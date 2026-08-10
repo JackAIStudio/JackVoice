@@ -220,6 +220,11 @@ fn save_volc_settings(
 }
 
 #[tauri::command]
+fn remove_volc_api_key(state: tauri::State<'_, AppState>) -> Result<UiState, String> {
+    state.remove_volc_api_key()
+}
+
+#[tauri::command]
 async fn test_volc_connection(
     api_key: String,
     resource_id: String,
@@ -239,6 +244,14 @@ fn set_audio_retention(
     state: tauri::State<'_, AppState>,
 ) -> Result<UiState, String> {
     state.set_audio_retention(retention)
+}
+
+#[tauri::command]
+fn set_history_text_size(
+    size: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiState, String> {
+    state.set_history_text_size(size)
 }
 
 #[tauri::command]
@@ -269,10 +282,15 @@ fn complete_onboarding(state: tauri::State<'_, AppState>) -> Result<UiState, Str
 #[tauri::command]
 fn update_recognition_options(
     semantic_punctuation_enabled: bool,
+    semantic_smoothing_enabled: bool,
     max_sentence_silence_ms: u32,
     state: tauri::State<'_, AppState>,
 ) -> Result<UiState, String> {
-    state.update_recognition_options(semantic_punctuation_enabled, max_sentence_silence_ms)
+    state.update_recognition_options(
+        semantic_punctuation_enabled,
+        semantic_smoothing_enabled,
+        max_sentence_silence_ms,
+    )
 }
 
 #[tauri::command]
@@ -522,9 +540,11 @@ pub fn run() {
             start_mic_test,
             stop_mic_test,
             save_volc_settings,
+            remove_volc_api_key,
             test_volc_connection,
             set_input_gain,
             set_audio_retention,
+            set_history_text_size,
             get_permissions,
             request_accessibility_permission,
             check_permissions,

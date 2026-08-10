@@ -35,6 +35,8 @@ pub struct RecognitionContext {
     #[serde(default)]
     pub hotwords: Vec<String>,
     pub semantic_punctuation_enabled: bool,
+    #[serde(default)]
+    pub semantic_smoothing_enabled: bool,
     pub max_sentence_silence_ms: u32,
     pub input_gain_db: f32,
     #[serde(default, skip_serializing_if = "String::is_empty")]

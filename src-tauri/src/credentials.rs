@@ -87,7 +87,7 @@ impl SecretStore for NativeSecretStore {
         with_noninteractive_system_store(|| match entry(service)?.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(Error::NoEntry) => Ok(None),
-            Err(error) => Err(format!("无法从系统凭据库读取豆包 API Key：{error}")),
+            Err(error) => Err(format!("无法从系统凭据库读取豆包 App Key：{error}")),
         })
     }
 
@@ -98,12 +98,12 @@ impl SecretStore for NativeSecretStore {
             if value.is_empty() {
                 return match entry.delete_credential() {
                     Ok(()) | Err(Error::NoEntry) => Ok(()),
-                    Err(error) => Err(format!("无法从系统凭据库删除豆包 API Key：{error}")),
+                    Err(error) => Err(format!("无法从系统凭据库删除豆包 App Key：{error}")),
                 };
             }
             entry
                 .set_password(value)
-                .map_err(|error| format!("无法把豆包 API Key 保存到系统凭据库：{error}"))
+                .map_err(|error| format!("无法把豆包 App Key 保存到系统凭据库：{error}"))
         })
     }
 }
@@ -206,7 +206,7 @@ fn load_development(
         Ok(None) => {}
         Err(error) => {
             return CredentialLoad::missing(format!(
-                "开发版本地凭据暂不可用，JackVoice 已继续启动。请重新填写 API Key。{error}"
+                "开发版本地凭据暂不可用，JackVoice 已继续启动。请重新填写 App Key。{error}"
             ));
         }
     }
@@ -226,7 +226,7 @@ fn load_development(
     }
 
     CredentialLoad::missing(
-        "开发版未配置 API Key。请在设置中填写火山控制台的 APP Key；保存后会写入开发版私有凭据文件。",
+        "开发版尚未连接豆包语音。请在设置中填写 App Key；保存后会写入开发版私有凭据文件。",
     )
 }
 
@@ -239,7 +239,7 @@ fn load_production(store: &impl SecretStore) -> CredentialLoad {
         },
         Ok(_) => migrate_legacy_credential(store),
         Err(error) => CredentialLoad::missing(format!(
-            "系统凭据库暂时不可用，JackVoice 已继续启动。请在设置中重新填写 API Key。{error}"
+            "系统凭据库暂时不可用，JackVoice 已继续启动。请在设置中重新填写 App Key。{error}"
         )),
     }
 }
@@ -290,14 +290,14 @@ fn migrate_legacy_credential(store: &impl SecretStore) -> CredentialLoad {
                     value,
                     source: CredentialSource::LegacyMigration,
                     warning: format!(
-                        "旧版 API Key 本次可用，但迁移到新的正式版凭据条目失败：{error}"
+                        "旧版 App Key 本次可用，但迁移到新的正式版凭据条目失败：{error}"
                     ),
                 },
             }
         }
         Ok(_) => CredentialLoad::missing(String::new()),
         Err(error) => CredentialLoad::missing(format!(
-            "检测旧版凭据时遇到问题，已跳过且不会弹出系统密码框。请在设置中重新填写 API Key。{error}"
+            "检测旧版凭据时遇到问题，已跳过且不会弹出系统密码框。请在设置中重新填写 App Key。{error}"
         )),
     }
 }
@@ -447,6 +447,18 @@ mod tests {
                 0o600
             );
         }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn development_removes_private_file_only_on_explicit_empty_save() {
+        let dir = test_dir("remove");
+        save_volc_api_key(CredentialMode::Development, &dir, "dev-secret").unwrap();
+
+        let source = save_volc_api_key(CredentialMode::Development, &dir, "").unwrap();
+
+        assert_eq!(source, CredentialSource::Missing);
+        assert!(!development_credential_path(&dir).exists());
         let _ = fs::remove_dir_all(dir);
     }
 
