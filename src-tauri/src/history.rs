@@ -32,7 +32,6 @@ pub struct AudioArtifact {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RecognitionContext {
-    pub engine: String,
     #[serde(default)]
     pub hotwords: Vec<String>,
     pub semantic_punctuation_enabled: bool,
@@ -486,6 +485,30 @@ mod tests {
         assert!(data.records[0].recognition.is_none());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_recognition_engine_is_ignored_and_not_reserialized() {
+        let raw = r#"{
+            "id":"old-context",
+            "finishedAtMs":1,
+            "text":"旧识别记录",
+            "durationMs":50,
+            "charCount":5,
+            "recognition":{
+                "engine":"volc-seedasr-streaming",
+                "hotwords":[],
+                "semanticPunctuationEnabled":true,
+                "maxSentenceSilenceMs":800,
+                "inputGainDb":0,
+                "inputDeviceId":""
+            }
+        }"#;
+
+        let record: HistoryRecord = serde_json::from_str(raw).unwrap();
+        assert!(record.recognition.is_some());
+        let serialized = serde_json::to_value(record).unwrap();
+        assert!(serialized["recognition"].get("engine").is_none());
     }
 
     #[test]

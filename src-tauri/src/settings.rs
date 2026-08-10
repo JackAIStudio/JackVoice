@@ -29,6 +29,9 @@ pub struct AppSettings {
     pub shortcut: String,
     #[serde(default)]
     pub launch_at_login: bool,
+    /// 听写占用麦克风期间，临时静音系统输出；目前仅 macOS 支持。
+    #[serde(default)]
+    pub mute_system_audio_during_dictation: bool,
     #[serde(default)]
     pub input_gain_db: f32,
     #[serde(default)]
@@ -90,6 +93,8 @@ struct VariantSettings {
     #[serde(default)]
     launch_at_login: bool,
     #[serde(default)]
+    mute_system_audio_during_dictation: bool,
+    #[serde(default)]
     onboarding_completed: bool,
 }
 
@@ -126,6 +131,7 @@ impl AppSettings {
             selected_input_device_id: shared.selected_input_device_id,
             shortcut: shared.shortcut,
             launch_at_login: variant.launch_at_login,
+            mute_system_audio_during_dictation: variant.mute_system_audio_during_dictation,
             input_gain_db: shared.input_gain_db,
             onboarding_completed: variant.onboarding_completed,
             audio_retention,
@@ -149,6 +155,7 @@ impl AppSettings {
     fn variant(&self) -> VariantSettings {
         VariantSettings {
             launch_at_login: self.launch_at_login,
+            mute_system_audio_during_dictation: self.mute_system_audio_during_dictation,
             onboarding_completed: self.onboarding_completed,
         }
     }
@@ -227,6 +234,7 @@ fn migrate_legacy_variant_settings(raw: &str, production_data_dir: &Path) -> Res
         production_data_dir,
         &VariantSettings {
             launch_at_login: legacy.launch_at_login.unwrap_or(false),
+            mute_system_audio_during_dictation: false,
             onboarding_completed: legacy.onboarding_completed.unwrap_or(false),
         },
     )
@@ -348,6 +356,7 @@ mod tests {
         let settings = AppSettings {
             volc_api_key: "secret".into(),
             onboarding_completed: true,
+            mute_system_audio_during_dictation: true,
             ..AppSettings::default()
         };
 
@@ -358,7 +367,9 @@ mod tests {
         assert!(!shared_raw.contains("secret"));
         assert!(!shared_raw.contains("volcApiKey"));
         assert!(!shared_raw.contains("onboardingCompleted"));
+        assert!(!shared_raw.contains("muteSystemAudioDuringDictation"));
         assert!(variant_raw.contains("onboardingCompleted"));
+        assert!(variant_raw.contains("muteSystemAudioDuringDictation"));
         fs::remove_dir_all(root).unwrap();
     }
 }

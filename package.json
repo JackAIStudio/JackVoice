@@ -13,6 +13,7 @@
   },
   "type": "module",
   "scripts": {
+    "predev": "node scripts/prepare-dev-ports.mjs",
     "dev": "node scripts/run-desktop-dev.mjs",
     "dev:web": "vite",
     "build": "tsc && vite build",

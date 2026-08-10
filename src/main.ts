@@ -25,6 +25,8 @@ type UiState = {
   needsCopyPrompt: boolean;
   shortcut: string;
   launchAtLogin: boolean;
+  muteSystemAudioDuringDictation: boolean;
+  systemAudioMuteSupported: boolean;
   onboardingCompleted: boolean;
   audioRetention: string;
 };
@@ -57,7 +59,6 @@ type HistoryRecord = {
     sizeBytes: number;
   };
   recognition?: {
-    engine: string;
     hotwords: string[];
     semanticPunctuationEnabled: boolean;
     maxSentenceSilenceMs: number;
@@ -80,8 +81,6 @@ type PermissionStatus = { microphone: boolean; accessibility: boolean };
 const VOLC_HOTWORD_MAX_CHARS = 32;
 // 火山平台热词表上限。
 const HOTWORD_LIMIT = 5000;
-const VOLC_ENGINE_ID = "volc-seedasr-streaming";
-const VOLC_ENGINE_LABEL = "火山引擎 豆包流式语音识别模型 2.0";
 const WEEKDAYS = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"];
 
 const $ = <T extends Element = HTMLElement>(selector: string) =>
@@ -98,12 +97,16 @@ let selectedHistoryId: string | null = null;
 let historyQuery = "";
 let historyPlaybackRate = 1;
 let historyPlaybackLoadingId: string | null = null;
+let historyPlaybackLoadGeneration = 0;
 let historyPlayback: {
   recordId: string;
   audio: HTMLAudioElement;
   objectUrl: string;
 } | null = null;
 let toastTimer: number | undefined;
+let dictationElapsedTimer: number | undefined;
+let dictationRecordingStartedAt: number | null = null;
+let lastDictationPhase = "idle";
 
 const COPY_SUCCESS_ICON =
   '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4 4L19 6"/></svg>';
@@ -188,6 +191,10 @@ function modLabel(token: string): string {
       return "⌃";
     case "Shift":
       return "⇧";
+    case "Fn":
+      return "Fn";
+    case "Equal":
+      return "=";
     default:
       return token;
   }
@@ -239,12 +246,6 @@ function formatFileSize(bytes: number): string {
   return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
-function engineLabel(id?: string): string {
-  if (!id) return "";
-  if (id === VOLC_ENGINE_ID) return VOLC_ENGINE_LABEL;
-  return id;
-}
-
 function phaseLabel(phase: string): string {
   switch (phase) {
     case "recording":
@@ -260,6 +261,68 @@ function phaseLabel(phase: string): string {
   }
 }
 
+function formatDictationElapsed(elapsedMs: number): string {
+  const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function updateDictationElapsed() {
+  const elapsed = $("#dictation-elapsed");
+  if (!elapsed || dictationRecordingStartedAt === null) return;
+  elapsed.textContent = formatDictationElapsed(Date.now() - dictationRecordingStartedAt);
+}
+
+function syncDictationElapsed(phase: string) {
+  const elapsed = $("#dictation-elapsed");
+  const isRecording = phase === "recording";
+
+  if (isRecording && lastDictationPhase !== "recording") {
+    dictationRecordingStartedAt = Date.now();
+  }
+
+  if (isRecording) {
+    elapsed?.classList.remove("hidden");
+    updateDictationElapsed();
+    if (!dictationElapsedTimer) {
+      dictationElapsedTimer = window.setInterval(updateDictationElapsed, 1000);
+    }
+  } else {
+    elapsed?.classList.add("hidden");
+    if (dictationElapsedTimer) {
+      window.clearInterval(dictationElapsedTimer);
+      dictationElapsedTimer = undefined;
+    }
+    if (phase === "idle" || phase === "error") {
+      dictationRecordingStartedAt = null;
+      if (elapsed) elapsed.textContent = "00:00";
+    }
+  }
+
+  lastDictationPhase = phase;
+}
+
+function renderDictationError(message: string) {
+  const notice = $("#dictation-notice");
+  const noticeText = $("#dictation-notice-text");
+  if (noticeText) noticeText.textContent = message;
+  notice?.classList.remove("hidden");
+
+  const control = $("#toggle-btn") as HTMLButtonElement | null;
+  const label = $("#console-title");
+  const shortcut = $("#shortcut-kbd");
+  if (control) {
+    control.className = "dictation-control error";
+    control.disabled = false;
+    control.title = message;
+    control.setAttribute("aria-label", `重试听写：${message}`);
+  }
+  if (label) label.textContent = "重试听写";
+  shortcut?.classList.add("hidden");
+  syncDictationElapsed("error");
+}
+
 /* ---------------- 状态渲染 ---------------- */
 
 function applyState(state: UiState) {
@@ -268,30 +331,59 @@ function applyState(state: UiState) {
   const kbd = $("#shortcut-kbd");
   if (kbd) kbd.textContent = formatShortcut(state.shortcut || "Alt+Space");
 
-  const phaseDot = $("#phase-dot");
-  if (phaseDot) phaseDot.className = `phase-dot ${state.phase || "idle"}`;
-  const console = $(".dictation-console");
-  const active = ["recording", "connecting", "finalizing"].includes(state.phase);
-  console?.classList.toggle("active", active);
+  const phase = state.phase || "idle";
+  const setupRequired = phase === "idle" && !state.hasVolcApiKey;
+  const controlPhase = setupRequired ? "setup" : phase;
   const consoleTitle = $("#console-title");
   if (consoleTitle) {
-    if (state.phase === "recording") consoleTitle.textContent = "正在听写";
-    else if (state.phase === "connecting") consoleTitle.textContent = "正在连接识别服务";
-    else if (state.phase === "finalizing") consoleTitle.textContent = "正在整理文字";
-    else if (state.phase === "error") consoleTitle.textContent = "本次听写未能完成";
-    else consoleTitle.textContent = "听写已就绪";
-    consoleTitle.title = state.status || phaseLabel(state.phase);
+    if (phase === "recording") consoleTitle.textContent = "正在听写";
+    else if (phase === "connecting") consoleTitle.textContent = "正在连接…";
+    else if (phase === "finalizing") consoleTitle.textContent = "正在整理文字…";
+    else if (phase === "error") consoleTitle.textContent = "重试听写";
+    else if (setupRequired) consoleTitle.textContent = "完成设置";
+    else consoleTitle.textContent = "开始听写";
   }
 
   const toggle = $("#toggle-btn") as HTMLButtonElement | null;
   if (toggle) {
-    toggle.textContent = active ? "结束听写" : "开始听写";
-    toggle.disabled = state.phase === "connecting" || state.phase === "finalizing";
+    toggle.className = `dictation-control ${controlPhase}`;
+    toggle.disabled = phase === "connecting" || phase === "finalizing";
+    toggle.title = state.status || phaseLabel(phase);
+    toggle.setAttribute("aria-pressed", String(phase === "recording"));
+    toggle.setAttribute(
+      "aria-label",
+      phase === "recording"
+        ? "结束听写"
+        : setupRequired
+          ? "打开设置以完成听写配置"
+          : phase === "error"
+            ? `重试听写：${state.status || "上次听写出错"}`
+            : state.status || "开始听写",
+    );
+  }
+
+  kbd?.classList.toggle("hidden", phase !== "idle" || setupRequired);
+  syncDictationElapsed(phase);
+
+  const notice = $("#dictation-notice");
+  const noticeText = $("#dictation-notice-text");
+  if (phase === "error") {
+    if (noticeText) noticeText.textContent = state.status || "请检查听写设置后重试。";
+    notice?.classList.remove("hidden");
+  } else {
+    notice?.classList.add("hidden");
   }
 
   const autostart = $("#autostart-toggle") as HTMLInputElement | null;
   if (autostart && document.activeElement !== autostart) {
     autostart.checked = !!state.launchAtLogin;
+  }
+
+  const outputMuteRow = $("#output-mute-row");
+  outputMuteRow?.classList.toggle("hidden", !state.systemAudioMuteSupported);
+  const outputMute = $("#output-mute-toggle") as HTMLInputElement | null;
+  if (outputMute && document.activeElement !== outputMute) {
+    outputMute.checked = !!state.muteSystemAudioDuringDictation;
   }
 
   if (!recordingShortcut) {
@@ -766,7 +858,6 @@ function renderHistoryDetail(record: HistoryRecord) {
     infoGrid.append(term, description);
   };
   addInfo("完成时间", date.toLocaleString("zh-CN"));
-  addInfo("识别模型", engineLabel(record.recognition?.engine) || "未记录");
   addInfo("文字", `${record.charCount} 字`);
   if (record.audio) {
     addInfo(
@@ -846,11 +937,14 @@ async function clearAllHistory() {
 }
 
 function stopHistoryPlayback() {
-  if (!historyPlayback) return;
-  historyPlayback.audio.pause();
-  URL.revokeObjectURL(historyPlayback.objectUrl);
-  historyPlayback = null;
+  historyPlaybackLoadGeneration += 1;
   historyPlaybackLoadingId = null;
+  if (historyPlayback) {
+    historyPlayback.audio.pause();
+    historyPlayback.audio.currentTime = 0;
+    URL.revokeObjectURL(historyPlayback.objectUrl);
+  }
+  historyPlayback = null;
   syncPlaybackUi();
 }
 
@@ -898,10 +992,12 @@ function syncPlaybackUi() {
 async function loadHistoryPlayback(recordId: string): Promise<HTMLAudioElement | null> {
   if (historyPlayback?.recordId === recordId) return historyPlayback.audio;
   stopHistoryPlayback();
+  const loadGeneration = historyPlaybackLoadGeneration;
   historyPlaybackLoadingId = recordId;
   syncPlaybackUi();
   try {
     const wav = await invoke<ArrayBuffer>("get_history_audio", { recordId });
+    if (loadGeneration !== historyPlaybackLoadGeneration) return null;
     const objectUrl = URL.createObjectURL(new Blob([wav], { type: "audio/wav" }));
     const audio = new Audio(objectUrl);
     audio.preload = "metadata";
@@ -924,12 +1020,15 @@ async function loadHistoryPlayback(recordId: string): Promise<HTMLAudioElement |
     );
     return audio;
   } catch (error) {
+    if (loadGeneration !== historyPlaybackLoadGeneration) return null;
     console.error("load history audio failed", error);
     showToast(`录音加载失败：${String(error)}`, "error");
     return null;
   } finally {
-    historyPlaybackLoadingId = null;
-    syncPlaybackUi();
+    if (loadGeneration === historyPlaybackLoadGeneration) {
+      historyPlaybackLoadingId = null;
+      syncPlaybackUi();
+    }
   }
 }
 
@@ -1362,6 +1461,9 @@ function hideShortcutError() {
 function startRecording() {
   recordingShortcut = true;
   hideShortcutError();
+  void invoke("start_shortcut_recording").catch((error) =>
+    console.error("start native shortcut recording failed", error),
+  );
   const btn = $("#shortcut-btn");
   if (btn) {
     btn.classList.add("recording");
@@ -1371,6 +1473,9 @@ function startRecording() {
 
 function stopRecording() {
   recordingShortcut = false;
+  void invoke("cancel_shortcut_recording").catch((error) =>
+    console.error("cancel native shortcut recording failed", error),
+  );
   const btn = $("#shortcut-btn");
   if (btn) {
     btn.classList.remove("recording");
@@ -1396,7 +1501,7 @@ function acceleratorFromEvent(e: KeyboardEvent): string | null {
   else if (code === "ArrowUp") key = "Up";
   else if (code === "ArrowDown") key = "Down";
   else if (code === "Minus") key = "-";
-  else if (code === "Equal") key = "+";
+  else if (code === "Equal") key = "Equal";
   else if (code === "Comma") key = ",";
   else if (code === "Period") key = ".";
   else if (code === "Semicolon") key = ";";
@@ -1404,7 +1509,7 @@ function acceleratorFromEvent(e: KeyboardEvent): string | null {
   else if (code === "BracketLeft") key = "[";
   else if (code === "BracketRight") key = "]";
   else if (code === "Backquote") key = "`";
-  else if (code === "Enter") key = "Return";
+  else if (code === "Enter") key = "Enter";
   else if (code === "Tab") key = "Tab";
 
   if (!key) return null; // 只按了修饰键，继续等待
@@ -1424,12 +1529,28 @@ function onRecordKeydown(e: KeyboardEvent) {
   if (accelerator === null) return;
   stopRecording();
   if (accelerator === "") {
-    showShortcutError("请至少包含一个修饰键（⌘ / ⌥ / ⇧ / ），或单独使用 F1–F12。");
+    showShortcutError("请至少包含一个修饰键（Fn / ⌘ / ⌥ / ⌃ / ⇧），或单独使用 F1–F12。");
     return;
   }
+  saveShortcut(accelerator);
+}
+
+function saveShortcut(accelerator: string) {
   invoke<UiState>("update_shortcut", { shortcut: accelerator })
     .then((state) => applyState(state))
     .catch((error) => showShortcutError(error instanceof Error ? error.message : String(error)));
+}
+
+type ShortcutCaptureEvent = { accelerator: string; error: string };
+
+function onNativeShortcutCaptured(payload: ShortcutCaptureEvent) {
+  if (!recordingShortcut) return;
+  stopRecording();
+  if (payload.error) {
+    showShortcutError(payload.error);
+    return;
+  }
+  if (payload.accelerator) saveShortcut(payload.accelerator);
 }
 
 /* ---------------- 命令调用 ---------------- */
@@ -1445,12 +1566,7 @@ async function toggleDictation() {
     applyState(state);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const pill = $("#phase-pill");
-    if (pill) {
-      pill.className = "pill error";
-      pill.textContent = "出错";
-      pill.title = message;
-    }
+    renderDictationError(message);
   }
 }
 
@@ -1604,6 +1720,17 @@ async function setLaunchAtLogin(enabled: boolean) {
     window.alert(message);
     const toggle = $("#autostart-toggle") as HTMLInputElement | null;
     if (toggle) toggle.checked = !enabled;
+  }
+}
+
+async function setMuteSystemAudioDuringDictation(enabled: boolean) {
+  try {
+    const state = await invoke<UiState>("set_mute_system_audio_during_dictation", { enabled });
+    applyState(state);
+    showToast(enabled ? "已开启听写时自动静音" : "已关闭听写时自动静音", "success");
+  } catch (error) {
+    window.alert(error instanceof Error ? error.message : String(error));
+    if (currentState) applyState(currentState);
   }
 }
 
@@ -1853,6 +1980,11 @@ function bindSettingsModal() {
     void setLaunchAtLogin(enabled);
   });
 
+  $("#output-mute-toggle")?.addEventListener("change", (e) => {
+    const enabled = (e.target as HTMLInputElement).checked;
+    void setMuteSystemAudioDuringDictation(enabled);
+  });
+
   $("#audio-retention")?.addEventListener("change", (e) => {
     void setAudioRetention((e.target as HTMLSelectElement).value);
   });
@@ -1886,7 +2018,14 @@ function bindExternalLinks() {
 }
 
 function bindHome() {
-  $("#toggle-btn")?.addEventListener("click", () => void toggleDictation());
+  $("#toggle-btn")?.addEventListener("click", () => {
+    if (currentState?.phase === "idle" && !currentState.hasVolcApiKey) {
+      openSettings();
+      return;
+    }
+    void toggleDictation();
+  });
+  $("#dictation-notice-settings")?.addEventListener("click", openSettings);
   $("#clear-history")?.addEventListener("click", () => void clearAllHistory());
   $("#history-search")?.addEventListener("input", (event) => {
     historyQuery = (event.target as HTMLInputElement).value;
@@ -1895,6 +2034,7 @@ function bindHome() {
 
   const detail = $("#history-detail") as HTMLDialogElement | null;
   detail?.addEventListener("close", () => {
+    stopHistoryPlayback();
     selectedHistoryId = null;
     document.querySelectorAll<HTMLElement>("[data-history-row]").forEach((row) => {
       row.classList.remove("active");
@@ -1962,6 +2102,9 @@ function bindDict() {
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
+  await listen<ShortcutCaptureEvent>("jackvoice://shortcut-captured", (event) =>
+    onNativeShortcutCaptured(event.payload),
+  );
   ensureSegments();
   bindNav();
   bindHome();

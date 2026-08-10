@@ -24,29 +24,36 @@
           <button class="nav-item active" data-view="home">听写</button>
           <button class="nav-item" data-view="dict">词库</button>
         </nav>
-        <button id="open-settings" class="settings-button" title="设置" aria-label="打开设置">
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M4 21v-7" /><path d="M4 10V3" /><path d="M12 21v-9" /><path d="M12 8V3" /><path d="M20 21v-5" /><path d="M20 12V3" />
-            <path d="M1 14h6" /><path d="M9 8h6" /><path d="M17 16h6" />
-          </svg>
-        </button>
+        <div class="header-actions">
+          <button id="toggle-btn" class="dictation-control idle" type="button" aria-label="开始听写">
+            <svg class="dictation-control-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+              <path d="M12 19v3" />
+            </svg>
+            <span id="console-title" class="dictation-control-label" aria-live="polite">开始听写</span>
+            <span id="dictation-elapsed" class="dictation-elapsed hidden" aria-hidden="true">00:00</span>
+            <kbd id="shortcut-kbd" class="control-shortcut">⌥ Space</kbd>
+          </button>
+          <button id="open-settings" class="settings-button" title="设置" aria-label="打开设置">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 21v-7" /><path d="M4 10V3" /><path d="M12 21v-9" /><path d="M12 8V3" /><path d="M20 21v-5" /><path d="M20 12V3" />
+              <path d="M1 14h6" /><path d="M9 8h6" /><path d="M17 16h6" />
+            </svg>
+          </button>
+        </div>
       </header>
 
       <main class="content">
         <!-- ================= 首页 ================= -->
         <section id="view-home" class="view active">
-          <section class="dictation-console">
-            <div class="console-copy">
-              <div class="console-state">
-                <span id="phase-dot" class="phase-dot" aria-hidden="true"></span>
-                <h1 id="console-title" aria-live="polite">听写已就绪</h1>
-              </div>
-              <p>在任意应用按 <kbd id="shortcut-kbd" class="shortcut">⌥ + Space</kbd> 开始，说完再按一次。</p>
+          <section id="dictation-notice" class="dictation-notice hidden" role="status" aria-live="polite">
+            <span class="dictation-notice-icon" aria-hidden="true">!</span>
+            <div class="dictation-notice-copy">
+              <strong>听写暂不可用</strong>
+              <p id="dictation-notice-text"></p>
             </div>
-            <div class="console-signal" aria-hidden="true">
-              <span></span><span></span><span></span><span></span><span></span>
-            </div>
-            <button id="toggle-btn" class="console-action">开始听写</button>
+            <button id="dictation-notice-settings" class="dictation-notice-action" type="button">打开设置</button>
           </section>
 
           <div class="history-workbench">
@@ -193,7 +200,7 @@
               <div class="set-row">
                 <div>
                   <div class="set-title">免按模式</div>
-                  <div class="set-desc">按下快捷键立即开始听写，再按一下结束说话。</div>
+                  <div class="set-desc">按下快捷键立即开始听写，再按一下结束说话。macOS 支持 Fn 与其他按键组合。</div>
                 </div>
                 <button id="shortcut-btn" class="shortcut-btn">⌥ + Space</button>
               </div>
@@ -260,6 +267,16 @@
                 </svg>
                 音频
               </h3>
+              <div id="output-mute-row" class="set-row hidden">
+                <div>
+                  <div class="set-title">听写时临时静音系统音频</div>
+                  <div class="set-desc">麦克风开始录音后静音音乐、视频和通知音，停止录音时立即恢复。</div>
+                </div>
+                <label class="switch">
+                  <input id="output-mute-toggle" type="checkbox" />
+                  <span class="slider"></span>
+                </label>
+              </div>
               <div class="set-row">
                 <div>
                   <div class="set-title">麦克风</div>

@@ -11,8 +11,6 @@ use tokio_tungstenite::{
 };
 use uuid::Uuid;
 
-/// 固定识别引擎：火山引擎豆包流式语音识别模型 2.0。
-pub const ASR_ENGINE_ID: &str = "volc-seedasr-streaming";
 /// 识别引擎展示名。
 pub const ASR_ENGINE_NAME: &str = "火山引擎 豆包流式语音识别模型 2.0";
 

@@ -1,10 +1,9 @@
-use crate::asr::{
-    RealtimeSession, TranscriptUpdate, VolcAsrConfig, ASR_ENGINE_ID, ASR_ENGINE_NAME,
-};
+use crate::asr::{RealtimeSession, TranscriptUpdate, VolcAsrConfig, ASR_ENGINE_NAME};
 use crate::audio::{self, AudioCapture, InputDeviceInfo};
 use crate::credentials::{CredentialMode, CredentialSource};
 use crate::delivery::{self, DeliveryResult};
 use crate::history::{AudioRecorder, RecognitionContext};
+use crate::output_mute::OutputMuteGuard;
 use crate::settings::{self, AppSettings};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -59,6 +58,8 @@ pub struct UiState {
     pub mic_notice_seq: u32,
     pub shortcut: String,
     pub launch_at_login: bool,
+    pub mute_system_audio_during_dictation: bool,
+    pub system_audio_mute_supported: bool,
     /// Whether the first-run onboarding walkthrough has been completed.
     pub onboarding_completed: bool,
     pub audio_retention: String,
@@ -89,6 +90,8 @@ impl Default for UiState {
             mic_notice_seq: 0,
             shortcut: "Alt+Space".into(),
             launch_at_login: false,
+            mute_system_audio_during_dictation: false,
+            system_audio_mute_supported: crate::output_mute::supported(),
             onboarding_completed: false,
             audio_retention: "thirtyDays".into(),
         }
@@ -99,6 +102,8 @@ struct ActiveSession {
     stop_tx: Option<mpsc::Sender<()>>,
     /// Stop the dedicated audio owner thread (Send).
     audio_stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    /// Owns only the mute state applied by this dictation session.
+    output_mute: Option<OutputMuteGuard>,
     started_at: Option<Instant>,
 }
 
@@ -173,6 +178,11 @@ impl AppState {
             settings::remove_legacy_settings_backup(&shared_data_dir)?;
         }
         crate::history::apply_audio_retention(&shared_data_dir, &settings.audio_retention)?;
+        match crate::output_mute::restore_stale(&shared_data_dir) {
+            Ok(true) => eprintln!("[output-mute] 已恢复上次异常退出遗留的系统音频状态"),
+            Ok(false) => {}
+            Err(error) => eprintln!("[output-mute] 启动恢复失败：{error}"),
+        }
         let mut ui = UiState::default();
         apply_settings_to_ui(&mut ui, &settings);
         ui.volc_credential_source = credential_source.as_str().into();
@@ -198,6 +208,10 @@ impl AppState {
 
     pub fn snapshot(&self) -> UiState {
         self.ui.lock().clone()
+    }
+
+    pub fn shortcut(&self) -> String {
+        self.settings.lock().shortcut.clone()
     }
 
     pub fn data_dir(&self) -> PathBuf {
@@ -770,6 +784,37 @@ impl AppState {
         Ok(ui.clone())
     }
 
+    pub fn set_mute_system_audio_during_dictation(&self, enabled: bool) -> Result<UiState, String> {
+        if enabled && !crate::output_mute::supported() {
+            return Err("当前系统暂不支持听写时自动静音。".into());
+        }
+        if self.active.lock().is_some() {
+            return Err("正在听写中，请结束后再修改系统音频设置。".into());
+        }
+        let mut settings = self.settings.lock();
+        settings.mute_system_audio_during_dictation = enabled;
+        self.save_settings(&settings)?;
+        let mut ui = self.ui.lock();
+        apply_settings_to_ui(&mut ui, &settings);
+        ui.status = if enabled {
+            "已开启听写时临时静音系统音频。".into()
+        } else {
+            "已关闭听写时临时静音系统音频。".into()
+        };
+        Ok(ui.clone())
+    }
+
+    /// Best-effort process-exit cleanup. Session stop paths call the same
+    /// guard earlier, immediately after microphone capture ends.
+    pub fn restore_output_audio(&self) {
+        let guard = self
+            .active
+            .lock()
+            .as_mut()
+            .and_then(|active| active.output_mute.take());
+        restore_output_mute(guard);
+    }
+
     /// Persist the "onboarding finished" flag so future launches go straight
     /// to the main UI.
     pub fn complete_onboarding(&self) -> Result<UiState, String> {
@@ -940,11 +985,28 @@ impl AppState {
             }
         }
 
+        let output_mute = if settings.mute_system_audio_during_dictation {
+            match OutputMuteGuard::engage(&self.shared_data_dir) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    eprintln!("[output-mute] 本次听写未能静音系统音频：{error}");
+                    let mut ui = self.ui.lock();
+                    ui.mic_notice = format!("系统音频未静音：{error}");
+                    ui.mic_notice_seq = ui.mic_notice_seq.wrapping_add(1);
+                    let _ = app.emit("jackvoice://state", ui.clone());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         {
             let mut active = self.active.lock();
             *active = Some(ActiveSession {
                 stop_tx: Some(stop_tx),
                 audio_stop_tx: Some(audio_stop_tx),
+                output_mute,
                 started_at: Some(Instant::now()),
             });
         }
@@ -965,7 +1027,6 @@ impl AppState {
         let recording_dir = self.shared_data_dir.clone();
         let save_audio = crate::history::should_save_audio(&settings.audio_retention);
         let recognition_context = RecognitionContext {
-            engine: ASR_ENGINE_ID.to_string(),
             hotwords: hotwords.clone(),
             semantic_punctuation_enabled: semantic,
             max_sentence_silence_ms: silence,
@@ -1097,11 +1158,17 @@ impl AppState {
 
             // Stop microphone before finalization.
             if let Some(state) = app_for_task.try_state::<AppState>() {
-                if let Some(active) = state.active.lock().as_mut() {
-                    if let Some(tx) = active.audio_stop_tx.take() {
-                        let _ = tx.send(());
+                let (audio_stop_tx, output_mute) = {
+                    let mut active = state.active.lock();
+                    match active.as_mut() {
+                        Some(active) => (active.audio_stop_tx.take(), active.output_mute.take()),
+                        None => (None, None),
                     }
+                };
+                if let Some(tx) = audio_stop_tx {
+                    let _ = tx.send(());
                 }
+                restore_output_mute(output_mute);
                 let mut ui = state.ui.lock();
                 ui.audio_level = 0.0;
                 ui.phase = "finalizing".into();
@@ -1243,17 +1310,22 @@ impl AppState {
         // window they are actually typing in.
         crate::overlay::remember_frontmost_app();
 
-        let (stop_tx, audio_stop_tx) = {
+        let (stop_tx, audio_stop_tx, output_mute) = {
             let mut active = self.active.lock();
             match active.as_mut() {
-                Some(session) => (session.stop_tx.take(), session.audio_stop_tx.take()),
-                None => (None, None),
+                Some(session) => (
+                    session.stop_tx.take(),
+                    session.audio_stop_tx.take(),
+                    session.output_mute.take(),
+                ),
+                None => (None, None, None),
             }
         };
 
         if let Some(tx) = audio_stop_tx {
             let _ = tx.send(());
         }
+        restore_output_mute(output_mute);
 
         {
             let mut ui = self.ui.lock();
@@ -1283,8 +1355,18 @@ fn apply_settings_to_ui(ui: &mut UiState, settings: &AppSettings) {
     ui.selected_input_device_id = settings.selected_input_device_id.clone();
     ui.shortcut = settings.shortcut.clone();
     ui.launch_at_login = settings.launch_at_login;
+    ui.mute_system_audio_during_dictation = settings.mute_system_audio_during_dictation;
+    ui.system_audio_mute_supported = crate::output_mute::supported();
     ui.onboarding_completed = settings.onboarding_completed;
     ui.audio_retention = settings.audio_retention.clone();
+}
+
+fn restore_output_mute(mut guard: Option<OutputMuteGuard>) {
+    if let Some(guard) = guard.as_mut() {
+        if let Err(error) = guard.restore() {
+            eprintln!("[output-mute] 恢复系统音频失败：{error}");
+        }
+    }
 }
 
 /// Human-readable text for microphone fault notices.
