@@ -267,6 +267,7 @@ button {
   white-space: nowrap;
 }
 
+.dictation-control.starting,
 .dictation-control.connecting,
 .dictation-control.finalizing {
   border-color: #c8e5dc;
@@ -274,6 +275,7 @@ button {
   color: #176f5a;
 }
 
+.dictation-control.starting .dictation-control-icon,
 .dictation-control.connecting .dictation-control-icon,
 .dictation-control.finalizing .dictation-control-icon {
   color: #22ae89;
@@ -391,6 +393,39 @@ kbd.shortcut {
 .dictation-notice-action:hover {
   background: #fffafa;
   border-color: #d9adad;
+}
+
+.recording-storage {
+  display: flex;
+  min-height: 54px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border: 1px solid #dce9e4;
+  border-radius: 14px;
+  background: #f5faf8;
+}
+
+.recording-storage-copy {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.recording-storage-copy strong {
+  flex: none;
+  font-size: 12px;
+}
+
+.recording-storage-copy span {
+  overflow: hidden;
+  color: #66716c;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .usage-summary {
@@ -1622,6 +1657,27 @@ input[type="range"]#gain-db {
   font-size: 21px;
   font-weight: 650;
   margin-bottom: 12px;
+}
+
+.ob-requirement {
+  display: inline-flex;
+  vertical-align: 3px;
+  margin-left: 6px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.4;
+}
+
+.ob-requirement.required {
+  color: #a34242;
+  background: #fff0f0;
+}
+
+.ob-requirement.optional {
+  color: #546071;
+  background: #eef1f5;
 }
 
 .ob-pane p {

@@ -9,6 +9,7 @@ const DEVELOPMENT_SERVICE: &str = "com.jackvoice.app.dev";
 const LEGACY_SHARED_SERVICE: &str = "com.jackvoice.shared";
 const VOLC_API_KEY_ACCOUNT: &str = "volc-api-key";
 const DEVELOPMENT_CREDENTIAL_FILE: &str = "dev-credentials.json";
+const DEVELOPMENT_MIGRATION_MARKER_FILE: &str = ".dev-credential-migration-complete";
 pub const DEVELOPMENT_ENV_VAR: &str = "JACKVOICE_VOLC_API_KEY";
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -197,6 +198,7 @@ fn load_development(
 
     match load_development_file(path) {
         Ok(Some(value)) => {
+            let _ = mark_development_migration_complete(path);
             return CredentialLoad {
                 value,
                 source: CredentialSource::DevelopmentFile,
@@ -209,6 +211,16 @@ fn load_development(
                 "开发版本地凭据暂不可用，JackVoice 已继续启动。请重新填写 App Key。{error}"
             ));
         }
+    }
+
+    // Migration is intentionally one-shot. In particular, an explicit key
+    // removal must not resurrect an old development Keychain entry on the next
+    // launch. The first completed check leaves a private marker beside the
+    // development credential file.
+    if development_migration_marker_path(path).is_file() {
+        return CredentialLoad::missing(
+            "开发版尚未连接豆包语音。请在设置中填写 App Key；保存后会写入开发版私有凭据文件。",
+        );
     }
 
     // One-time best-effort migration from the earlier development Keychain
@@ -224,6 +236,8 @@ fn load_development(
             };
         }
     }
+
+    let _ = mark_development_migration_complete(path);
 
     CredentialLoad::missing(
         "开发版尚未连接豆包语音。请在设置中填写 App Key；保存后会写入开发版私有凭据文件。",
@@ -248,6 +262,18 @@ fn development_credential_path(variant_data_dir: &Path) -> PathBuf {
     variant_data_dir.join(DEVELOPMENT_CREDENTIAL_FILE)
 }
 
+fn development_migration_marker_path(credential_path: &Path) -> PathBuf {
+    credential_path.with_file_name(DEVELOPMENT_MIGRATION_MARKER_FILE)
+}
+
+fn mark_development_migration_complete(credential_path: &Path) -> Result<(), String> {
+    crate::storage::write_atomic(
+        &development_migration_marker_path(credential_path),
+        b"version=1\n",
+        false,
+    )
+}
+
 fn load_development_file(path: &Path) -> Result<Option<String>, String> {
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,
@@ -263,17 +289,19 @@ fn load_development_file(path: &Path) -> Result<Option<String>, String> {
 fn save_development_file(path: &Path, value: &str) -> Result<(), String> {
     let value = value.trim();
     if value.is_empty() {
-        return match fs::remove_file(path) {
+        match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!("删除开发版凭据文件失败：{error}")),
-        };
+        }?;
+        return mark_development_migration_complete(path);
     }
     let raw = serde_json::to_vec_pretty(&DevelopmentCredentials {
         volc_api_key: value.to_string(),
     })
     .map_err(|error| format!("序列化开发版凭据失败：{error}"))?;
-    crate::storage::write_atomic(path, &raw, false)
+    crate::storage::write_atomic(path, &raw, false)?;
+    mark_development_migration_complete(path)
 }
 
 fn migrate_legacy_credential(store: &impl SecretStore) -> CredentialLoad {
@@ -459,6 +487,26 @@ mod tests {
 
         assert_eq!(source, CredentialSource::Missing);
         assert!(!development_credential_path(&dir).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn development_explicit_removal_does_not_remigrate_old_keychain_entry() {
+        let dir = test_dir("remove-no-remigrate");
+        let path = development_credential_path(&dir);
+        save_development_file(&path, "dev-secret").unwrap();
+        save_development_file(&path, "").unwrap();
+        let store = FakeStore::default();
+        store
+            .values
+            .borrow_mut()
+            .insert(DEVELOPMENT_SERVICE.into(), "legacy-dev-secret".into());
+
+        let loaded = load_development(None, &path, &store);
+
+        assert!(loaded.value.is_empty());
+        assert_eq!(loaded.source, CredentialSource::Missing);
+        assert!(store.calls.borrow().is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 

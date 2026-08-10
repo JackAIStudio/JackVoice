@@ -1,7 +1,6 @@
 use crate::storage;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -16,13 +15,13 @@ const MAX_RECORDS: usize = 500;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioArtifact {
-    /// 文件名始终是应用生成的 UUID，不包含目录。
+    /// 文件名始终由应用生成且不包含目录。
     pub file_name: String,
     pub mime_type: String,
     pub sample_rate_hz: u32,
     pub channels: u16,
     pub bits_per_sample: u16,
-    /// 实际送入识别引擎的语音时长，不含服务端收尾静音。
+    /// 实际写入本地文件的语音时长。
     pub duration_ms: u64,
     /// 完整 WAV 文件大小（包含 44 字节头）。
     pub size_bytes: u64,
@@ -56,6 +55,21 @@ pub struct HistoryRecord {
     pub audio: Option<AudioArtifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recognition: Option<RecognitionContext>,
+    /// completed / noSpeech / failed。旧记录默认视为已完成。
+    #[serde(default = "default_recognition_status")]
+    pub recognition_status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recognition_error: String,
+    /// 本地录音链路异常时记录原因；此时关联 WAV 可能只包含异常前的音频。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recording_error: String,
+    /// 用户可能在 Finder 中自行删除 WAV；文字和其他元数据仍然保留。
+    #[serde(default)]
+    pub audio_missing: bool,
+}
+
+fn default_recognition_status() -> String {
+    "completed".into()
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -88,11 +102,19 @@ fn audio_dir(dir: &Path) -> PathBuf {
 }
 
 fn load_records(dir: &Path) -> Vec<HistoryRecord> {
-    fs::read_to_string(history_path(dir))
+    let mut records = fs::read_to_string(history_path(dir))
         .ok()
         .and_then(|raw| serde_json::from_str::<HistoryFile>(&raw).ok())
         .map(|f| f.records)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    for record in &mut records {
+        record.audio_missing = record
+            .audio
+            .as_ref()
+            .and_then(|audio| audio_file_path(dir, &audio.file_name).ok())
+            .is_some_and(|path| !path.is_file());
+    }
+    records
 }
 
 fn compute_stats(records: &[HistoryRecord]) -> HistoryStats {
@@ -112,49 +134,53 @@ pub fn load(dir: &Path) -> HistoryData {
     HistoryData { records, stats }
 }
 
-/// 追加一条听写记录（空文本忽略），并裁剪到上限。被裁剪记录对应的 WAV 也会一并删除。
-pub fn append(
-    dir: &Path,
-    id: String,
-    text: &str,
-    duration_ms: u64,
-    audio: Option<AudioArtifact>,
-    recognition: Option<RecognitionContext>,
-) -> Result<(), String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
+/// 追加一条听写记录。即使没有识别文字，只要有本地录音也必须保留记录。
+/// 首页索引仍裁剪到上限，但 WAV 永远不由应用自动删除。
+pub struct HistoryAppend<'a> {
+    pub id: String,
+    pub text: &'a str,
+    pub duration_ms: u64,
+    pub audio: Option<AudioArtifact>,
+    pub recognition: Option<RecognitionContext>,
+    pub recording_error: Option<String>,
+    pub recognition_error: Option<String>,
+}
+
+pub fn append(dir: &Path, entry: HistoryAppend<'_>) -> Result<(), String> {
+    let trimmed = entry.text.trim();
+    if trimmed.is_empty() && entry.audio.is_none() {
         return Ok(());
     }
+    let recognition_error = entry.recognition_error.unwrap_or_default();
+    let recognition_status = if !recognition_error.is_empty() {
+        "failed"
+    } else if trimmed.is_empty() {
+        "noSpeech"
+    } else {
+        "completed"
+    };
 
     let mut records = load_records(dir);
     records.push(HistoryRecord {
-        id,
+        id: entry.id,
         finished_at_ms: chrono::Utc::now().timestamp_millis(),
         text: trimmed.to_string(),
-        duration_ms,
+        duration_ms: entry.duration_ms,
         char_count: trimmed.chars().filter(|c| !c.is_whitespace()).count() as u32,
-        audio,
-        recognition,
+        audio: entry.audio,
+        recognition: entry.recognition,
+        recognition_status: recognition_status.into(),
+        recognition_error,
+        recording_error: entry.recording_error.unwrap_or_default(),
+        audio_missing: false,
     });
 
-    let removed = if records.len() > MAX_RECORDS {
+    if records.len() > MAX_RECORDS {
         let excess = records.len() - MAX_RECORDS;
-        records.drain(0..excess).collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-
-    persist_records(dir, &records)?;
-
-    // 先成功写入新索引，再删除被裁剪的旧文件；索引写失败时不冒险丢音频。
-    for record in removed {
-        if let Some(audio) = record.audio {
-            if let Ok(path) = audio_file_path(dir, &audio.file_name) {
-                let _ = fs::remove_file(path);
-            }
-        }
+        records.drain(0..excess);
     }
-    Ok(())
+
+    persist_records(dir, &records)
 }
 
 fn persist_records(dir: &Path, records: &[HistoryRecord]) -> Result<(), String> {
@@ -180,108 +206,69 @@ pub fn delete_record(dir: &Path, record_id: &str) -> Result<(), String> {
         .iter()
         .position(|record| record.id == record_id)
         .ok_or_else(|| "找不到这条历史记录。".to_string())?;
-    let removed = records.remove(index);
-    if let Some(audio) = &removed.audio {
-        if let Ok(path) = audio_file_path(dir, &audio.file_name) {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("删除历史录音失败：{error}")),
-            }
-        }
-    }
+    records.remove(index);
     persist_records(dir, &records)?;
     remove_history_backup(dir)?;
     Ok(())
 }
 
 pub fn clear(dir: &Path) -> Result<(), String> {
-    let audio = audio_dir(dir);
-    match fs::remove_dir_all(audio) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("清空历史录音失败：{error}")),
-    };
     persist_records(dir, &[])?;
     remove_history_backup(dir)
 }
 
-pub fn should_save_audio(retention: &str) -> bool {
-    retention != "never"
+pub fn ensure_audio_dir(dir: &Path) -> Result<PathBuf, String> {
+    let path = audio_dir(dir);
+    fs::create_dir_all(&path).map_err(|e| format!("创建录音文件夹失败：{e}"))?;
+    Ok(path)
 }
 
-pub fn apply_audio_retention(dir: &Path, retention: &str) -> Result<(), String> {
-    if retention == "forever" {
-        remove_partial_audio_files(dir)?;
-        return remove_history_backup(dir);
-    }
+/// 将异常退出遗留、已经包含 PCM 的临时 WAV 修复为可播放文件。
+/// 没有任何音频的 `.part` 会保留供诊断，不做静默删除。
+pub fn recover_partial_audio_files(dir: &Path) -> Result<usize, String> {
+    let directory = ensure_audio_dir(dir)?;
+    let mut recovered = 0;
+    for entry in fs::read_dir(&directory).map_err(|e| format!("读取录音文件夹失败：{e}"))?
+    {
+        let entry = entry.map_err(|e| format!("读取临时录音失败：{e}"))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with('.') || !name.ends_with(".wav.part") {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|e| format!("读取临时录音大小失败：{e}"))?;
+        if metadata.len() <= WAV_HEADER_BYTES {
+            continue;
+        }
+        let pcm_bytes = metadata.len() - WAV_HEADER_BYTES;
+        if pcm_bytes > (u32::MAX - 36) as u64 || pcm_bytes & 1 != 0 {
+            continue;
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(entry.path())
+            .map_err(|e| format!("打开临时录音失败：{e}"))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("定位临时录音失败：{e}"))?;
+        file.write_all(&wav_header(pcm_bytes as u32))
+            .map_err(|e| format!("修复临时录音文件头失败：{e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("同步修复录音失败：{e}"))?;
+        drop(file);
 
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let cutoff_ms = match retention {
-        "never" => i64::MAX,
-        "sevenDays" => now_ms.saturating_sub(7 * 24 * 60 * 60 * 1000),
-        _ => now_ms.saturating_sub(30 * 24 * 60 * 60 * 1000),
-    };
-    let mut records = load_records(dir);
-    let mut changed = false;
-    for record in &mut records {
-        if record.finished_at_ms < cutoff_ms {
-            changed |= record.audio.take().is_some();
+        let final_name = name
+            .strip_prefix('.')
+            .and_then(|value| value.strip_suffix(".part"))
+            .ok_or_else(|| "临时录音文件名无效。".to_string())?;
+        let final_path = directory.join(final_name);
+        if !final_path.exists() {
+            fs::rename(entry.path(), final_path).map_err(|e| format!("提交修复录音失败：{e}"))?;
+            recovered += 1;
         }
     }
-
-    let retained_files = records
-        .iter()
-        .filter_map(|record| record.audio.as_ref().map(|audio| audio.file_name.as_str()))
-        .collect::<HashSet<_>>();
-    let audio_directory = audio_dir(dir);
-    match fs::read_dir(&audio_directory) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry.map_err(|error| format!("读取本地录音目录失败：{error}"))?;
-                if !entry
-                    .file_type()
-                    .map_err(|error| format!("读取本地录音类型失败：{error}"))?
-                    .is_file()
-                {
-                    continue;
-                }
-                let file_name = entry.file_name();
-                let file_name = file_name.to_string_lossy();
-                let remove = retention == "never"
-                    || file_name.ends_with(".part")
-                    || !retained_files.contains(file_name.as_ref());
-                if remove {
-                    fs::remove_file(entry.path())
-                        .map_err(|error| format!("清理本地录音失败：{error}"))?;
-                }
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("读取本地录音目录失败：{error}")),
-    }
-
-    if changed {
-        persist_records(dir, &records)?;
-    }
-    remove_history_backup(dir)
-}
-
-fn remove_partial_audio_files(dir: &Path) -> Result<(), String> {
-    match fs::read_dir(audio_dir(dir)) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry.map_err(|error| format!("读取本地录音目录失败：{error}"))?;
-                if entry.file_name().to_string_lossy().ends_with(".part") {
-                    fs::remove_file(entry.path())
-                        .map_err(|error| format!("清理未完成录音失败：{error}"))?;
-                }
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("读取本地录音目录失败：{error}")),
-    }
+    Ok(recovered)
 }
 
 /// 根据历史记录 id 解析音频路径。调用方不能提供任意文件名。
@@ -316,23 +303,28 @@ fn audio_file_path(dir: &Path, file_name: &str) -> Result<PathBuf, String> {
     Ok(audio_dir(dir).join(path))
 }
 
-/// 将送入 ASR 的 PCM16 数据流式写入临时 WAV，避免长录音常驻内存。
-/// 未调用 `finish`（取消、识别失败或进程内错误）时，Drop 会清理临时文件。
+/// 将实际用于识别的 PCM16 数据流式写入临时 WAV，避免长录音常驻内存。
+/// 正常听写无论识别是否成功都会调用 `finish`；只有用户明确取消或本地
+/// 录音本身失败时，Drop 才清理当前进程里的临时文件。
 pub struct AudioRecorder {
     writer: Option<BufWriter<File>>,
     temp_path: PathBuf,
     final_path: PathBuf,
     file_name: String,
     pcm_bytes: u64,
+    bytes_since_flush: u64,
     committed: bool,
+    preserve_partial_on_drop: bool,
 }
 
 impl AudioRecorder {
     pub fn create(dir: &Path, record_id: &str) -> Result<Self, String> {
-        fs::create_dir_all(audio_dir(dir)).map_err(|e| format!("创建音频目录失败：{e}"))?;
-        let file_name = format!("{record_id}.wav");
+        let directory = ensure_audio_dir(dir)?;
+        let short_id = record_id.chars().take(8).collect::<String>();
+        let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+        let file_name = format!("{timestamp}_{short_id}.wav");
         let final_path = audio_file_path(dir, &file_name)?;
-        let temp_path = audio_dir(dir).join(format!(".{record_id}.wav.part"));
+        let temp_path = directory.join(format!(".{file_name}.part"));
         let file = File::create(&temp_path).map_err(|e| format!("创建音频文件失败：{e}"))?;
         let mut writer = BufWriter::new(file);
         writer
@@ -344,7 +336,9 @@ impl AudioRecorder {
             final_path,
             file_name,
             pcm_bytes: 0,
+            bytes_since_flush: 0,
             committed: false,
+            preserve_partial_on_drop: false,
         })
     }
 
@@ -359,12 +353,24 @@ impl AudioRecorder {
         if next_len > (u32::MAX - 36) as u64 {
             return Err("单次录音超过 WAV 格式的 4 GiB 上限。".into());
         }
-        self.writer
+        let writer = self
+            .writer
             .as_mut()
-            .ok_or_else(|| "录音文件已经关闭。".to_string())?
+            .ok_or_else(|| "录音文件已经关闭。".to_string())?;
+        writer
             .write_all(pcm)
             .map_err(|e| format!("写入录音失败：{e}"))?;
         self.pcm_bytes = next_len;
+        // 捕获到任何有效 PCM 后，异常退出也必须保留临时文件供下次恢复。
+        self.preserve_partial_on_drop = true;
+        self.bytes_since_flush += pcm.len() as u64;
+        // 最多约 100 ms 音频留在用户态缓冲区，异常退出后也能尽量恢复完整。
+        if self.bytes_since_flush >= 3_200 {
+            writer
+                .flush()
+                .map_err(|e| format!("刷新录音缓冲失败：{e}"))?;
+            self.bytes_since_flush = 0;
+        }
         Ok(())
     }
 
@@ -372,6 +378,9 @@ impl AudioRecorder {
         if self.pcm_bytes == 0 {
             return Err("本次录音没有有效音频。".into());
         }
+        // 从这里开始任何失败都不应销毁已经捕获的 PCM。下次启动时会
+        // 修复并提交这个 `.part`，供用户自行检查或删除。
+        self.preserve_partial_on_drop = true;
 
         let mut writer = self
             .writer
@@ -410,7 +419,7 @@ impl AudioRecorder {
 
 impl Drop for AudioRecorder {
     fn drop(&mut self) {
-        if !self.committed {
+        if !self.committed && !self.preserve_partial_on_drop {
             // Windows 不能删除仍被打开的文件，先关闭 BufWriter。
             self.writer.take();
             let _ = fs::remove_file(&self.temp_path);
@@ -455,7 +464,19 @@ mod tests {
         recorder.write_pcm(&pcm).unwrap();
         let artifact = recorder.finish().unwrap();
 
-        append(&dir, id.clone(), "测试", 10, Some(artifact.clone()), None).unwrap();
+        append(
+            &dir,
+            HistoryAppend {
+                id: id.clone(),
+                text: "测试",
+                duration_ms: 10,
+                audio: Some(artifact.clone()),
+                recognition: None,
+                recording_error: None,
+                recognition_error: None,
+            },
+        )
+        .unwrap();
         let wav = read_audio(&dir, &id).unwrap();
         assert_eq!(&wav[0..4], b"RIFF");
         assert_eq!(&wav[8..12], b"WAVE");
@@ -514,84 +535,194 @@ mod tests {
     }
 
     #[test]
-    fn unfinished_recording_removes_partial_file() {
+    fn interrupted_recording_with_pcm_preserves_recoverable_partial_file() {
         let dir = temp_dir();
         let id = uuid::Uuid::new_v4().to_string();
-        let partial = audio_dir(&dir).join(format!(".{id}.wav.part"));
+        let partial;
         {
             let mut recorder = AudioRecorder::create(&dir, &id).unwrap();
             recorder.write_pcm(&[0, 0, 1, 0]).unwrap();
+            partial = recorder.temp_path.clone();
             assert!(partial.exists());
         }
-        assert!(!partial.exists());
+        assert!(partial.exists());
+        assert_eq!(recover_partial_audio_files(&dir).unwrap(), 1);
+        assert!(dir
+            .join(AUDIO_DIR_NAME)
+            .join(
+                partial
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .trim_start_matches('.')
+                    .trim_end_matches(".part")
+            )
+            .exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn deleting_record_removes_text_audio_and_backup() {
+    fn deleting_record_keeps_audio_but_removes_text_and_backup() {
         let dir = temp_dir();
         let id = uuid::Uuid::new_v4().to_string();
         let mut recorder = AudioRecorder::create(&dir, &id).unwrap();
         recorder.write_pcm(&[0, 0, 1, 0]).unwrap();
         let artifact = recorder.finish().unwrap();
         let audio_path = audio_file_path(&dir, &artifact.file_name).unwrap();
-        append(&dir, id.clone(), "可删除", 1, Some(artifact), None).unwrap();
+        append(
+            &dir,
+            HistoryAppend {
+                id: id.clone(),
+                text: "可删除",
+                duration_ms: 1,
+                audio: Some(artifact),
+                recognition: None,
+                recording_error: None,
+                recognition_error: None,
+            },
+        )
+        .unwrap();
         fs::write(history_path(&dir).with_extension("json.bak"), "private").unwrap();
 
         delete_record(&dir, &id).unwrap();
 
         assert!(load(&dir).records.is_empty());
-        assert!(!audio_path.exists());
+        assert!(audio_path.exists());
         assert!(!history_path(&dir).with_extension("json.bak").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn never_retention_removes_audio_but_keeps_transcript() {
+    fn audio_only_failed_recognition_is_kept() {
+        let dir = temp_dir();
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut recorder = AudioRecorder::create(&dir, &id).unwrap();
+        recorder.write_pcm(&[0, 0, 1, 0]).unwrap();
+        let artifact = recorder.finish().unwrap();
+        append(
+            &dir,
+            HistoryAppend {
+                id,
+                text: "",
+                duration_ms: 1,
+                audio: Some(artifact),
+                recognition: None,
+                recording_error: None,
+                recognition_error: Some("没有网络".into()),
+            },
+        )
+        .unwrap();
+
+        let records = load(&dir).records;
+        assert_eq!(records.len(), 1);
+        assert!(records[0].text.is_empty());
+        assert_eq!(records[0].recognition_status, "failed");
+        assert_eq!(records[0].recognition_error, "没有网络");
+        assert!(records[0].audio.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_recording_failure_is_preserved_in_history() {
+        let dir = temp_dir();
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut recorder = AudioRecorder::create(&dir, &id).unwrap();
+        recorder.write_pcm(&[0, 0, 1, 0]).unwrap();
+        let artifact = recorder.finish().unwrap();
+        append(
+            &dir,
+            HistoryAppend {
+                id,
+                text: "",
+                duration_ms: 1,
+                audio: Some(artifact),
+                recognition: None,
+                recording_error: Some("录音缓冲区已满".into()),
+                recognition_error: None,
+            },
+        )
+        .unwrap();
+
+        let records = load(&dir).records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].recording_error, "录音缓冲区已满");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_audio_is_reported_without_removing_history() {
         let dir = temp_dir();
         let id = uuid::Uuid::new_v4().to_string();
         let mut recorder = AudioRecorder::create(&dir, &id).unwrap();
         recorder.write_pcm(&[0, 0, 1, 0]).unwrap();
         let artifact = recorder.finish().unwrap();
         let audio_path = audio_file_path(&dir, &artifact.file_name).unwrap();
-        append(&dir, id, "只保留文字", 1, Some(artifact), None).unwrap();
-
-        apply_audio_retention(&dir, "never").unwrap();
+        append(
+            &dir,
+            HistoryAppend {
+                id,
+                text: "用户自行删除录音",
+                duration_ms: 1,
+                audio: Some(artifact),
+                recognition: None,
+                recording_error: None,
+                recognition_error: None,
+            },
+        )
+        .unwrap();
+        fs::remove_file(audio_path).unwrap();
 
         let records = load(&dir).records;
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].text, "只保留文字");
-        assert!(records[0].audio.is_none());
-        assert!(!audio_path.exists());
+        assert!(records[0].audio_missing);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn clearing_history_removes_all_audio() {
+    fn clearing_history_keeps_all_audio() {
         let dir = temp_dir();
         let id = uuid::Uuid::new_v4().to_string();
         let mut recorder = AudioRecorder::create(&dir, &id).unwrap();
         recorder.write_pcm(&[0, 0, 1, 0]).unwrap();
         let artifact = recorder.finish().unwrap();
-        append(&dir, id, "清空", 1, Some(artifact), None).unwrap();
+        let audio_path = audio_file_path(&dir, &artifact.file_name).unwrap();
+        append(
+            &dir,
+            HistoryAppend {
+                id,
+                text: "清空",
+                duration_ms: 1,
+                audio: Some(artifact),
+                recognition: None,
+                recording_error: None,
+                recognition_error: None,
+            },
+        )
+        .unwrap();
 
         clear(&dir).unwrap();
 
         assert!(load(&dir).records.is_empty());
-        assert!(!audio_dir(&dir).exists());
+        assert!(audio_path.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn retention_removes_orphaned_audio_files() {
+    fn recovers_pcm_from_an_interrupted_partial_wav() {
         let dir = temp_dir();
-        fs::create_dir_all(audio_dir(&dir)).unwrap();
-        let orphan = audio_dir(&dir).join("orphan.wav");
-        fs::write(&orphan, b"private audio").unwrap();
+        let directory = ensure_audio_dir(&dir).unwrap();
+        let partial = directory.join(".2026-08-10_12-00-00_deadbeef.wav.part");
+        let pcm = [0_u8, 0, 1, 0];
+        let mut bytes = vec![0_u8; WAV_HEADER_BYTES as usize];
+        bytes.extend_from_slice(&pcm);
+        fs::write(&partial, bytes).unwrap();
 
-        apply_audio_retention(&dir, "thirtyDays").unwrap();
+        assert_eq!(recover_partial_audio_files(&dir).unwrap(), 1);
 
-        assert!(!orphan.exists());
+        let recovered = directory.join("2026-08-10_12-00-00_deadbeef.wav");
+        let wav = fs::read(recovered).unwrap();
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[44..], pcm.as_slice());
         let _ = fs::remove_dir_all(&dir);
     }
 }

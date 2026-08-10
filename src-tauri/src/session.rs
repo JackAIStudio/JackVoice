@@ -2,20 +2,28 @@ use crate::asr::{RealtimeSession, TranscriptUpdate, VolcAsrConfig, ASR_ENGINE_NA
 use crate::audio::{self, AudioCapture, InputDeviceInfo};
 use crate::credentials::{CredentialMode, CredentialSource};
 use crate::delivery::{self, DeliveryResult};
-use crate::history::{AudioRecorder, RecognitionContext};
+use crate::history::{AudioRecorder, HistoryAppend, RecognitionContext};
 use crate::output_mute::OutputMuteGuard;
 use crate::settings::{self, AppSettings};
 use parking_lot::Mutex;
 use serde::Serialize;
+use std::collections::VecDeque;
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Upper bound for the user-facing digital input gain (dB).
 pub const MAX_INPUT_GAIN_DB: f32 = 24.0;
+const LOCAL_AUDIO_QUEUE_CAPACITY: usize = 4_096;
+const ASR_AUDIO_QUEUE_CAPACITY: usize = 8_192;
+const MAX_CONNECT_BACKLOG_BYTES: usize = 2 * 1024 * 1024;
+const ASR_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +40,9 @@ pub struct SaveHotwordsResult {
 #[serde(rename_all = "camelCase")]
 pub struct UiState {
     pub phase: String,
+    /// idle / connecting / streaming / unavailable / error / finalizing。
+    /// 录音生命周期由 `phase` 表达，识别状态绝不能反向控制本地录音。
+    pub recognition_phase: String,
     pub status: String,
     pub transcript: String,
     pub has_volc_api_key: bool,
@@ -63,7 +74,6 @@ pub struct UiState {
     pub system_audio_mute_supported: bool,
     /// Whether the first-run onboarding walkthrough has been completed.
     pub onboarding_completed: bool,
-    pub audio_retention: String,
     pub history_text_size: String,
 }
 
@@ -71,6 +81,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             phase: "idle".into(),
+            recognition_phase: "idle".into(),
             status: "准备就绪。按 Option+Space 开始听写。".into(),
             transcript: String::new(),
             has_volc_api_key: false,
@@ -96,20 +107,43 @@ impl Default for UiState {
             mute_system_audio_during_dictation: false,
             system_audio_mute_supported: crate::output_mute::supported(),
             onboarding_completed: false,
-            audio_retention: "thirtyDays".into(),
             history_text_size: "standard".into(),
         }
     }
 }
 
 struct ActiveSession {
-    stop_tx: Option<mpsc::Sender<()>>,
+    id: u64,
+    stop_tx: Option<mpsc::Sender<SessionControl>>,
     /// Stop the dedicated audio owner thread (Send).
     audio_stop_tx: Option<std::sync::mpsc::Sender<()>>,
     /// Owns only the mute state applied by this dictation session.
     output_mute: Option<OutputMuteGuard>,
     started_at: Option<Instant>,
+    stopping: bool,
 }
+
+struct RecordingSession {
+    session_id: u64,
+    record_id: String,
+    recorder: AudioRecorder,
+    audio_rx: mpsc::Receiver<Vec<u8>>,
+    control_rx: mpsc::Receiver<SessionControl>,
+    audio_stop_tx: std::sync::mpsc::Sender<()>,
+    settings: AppSettings,
+}
+
+enum SessionControl {
+    Stop,
+    RecordingFailed(String),
+}
+
+enum AsrCommand {
+    Audio(Vec<u8>),
+    Finish(oneshot::Sender<Result<String, String>>),
+}
+
+type ConnectFuture = Pin<Box<dyn Future<Output = Result<RealtimeSession, String>> + Send>>;
 
 struct MonitorSession {
     stop_tx: Option<std::sync::mpsc::Sender<()>>,
@@ -181,7 +215,13 @@ impl AppState {
         if legacy_migration_complete {
             settings::remove_legacy_settings_backup(&shared_data_dir)?;
         }
-        crate::history::apply_audio_retention(&shared_data_dir, &settings.audio_retention)?;
+        match crate::history::recover_partial_audio_files(&shared_data_dir) {
+            Ok(count) if count > 0 => {
+                eprintln!("[history] 已恢复 {count} 个异常退出遗留的本地录音")
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("[history] 恢复未完成录音失败：{error}"),
+        }
         match crate::output_mute::restore_stale(&shared_data_dir) {
             Ok(true) => eprintln!("[output-mute] 已恢复上次异常退出遗留的系统音频状态"),
             Ok(false) => {}
@@ -763,29 +803,6 @@ impl AppState {
         Ok(ui.clone())
     }
 
-    pub fn set_audio_retention(&self, retention: String) -> Result<UiState, String> {
-        if self.active.lock().is_some() {
-            return Err("正在听写中，请结束后再修改录音保留策略。".into());
-        }
-        let mut settings = self.settings.lock();
-        let previous = settings.audio_retention.clone();
-        settings.audio_retention = settings::normalize_audio_retention(retention.trim());
-        self.save_settings(&settings)?;
-        if let Err(error) =
-            crate::history::apply_audio_retention(&self.shared_data_dir, &settings.audio_retention)
-        {
-            settings.audio_retention = previous;
-            if let Err(rollback_error) = self.save_settings(&settings) {
-                return Err(format!("{error}；恢复原录音策略时也失败：{rollback_error}"));
-            }
-            return Err(error);
-        }
-        let mut ui = self.ui.lock();
-        apply_settings_to_ui(&mut ui, &settings);
-        ui.status = "录音保留策略已更新。".into();
-        Ok(ui.clone())
-    }
-
     pub fn set_history_text_size(&self, size: String) -> Result<UiState, String> {
         let mut settings = self.settings.lock();
         settings.history_text_size = settings::normalize_history_text_size(size.trim());
@@ -876,6 +893,7 @@ impl AppState {
         {
             let mut ui = self.ui.lock();
             ui.phase = "idle".into();
+            ui.recognition_phase = "idle".into();
             ui.status = if had_active {
                 "已取消本次听写。".into()
             } else {
@@ -890,7 +908,6 @@ impl AppState {
 
         crate::overlay::hide_overlay(&app);
         crate::overlay::ensure_main_stays_in_background(&app);
-        *self.active.lock() = None;
         Ok(self.snapshot())
     }
 
@@ -904,52 +921,74 @@ impl AppState {
     }
 
     async fn start(&self, app: AppHandle) -> Result<UiState, String> {
-        if self.active.lock().is_some() {
-            return Ok(self.snapshot());
+        // Claim the session before any disk, microphone or UI work. A second
+        // shortcut press from this point onward can only stop this exact session.
+        let session_id = self.session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let (stop_tx, stop_rx) = mpsc::channel::<SessionControl>(4);
+        let (audio_stop_tx, audio_stop_rx) = std::sync::mpsc::channel::<()>();
+        {
+            let mut active = self.active.lock();
+            if active.is_some() {
+                return Ok(self.snapshot());
+            }
+            *active = Some(ActiveSession {
+                id: session_id,
+                stop_tx: Some(stop_tx.clone()),
+                audio_stop_tx: Some(audio_stop_tx.clone()),
+                output_mute: None,
+                started_at: None,
+                stopping: false,
+            });
         }
 
-        // A new session attempt begins; any pending error-capsule auto-hide
-        // from a previous attempt must not touch this one.
-        let epoch = self.session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-
-        // Dictation takes over the mic; stop temporary test capture first.
         self.stop_mic_test_internal();
         *self.cancel_requested.lock() = false;
-
         let settings = self.settings.lock().clone();
-        if settings.volc_api_key.trim().is_empty() {
-            let mut ui = self.ui.lock();
-            ui.phase = "error".into();
-            ui.status = if ui.volc_credential_warning.is_empty() {
-                "尚未连接豆包语音，请打开 JackVoice 设置 → 识别。".into()
-            } else {
-                ui.volc_credential_warning.clone()
-            };
-            ui.audio_level = 0.0;
-            let message = ui.status.clone();
-            let _ = app.emit("jackvoice://state", ui.clone());
-            drop(ui);
-            crate::overlay::show_overlay(&app);
-            schedule_error_overlay_hide(&app, epoch);
-            return Err(message);
-        }
 
         {
             let mut ui = self.ui.lock();
-            ui.phase = "connecting".into();
-            ui.status = format!("正在连接{ASR_ENGINE_NAME}…");
+            ui.phase = "starting".into();
+            ui.recognition_phase = if settings.volc_api_key.trim().is_empty() {
+                "unavailable".into()
+            } else {
+                "connecting".into()
+            };
+            ui.status = "正在启动本地录音…".into();
             ui.transcript.clear();
             ui.last_delivery_message.clear();
             ui.audio_level = 0.0;
             ui.needs_copy_prompt = false;
             let _ = app.emit("jackvoice://state", ui.clone());
-            crate::overlay::show_overlay(&app);
         }
 
-        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
-        let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(32);
-        let (audio_stop_tx, audio_stop_rx) = std::sync::mpsc::channel::<()>();
-        let (audio_ready_tx, audio_ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        // The recorder exists before CoreAudio starts. Once the first PCM frame
+        // arrives there is already a durable local destination for it.
+        let record_id = uuid::Uuid::new_v4().to_string();
+        let recorder = match AudioRecorder::create(&self.shared_data_dir, &record_id) {
+            Ok(recorder) => recorder,
+            Err(error) => {
+                if self
+                    .active
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|active| active.id == session_id)
+                {
+                    self.active.lock().take();
+                }
+                let mut ui = self.ui.lock();
+                ui.phase = "error".into();
+                ui.recognition_phase = "idle".into();
+                ui.status = error.clone();
+                let _ = app.emit("jackvoice://state", ui.clone());
+                drop(ui);
+                crate::overlay::show_overlay(&app);
+                schedule_error_overlay_hide(&app, session_id);
+                return Err(error);
+            }
+        };
+
+        let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(LOCAL_AUDIO_QUEUE_CAPACITY);
+        let (audio_ready_tx, audio_ready_rx) = oneshot::channel::<Result<(), String>>();
         let selected_device = settings.selected_input_device_id.clone();
         let dictation_gain_db = settings.input_gain_db;
 
@@ -957,6 +996,14 @@ impl AppState {
         let app_for_notice = app.clone();
         let on_notice = move |notice: audio::AudioNotice| {
             if let Some(state) = app_for_notice.try_state::<AppState>() {
+                let is_current = state
+                    .active
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|active| active.id == session_id && !active.stopping);
+                if !is_current {
+                    return;
+                }
                 let message = mic_notice_message(&notice);
                 let mut ui = state.ui.lock();
                 ui.mic_notice = message;
@@ -965,8 +1012,12 @@ impl AppState {
             }
         };
 
+        let overflow_reported = Arc::new(AtomicBool::new(false));
+        let overflow_for_pcm = overflow_reported.clone();
+        let control_for_pcm = stop_tx.clone();
+
         // Own AudioCapture fully on a dedicated thread so AppState remains Send+Sync.
-        thread::Builder::new()
+        let spawn_result = thread::Builder::new()
             .name("jackvoice-audio-owner".into())
             .spawn(move || {
                 let capture = match AudioCapture::start_with_device(
@@ -977,7 +1028,15 @@ impl AppState {
                     },
                     dictation_gain_db,
                     move |pcm| {
-                        let _ = audio_tx.try_send(pcm);
+                        if let Err(error) = audio_tx.try_send(pcm) {
+                            if matches!(error, mpsc::error::TrySendError::Full(_))
+                                && !overflow_for_pcm.swap(true, Ordering::AcqRel)
+                            {
+                                let _ = control_for_pcm.try_send(SessionControl::RecordingFailed(
+                                    "本地录音缓冲区已满，录音可能不完整，已停止本次听写。".into(),
+                                ));
+                            }
+                        }
                     },
                     on_notice,
                 ) {
@@ -993,35 +1052,77 @@ impl AppState {
 
                 let _ = audio_stop_rx.recv();
                 capture.stop();
-            })
-            .map_err(|e| format!("无法启动录音线程：{e}"))?;
+            });
 
-        match audio_ready_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                let mut ui = self.ui.lock();
-                ui.phase = "error".into();
-                ui.status = err.clone();
-                ui.audio_level = 0.0;
-                let _ = app.emit("jackvoice://state", ui.clone());
-                // Keep the capsule up for a few seconds so the user can read
-                // why dictation did not start, instead of a silent flash.
-                schedule_error_overlay_hide(&app, epoch);
-                return Err(err);
+        let ready = match spawn_result {
+            Ok(_) => audio_ready_rx
+                .await
+                .unwrap_or_else(|_| Err("录音线程启动失败。".into())),
+            Err(error) => Err(format!("无法启动录音线程：{error}")),
+        };
+        if let Err(error) = ready {
+            if self
+                .active
+                .lock()
+                .as_ref()
+                .is_some_and(|active| active.id == session_id)
+            {
+                self.active.lock().take();
             }
-            Err(_) => {
-                let err = "录音线程启动失败。".to_string();
-                let mut ui = self.ui.lock();
-                ui.phase = "error".into();
-                ui.status = err.clone();
-                ui.audio_level = 0.0;
-                let _ = app.emit("jackvoice://state", ui.clone());
-                schedule_error_overlay_hide(&app, epoch);
-                return Err(err);
-            }
+            let mut ui = self.ui.lock();
+            ui.phase = "error".into();
+            ui.recognition_phase = "idle".into();
+            ui.status = error.clone();
+            ui.audio_level = 0.0;
+            let _ = app.emit("jackvoice://state", ui.clone());
+            drop(ui);
+            crate::overlay::show_overlay(&app);
+            schedule_error_overlay_hide(&app, session_id);
+            return Err(error);
         }
 
-        let output_mute = if settings.mute_system_audio_during_dictation {
+        let stopping = {
+            let mut active = self.active.lock();
+            match active.as_mut().filter(|active| active.id == session_id) {
+                Some(active) => {
+                    active.started_at = Some(Instant::now());
+                    active.stopping
+                }
+                None => true,
+            }
+        };
+
+        if !stopping {
+            let mut ui = self.ui.lock();
+            ui.phase = "recording".into();
+            ui.recognition_phase = if settings.volc_api_key.trim().is_empty() {
+                "unavailable".into()
+            } else {
+                "connecting".into()
+            };
+            ui.status = if ui.recognition_phase == "connecting" {
+                format!("正在录音 · 正在连接{ASR_ENGINE_NAME}…")
+            } else {
+                "正在本地录音 · 尚未配置实时识别".into()
+            };
+            let _ = app.emit("jackvoice://state", ui.clone());
+        }
+
+        let app_for_task = app.clone();
+        tokio::spawn(run_recording_session(
+            app_for_task,
+            RecordingSession {
+                session_id,
+                record_id,
+                recorder,
+                audio_rx,
+                control_rx: stop_rx,
+                audio_stop_tx: audio_stop_tx.clone(),
+                settings: settings.clone(),
+            },
+        ));
+
+        let output_mute = if settings.mute_system_audio_during_dictation && !stopping {
             match OutputMuteGuard::engage(&self.shared_data_dir) {
                 Ok(guard) => Some(guard),
                 Err(error) => {
@@ -1037,325 +1138,37 @@ impl AppState {
             None
         };
 
-        {
+        if let Some(guard) = output_mute {
             let mut active = self.active.lock();
-            *active = Some(ActiveSession {
-                stop_tx: Some(stop_tx),
-                audio_stop_tx: Some(audio_stop_tx),
-                output_mute,
-                started_at: Some(Instant::now()),
-            });
+            if let Some(active) = active.as_mut().filter(|active| active.id == session_id) {
+                active.output_mute = Some(guard);
+            } else {
+                drop(active);
+                restore_output_mute(Some(guard));
+            }
         }
 
-        let app_for_task = app.clone();
-        let punctuation = settings.semantic_punctuation_enabled;
-        let smoothing = settings.semantic_smoothing_enabled;
-        let silence = settings.max_sentence_silence_ms;
-        let volc_config = VolcAsrConfig {
-            api_key: settings.volc_api_key.clone(),
-            resource_id: settings.volc_resource_id.clone(),
-            boosting_table_id: settings.volc_boosting_table_id.clone(),
-        };
-        // 热词随每次会话下发：平台热词表优先，否则请求级直传。
-        let dictionary = crate::hotwords::load(&self.shared_data_dir);
-        let hotwords = crate::hotwords::recognition_words(&dictionary);
-        let replacement_rules = crate::hotwords::user_replacement_rules(&self.shared_data_dir);
-        let record_id = uuid::Uuid::new_v4().to_string();
-        let recording_dir = self.shared_data_dir.clone();
-        let save_audio = crate::history::should_save_audio(&settings.audio_retention);
-        let recognition_context = RecognitionContext {
-            hotwords: hotwords.clone(),
-            semantic_punctuation_enabled: punctuation,
-            semantic_smoothing_enabled: smoothing,
-            max_sentence_silence_ms: silence,
-            input_gain_db: settings.input_gain_db,
-            input_device_id: settings.selected_input_device_id.clone(),
-        };
-
-        tokio::spawn(async move {
-            let session_result =
-                RealtimeSession::connect(volc_config, punctuation, smoothing, silence, hotwords, {
-                    let app = app_for_task.clone();
-                    let replacement_rules_for_updates = replacement_rules.clone();
-                    move |update: TranscriptUpdate| {
-                        if let Some(state) = app.try_state::<AppState>() {
-                            let mut ui = state.ui.lock();
-                            ui.phase = "recording".into();
-                            ui.transcript = crate::hotwords::apply_replacements(
-                                &update.text,
-                                &replacement_rules_for_updates,
-                            );
-                            ui.status = if update.is_final_sentence {
-                                "正在听写 · 已生成句子".into()
-                            } else {
-                                "正在听写 · 实时转写中".into()
-                            };
-                            let _ = app.emit("jackvoice://state", ui.clone());
-                        }
-                    }
-                })
-                .await;
-
-            let session = match session_result {
-                Ok(session) => session,
-                Err(err) => {
-                    if let Some(state) = app_for_task.try_state::<AppState>() {
-                        if let Some(active) = state.active.lock().take() {
-                            if let Some(tx) = active.audio_stop_tx {
-                                let _ = tx.send(());
-                            }
-                        }
-                        let mut ui = state.ui.lock();
-                        ui.phase = "error".into();
-                        ui.status = err.to_string();
-                        ui.audio_level = 0.0;
-                        let _ = app_for_task.emit("jackvoice://state", ui.clone());
-                        // Linger so the error can be read; focus still goes back.
-                        schedule_error_overlay_hide(&app_for_task, epoch);
-                        crate::overlay::ensure_main_stays_in_background(&app_for_task);
-                    }
-                    return;
-                }
-            };
-
-            if let Some(state) = app_for_task.try_state::<AppState>() {
-                let mut ui = state.ui.lock();
-                ui.phase = "recording".into();
-                ui.status = "正在听写。可自由切换应用，预览窗会持续更新。".into();
-                let _ = app_for_task.emit("jackvoice://state", ui.clone());
-            }
-
-            // 保存的是经过重采样和增益处理、实际送入 ASR 的 16 kHz 单声道
-            // PCM16。流式落盘避免长听写把整段音频留在内存里。
-            let mut audio_recorder = if save_audio {
-                match AudioRecorder::create(&recording_dir, &record_id) {
-                    Ok(recorder) => Some(recorder),
-                    Err(err) => {
-                        eprintln!("[history] 无法开始保存本次录音：{err}");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            let mut last_level_emit = Instant::now() - Duration::from_millis(100);
-            loop {
-                tokio::select! {
-                    _ = stop_rx.recv() => {
-                        break;
-                    }
-                    maybe_audio = audio_rx.recv() => {
-                        match maybe_audio {
-                            Some(pcm) => {
-                                let level = audio::pcm16_level(&pcm);
-                                if let Some(state) = app_for_task.try_state::<AppState>() {
-                                    let mut ui = state.ui.lock();
-                                    ui.audio_level = level;
-                                    // Throttle waveform updates so UI stays smooth.
-                                    if last_level_emit.elapsed() >= Duration::from_millis(50) {
-                                        last_level_emit = Instant::now();
-                                        let _ = app_for_task.emit("jackvoice://level", level);
-                                        let _ = app_for_task.emit("jackvoice://state", ui.clone());
-                                    }
-                                }
-
-                                if let Some(recorder) = audio_recorder.as_mut() {
-                                    if let Err(err) = recorder.write_pcm(&pcm) {
-                                        eprintln!("[history] 保存录音中断：{err}");
-                                        // Drop 会删除未完成的 .part 文件；文本识别继续。
-                                        audio_recorder = None;
-                                    }
-                                }
-
-                                if let Err(err) = session.send_audio(pcm).await {
-                                    if let Some(state) = app_for_task.try_state::<AppState>() {
-                                        if let Some(active) = state.active.lock().take() {
-                                            if let Some(tx) = active.audio_stop_tx {
-                                                let _ = tx.send(());
-                                            }
-                                        }
-                                        let mut ui = state.ui.lock();
-                                        ui.phase = "error".into();
-                                        ui.status = err.to_string();
-                                        ui.audio_level = 0.0;
-                                        let _ = app_for_task.emit("jackvoice://state", ui.clone());
-                                        schedule_error_overlay_hide(&app_for_task, epoch);
-                        crate::overlay::ensure_main_stays_in_background(&app_for_task);
-                                    }
-                                    return;
-                                }
-                            }
-                            None => {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Stop microphone before finalization.
-            if let Some(state) = app_for_task.try_state::<AppState>() {
-                let (audio_stop_tx, output_mute) = {
-                    let mut active = state.active.lock();
-                    match active.as_mut() {
-                        Some(active) => (active.audio_stop_tx.take(), active.output_mute.take()),
-                        None => (None, None),
-                    }
-                };
-                if let Some(tx) = audio_stop_tx {
-                    let _ = tx.send(());
-                }
-                restore_output_mute(output_mute);
-                let mut ui = state.ui.lock();
-                ui.audio_level = 0.0;
-                ui.phase = "finalizing".into();
-                ui.status = "正在等待最终结果…".into();
-                let _ = app_for_task.emit("jackvoice://level", 0.0_f32);
-                let _ = app_for_task.emit("jackvoice://state", ui.clone());
-            }
-
-            let is_cancel = app_for_task
-                .try_state::<AppState>()
-                .map(|s| *s.cancel_requested.lock())
-                .unwrap_or(false);
-
-            if is_cancel {
-                // Silent cancel: discard audio/result, no copy, no paste.
-                session.cancel().await;
-                if let Some(state) = app_for_task.try_state::<AppState>() {
-                    let mut ui = state.ui.lock();
-                    ui.phase = "idle".into();
-                    ui.status = "已取消本次听写。".into();
-                    ui.audio_level = 0.0;
-                    let _ = app_for_task.emit("jackvoice://state", ui.clone());
-                    *state.active.lock() = None;
-                    crate::overlay::hide_overlay(&app_for_task);
-                    crate::overlay::ensure_main_stays_in_background(&app_for_task);
-                }
-                return;
-            }
-
-            match session.finish().await {
-                Ok(final_text) => {
-                    let final_text =
-                        crate::hotwords::apply_replacements(&final_text, &replacement_rules);
-                    let saved_audio = if final_text.trim().is_empty() {
-                        None
-                    } else {
-                        audio_recorder
-                            .take()
-                            .and_then(|recorder| match recorder.finish() {
-                                Ok(audio) => Some(audio),
-                                Err(err) => {
-                                    eprintln!("[history] 无法完成本次录音：{err}");
-                                    None
-                                }
-                            })
-                    };
-                    if let Some(state) = app_for_task.try_state::<AppState>() {
-                        let elapsed_ms = state
-                            .active
-                            .lock()
-                            .as_ref()
-                            .and_then(|a| a.started_at)
-                            .map(|t| t.elapsed().as_millis() as u64)
-                            .unwrap_or(0);
-                        // 有音频时以采样数计算的时长为准；它比包含联网和收尾等待的
-                        // 墙钟耗时更适合作为口述统计与后续识别效率基准。
-                        let duration_ms = saved_audio
-                            .as_ref()
-                            .map(|audio| audio.duration_ms)
-                            .unwrap_or(elapsed_ms);
-                        if !final_text.trim().is_empty() {
-                            if let Err(err) = crate::history::append(
-                                &state.shared_data_dir,
-                                record_id,
-                                &final_text,
-                                duration_ms,
-                                saved_audio,
-                                Some(recognition_context),
-                            ) {
-                                eprintln!("[history] 保存听写记录失败：{err}");
-                            }
-                            let _ = app_for_task.emit("jackvoice://history", true);
-                        }
-                        // Before disturbing focus in any way, check whether the app
-                        // that will receive the paste actually has a focused text
-                        // insertion point. If not, we skip auto-paste entirely so
-                        // text never lands in some unintended input box.
-                        let probe = if final_text.trim().is_empty() {
-                            delivery::InsertionProbe::Unknown
-                        } else {
-                            // Refresh once more: finalization takes a moment
-                            // and the user may have moved to another app.
-                            crate::overlay::remember_frontmost_app();
-                            let target = crate::overlay::remembered_frontmost_app();
-                            delivery::probe_insertion_target(target.as_deref())
-                        };
-
-                        // Hide capsule and hand focus back to the user's app FIRST,
-                        // so the auto-paste lands in the right place.
-                        crate::overlay::hide_overlay(&app_for_task);
-                        crate::overlay::ensure_main_stays_in_background(&app_for_task);
-                        tokio::time::sleep(Duration::from_millis(350)).await;
-
-                        // deliver_text copies first, then best-effort pastes.
-                        let delivery = delivery::deliver_text(&app_for_task, &final_text, probe);
-                        // When insertion was not detected, bring the capsule back with a
-                        // manual "copy" affordance so nothing is silently lost.
-                        let needs_copy_prompt = !delivery.pasted && !final_text.trim().is_empty();
-                        let mut ui = state.ui.lock();
-                        ui.phase = "idle".into();
-                        ui.transcript = final_text;
-                        ui.status = "听写结束。".into();
-                        ui.audio_level = 0.0;
-                        ui.last_delivery_message = delivery.message.clone();
-                        ui.needs_copy_prompt = needs_copy_prompt;
-                        let _ = app_for_task.emit("jackvoice://state", ui.clone());
-                        let _ = app_for_task.emit("jackvoice://delivery", delivery);
-                        drop(ui);
-                        if needs_copy_prompt {
-                            crate::overlay::show_overlay(&app_for_task);
-                        }
-                        *state.active.lock() = None;
-                    }
-                }
-                Err(err) => {
-                    let raw = err.to_string();
-                    eprintln!("[asr-connect] {raw}");
-                    let message = format_volc_connection_error(&raw);
-                    if let Some(state) = app_for_task.try_state::<AppState>() {
-                        let mut ui = state.ui.lock();
-                        ui.phase = "error".into();
-                        ui.status = message;
-                        ui.audio_level = 0.0;
-                        let _ = app_for_task.emit("jackvoice://state", ui.clone());
-                        *state.active.lock() = None;
-                        schedule_error_overlay_hide(&app_for_task, epoch);
-                        crate::overlay::ensure_main_stays_in_background(&app_for_task);
-                    }
-                }
-            }
-        });
+        if !stopping {
+            // Any relatively slow positioning/frontmost-app work happens only
+            // after the microphone and recorder are already live.
+            crate::overlay::show_overlay(&app);
+        }
 
         Ok(self.snapshot())
     }
 
     async fn stop(&self, app: AppHandle) -> Result<UiState, String> {
-        // The user may have switched apps during dictation; re-capture the
-        // app that is frontmost right now so the final paste targets the
-        // window they are actually typing in.
-        crate::overlay::remember_frontmost_app();
-
         let (stop_tx, audio_stop_tx, output_mute) = {
             let mut active = self.active.lock();
             match active.as_mut() {
-                Some(session) => (
-                    session.stop_tx.take(),
-                    session.audio_stop_tx.take(),
-                    session.output_mute.take(),
-                ),
+                Some(session) => {
+                    session.stopping = true;
+                    (
+                        session.stop_tx.take(),
+                        session.audio_stop_tx.take(),
+                        session.output_mute.take(),
+                    )
+                }
                 None => (None, None, None),
             }
         };
@@ -1368,6 +1181,7 @@ impl AppState {
         {
             let mut ui = self.ui.lock();
             ui.phase = "finalizing".into();
+            ui.recognition_phase = "finalizing".into();
             ui.status = "正在结束听写并收尾…".into();
             ui.audio_level = 0.0;
             let _ = app.emit("jackvoice://level", 0.0_f32);
@@ -1375,10 +1189,491 @@ impl AppState {
         }
 
         if let Some(tx) = stop_tx {
-            let _ = tx.send(()).await;
+            let _ = tx.send(SessionControl::Stop).await;
         }
 
         Ok(self.snapshot())
+    }
+}
+
+async fn run_asr_sender(
+    session: RealtimeSession,
+    mut commands: mpsc::Receiver<AsrCommand>,
+    error_tx: mpsc::UnboundedSender<String>,
+) {
+    while let Some(command) = commands.recv().await {
+        match command {
+            AsrCommand::Audio(pcm) => {
+                if let Err(error) = session.send_audio(pcm).await {
+                    let _ = error_tx.send(format_volc_connection_error(&error.to_string()));
+                    session.cancel().await;
+                    return;
+                }
+            }
+            AsrCommand::Finish(result_tx) => {
+                let result = session
+                    .finish()
+                    .await
+                    .map_err(|error| format_volc_connection_error(&error.to_string()));
+                let _ = result_tx.send(result);
+                return;
+            }
+        }
+    }
+    session.cancel().await;
+}
+
+fn persist_local_pcm(
+    app: &AppHandle,
+    session_id: u64,
+    recorder: &mut AudioRecorder,
+    pcm: &[u8],
+    last_level_emit: &mut Instant,
+) -> Result<(), String> {
+    // Local persistence always happens before the chunk is offered to ASR.
+    recorder.write_pcm(pcm)?;
+    let level = audio::pcm16_level(pcm);
+    if let Some(state) = app.try_state::<AppState>() {
+        let is_current = state
+            .active
+            .lock()
+            .as_ref()
+            .is_some_and(|active| active.id == session_id);
+        if is_current {
+            let mut ui = state.ui.lock();
+            ui.audio_level = level;
+            if last_level_emit.elapsed() >= Duration::from_millis(50) {
+                *last_level_emit = Instant::now();
+                let _ = app.emit("jackvoice://level", level);
+                let _ = app.emit("jackvoice://state", ui.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mark_recognition_unavailable(app: &AppHandle, session_id: u64, message: &str) {
+    if let Some(state) = app.try_state::<AppState>() {
+        let is_current = state
+            .active
+            .lock()
+            .as_ref()
+            .is_some_and(|active| active.id == session_id && !active.stopping);
+        if !is_current {
+            return;
+        }
+        let mut ui = state.ui.lock();
+        ui.recognition_phase = "error".into();
+        ui.status = format!("正在本地录音 · 实时识别不可用：{message}");
+        let _ = app.emit("jackvoice://state", ui.clone());
+    }
+}
+
+async fn run_recording_session(app: AppHandle, session: RecordingSession) {
+    let RecordingSession {
+        session_id,
+        record_id,
+        mut recorder,
+        mut audio_rx,
+        mut control_rx,
+        audio_stop_tx,
+        settings,
+    } = session;
+    let punctuation = settings.semantic_punctuation_enabled;
+    let smoothing = settings.semantic_smoothing_enabled;
+    let silence = settings.max_sentence_silence_ms;
+    let dictionary = app
+        .try_state::<AppState>()
+        .map(|state| crate::hotwords::load(&state.shared_data_dir))
+        .unwrap_or_default();
+    let hotwords = crate::hotwords::recognition_words(&dictionary);
+    let replacement_rules = app
+        .try_state::<AppState>()
+        .map(|state| crate::hotwords::user_replacement_rules(&state.shared_data_dir))
+        .unwrap_or_default();
+    let recognition_context = RecognitionContext {
+        hotwords: hotwords.clone(),
+        semantic_punctuation_enabled: punctuation,
+        semantic_smoothing_enabled: smoothing,
+        max_sentence_silence_ms: silence,
+        input_gain_db: settings.input_gain_db,
+        input_device_id: settings.selected_input_device_id.clone(),
+    };
+
+    let mut recognition_error = if settings.volc_api_key.trim().is_empty() {
+        Some("尚未配置豆包语音 App Key".to_string())
+    } else {
+        None
+    };
+    let mut connect_future: Option<ConnectFuture> = if recognition_error.is_none() {
+        let config = VolcAsrConfig {
+            api_key: settings.volc_api_key.clone(),
+            resource_id: settings.volc_resource_id.clone(),
+            boosting_table_id: settings.volc_boosting_table_id.clone(),
+        };
+        let connect_hotwords = hotwords.clone();
+        let app_for_updates = app.clone();
+        let replacement_rules_for_updates = replacement_rules.clone();
+        Some(Box::pin(async move {
+            tokio::time::timeout(
+                ASR_CONNECT_TIMEOUT,
+                RealtimeSession::connect(
+                    config,
+                    punctuation,
+                    smoothing,
+                    silence,
+                    connect_hotwords,
+                    move |update: TranscriptUpdate| {
+                        if let Some(state) = app_for_updates.try_state::<AppState>() {
+                            let is_current =
+                                state.active.lock().as_ref().is_some_and(|active| {
+                                    active.id == session_id && !active.stopping
+                                });
+                            if !is_current {
+                                return;
+                            }
+                            let mut ui = state.ui.lock();
+                            if ui.recognition_phase != "streaming" {
+                                return;
+                            }
+                            ui.transcript = crate::hotwords::apply_replacements(
+                                &update.text,
+                                &replacement_rules_for_updates,
+                            );
+                            ui.status = if update.is_final_sentence {
+                                "正在录音 · 已生成句子".into()
+                            } else {
+                                "正在录音 · 实时转写中".into()
+                            };
+                            let _ = app_for_updates.emit("jackvoice://state", ui.clone());
+                        }
+                    },
+                ),
+            )
+            .await
+            .map_err(|_| "连接豆包语音超时".to_string())?
+            .map_err(|error| format_volc_connection_error(&error.to_string()))
+        }))
+    } else {
+        None
+    };
+
+    let mut connect_backlog = VecDeque::<Vec<u8>>::new();
+    let mut connect_backlog_bytes = 0usize;
+    let mut asr_tx: Option<mpsc::Sender<AsrCommand>> = None;
+    let (asr_error_tx, mut asr_error_rx) = mpsc::unbounded_channel::<String>();
+    let mut asr_error_tx = Some(asr_error_tx);
+    let mut local_error: Option<String> = None;
+    let mut last_level_emit = Instant::now() - Duration::from_millis(100);
+
+    loop {
+        tokio::select! {
+            control = control_rx.recv() => {
+                match control {
+                    Some(SessionControl::Stop) | None => {}
+                    Some(SessionControl::RecordingFailed(error)) => local_error = Some(error),
+                }
+                let _ = audio_stop_tx.send(());
+                if connect_future.is_some() && recognition_error.is_none() {
+                    recognition_error = Some("录音结束前实时识别尚未连接完成".into());
+                }
+                drop(connect_future.take());
+                break;
+            }
+            maybe_pcm = audio_rx.recv() => {
+                let Some(pcm) = maybe_pcm else {
+                    let expected_stop = app
+                        .try_state::<AppState>()
+                        .and_then(|state| {
+                            state
+                                .active
+                                .lock()
+                                .as_ref()
+                                .filter(|active| active.id == session_id)
+                                .map(|active| active.stopping)
+                        })
+                        .unwrap_or(false);
+                    if !expected_stop {
+                        local_error = Some("麦克风录音线程意外结束".into());
+                    }
+                    if connect_future.is_some() && recognition_error.is_none() {
+                        recognition_error = Some("录音结束前实时识别尚未连接完成".into());
+                    }
+                    drop(connect_future.take());
+                    break;
+                };
+                if let Err(error) = persist_local_pcm(
+                    &app,
+                    session_id,
+                    &mut recorder,
+                    &pcm,
+                    &mut last_level_emit,
+                ) {
+                    local_error = Some(error);
+                    let _ = audio_stop_tx.send(());
+                    drop(connect_future.take());
+                    break;
+                }
+
+                if let Some(tx) = asr_tx.as_ref() {
+                    if tx.try_send(AsrCommand::Audio(pcm)).is_err() {
+                        let error = "实时识别发送缓冲区已满".to_string();
+                        recognition_error = Some(error.clone());
+                        asr_tx = None;
+                        mark_recognition_unavailable(&app, session_id, &error);
+                    }
+                } else if connect_future.is_some() {
+                    connect_backlog_bytes = connect_backlog_bytes.saturating_add(pcm.len());
+                    if connect_backlog_bytes > MAX_CONNECT_BACKLOG_BYTES {
+                        let error = "实时识别连接过慢，已停止本次实时预览".to_string();
+                        recognition_error = Some(error.clone());
+                        connect_future = None;
+                        connect_backlog.clear();
+                        connect_backlog_bytes = 0;
+                        mark_recognition_unavailable(&app, session_id, &error);
+                    } else {
+                        connect_backlog.push_back(pcm);
+                    }
+                }
+            }
+            connect_result = async {
+                connect_future.as_mut().expect("guarded connect future").as_mut().await
+            }, if connect_future.is_some() => {
+                connect_future = None;
+                match connect_result {
+                    Ok(session) => {
+                        let (command_tx, command_rx) = mpsc::channel(ASR_AUDIO_QUEUE_CAPACITY);
+                        tokio::spawn(run_asr_sender(
+                            session,
+                            command_rx,
+                            asr_error_tx.take().expect("ASR error sender is available"),
+                        ));
+                        let mut backlog_failed = false;
+                        while let Some(pcm) = connect_backlog.pop_front() {
+                            if command_tx.try_send(AsrCommand::Audio(pcm)).is_err() {
+                                backlog_failed = true;
+                                break;
+                            }
+                        }
+                        connect_backlog_bytes = 0;
+                        if backlog_failed {
+                            let error = "实时识别无法追赶连接前的录音".to_string();
+                            recognition_error = Some(error.clone());
+                            mark_recognition_unavailable(&app, session_id, &error);
+                        } else {
+                            asr_tx = Some(command_tx);
+                            if let Some(state) = app.try_state::<AppState>() {
+                                let is_current = state
+                                    .active
+                                    .lock()
+                                    .as_ref()
+                                    .is_some_and(|active| active.id == session_id && !active.stopping);
+                                if is_current {
+                                    let mut ui = state.ui.lock();
+                                    ui.recognition_phase = "streaming".into();
+                                    ui.status = "正在录音 · 实时识别已连接".into();
+                                    let _ = app.emit("jackvoice://state", ui.clone());
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        recognition_error = Some(error.clone());
+                        connect_backlog.clear();
+                        connect_backlog_bytes = 0;
+                        mark_recognition_unavailable(&app, session_id, &error);
+                    }
+                }
+            }
+            maybe_error = asr_error_rx.recv(), if asr_tx.is_some() => {
+                if let Some(error) = maybe_error {
+                    recognition_error = Some(error.clone());
+                    asr_tx = None;
+                    mark_recognition_unavailable(&app, session_id, &error);
+                }
+            }
+        }
+    }
+
+    // Capture.stop() joins the CoreAudio thread. Drain everything it emitted
+    // before channel close so the tail of the recording is never truncated.
+    while let Some(pcm) = audio_rx.recv().await {
+        if let Err(error) =
+            persist_local_pcm(&app, session_id, &mut recorder, &pcm, &mut last_level_emit)
+        {
+            local_error.get_or_insert(error);
+            break;
+        }
+        if let Some(tx) = asr_tx.as_ref() {
+            if tx.try_send(AsrCommand::Audio(pcm)).is_err() {
+                let error = "实时识别发送缓冲区已满".to_string();
+                recognition_error = Some(error);
+                asr_tx = None;
+            }
+        }
+    }
+
+    let is_cancel = app
+        .try_state::<AppState>()
+        .map(|state| *state.cancel_requested.lock())
+        .unwrap_or(false);
+    if is_cancel {
+        drop(asr_tx.take());
+        recognition_error = Some("用户已取消文字识别".into());
+    }
+
+    if !is_cancel {
+        if let Some(state) = app.try_state::<AppState>() {
+            let mut ui = state.ui.lock();
+            ui.phase = "finalizing".into();
+            ui.recognition_phase = "finalizing".into();
+            ui.audio_level = 0.0;
+            ui.status = "本地录音已完成，正在整理文字…".into();
+            let _ = app.emit("jackvoice://level", 0.0_f32);
+            let _ = app.emit("jackvoice://state", ui.clone());
+        }
+    } else if let Some(state) = app.try_state::<AppState>() {
+        let mut ui = state.ui.lock();
+        ui.phase = "idle".into();
+        ui.recognition_phase = "idle".into();
+        ui.audio_level = 0.0;
+        ui.status = "正在保存已取消听写的本地录音…".into();
+        let _ = app.emit("jackvoice://level", 0.0_f32);
+        let _ = app.emit("jackvoice://state", ui.clone());
+    }
+
+    // Commit the local WAV before waiting for any network finalization.
+    let saved_audio = match recorder.finish() {
+        Ok(audio) => Some(audio),
+        Err(error) => {
+            local_error.get_or_insert(error);
+            None
+        }
+    };
+
+    let mut final_text = app
+        .try_state::<AppState>()
+        .map(|state| state.ui.lock().transcript.clone())
+        .unwrap_or_default();
+    if local_error.is_none() && !is_cancel {
+        if let Some(tx) = asr_tx.take() {
+            let (result_tx, result_rx) = oneshot::channel();
+            if tx.send(AsrCommand::Finish(result_tx)).await.is_ok() {
+                match result_rx.await {
+                    Ok(Ok(text)) => {
+                        final_text = crate::hotwords::apply_replacements(&text, &replacement_rules);
+                        recognition_error = None;
+                    }
+                    Ok(Err(error)) => recognition_error = Some(error),
+                    Err(_) => recognition_error = Some("实时识别收尾任务意外结束".into()),
+                }
+            } else {
+                recognition_error = Some("实时识别会话已经关闭".into());
+            }
+        }
+    } else {
+        drop(asr_tx);
+    }
+
+    if let Some(state) = app.try_state::<AppState>() {
+        let elapsed_ms = state
+            .active
+            .lock()
+            .as_ref()
+            .filter(|active| active.id == session_id)
+            .and_then(|active| active.started_at)
+            .map(|started| started.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        let duration_ms = saved_audio
+            .as_ref()
+            .map(|audio| audio.duration_ms)
+            .unwrap_or(elapsed_ms);
+        let history_result = crate::history::append(
+            &state.shared_data_dir,
+            HistoryAppend {
+                id: record_id,
+                text: &final_text,
+                duration_ms,
+                audio: saved_audio,
+                recognition: Some(recognition_context),
+                recording_error: local_error.clone(),
+                recognition_error: recognition_error.clone(),
+            },
+        );
+        if let Err(error) = history_result {
+            eprintln!("[history] 保存听写记录失败：{error}");
+            local_error.get_or_insert(format!("录音文件已保存，但写入历史记录失败：{error}"));
+        } else {
+            let _ = app.emit("jackvoice://history", true);
+        }
+
+        let mut delivery_result = None;
+        let mut needs_copy_prompt = false;
+        if !final_text.trim().is_empty() && local_error.is_none() && recognition_error.is_none() {
+            crate::overlay::remember_frontmost_app();
+            let target = crate::overlay::remembered_frontmost_app();
+            let probe = delivery::probe_insertion_target(target.as_deref());
+            crate::overlay::hide_overlay(&app);
+            crate::overlay::ensure_main_stays_in_background(&app);
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            let delivery = delivery::deliver_text(&app, &final_text, probe);
+            needs_copy_prompt = !delivery.pasted;
+            delivery_result = Some(delivery);
+        } else if local_error.is_none() {
+            crate::overlay::hide_overlay(&app);
+            crate::overlay::ensure_main_stays_in_background(&app);
+        }
+
+        let guard = {
+            let mut active = state.active.lock();
+            if active
+                .as_ref()
+                .is_some_and(|active| active.id == session_id)
+            {
+                active
+                    .take()
+                    .and_then(|mut active| active.output_mute.take())
+            } else {
+                None
+            }
+        };
+        restore_output_mute(guard);
+
+        let mut ui = state.ui.lock();
+        ui.audio_level = 0.0;
+        ui.transcript = final_text;
+        ui.needs_copy_prompt = needs_copy_prompt;
+        ui.recognition_phase = "idle".into();
+        if let Some(error) = local_error {
+            ui.phase = "error".into();
+            ui.status = error;
+        } else {
+            ui.phase = "idle".into();
+            ui.status = if is_cancel {
+                "已取消文字处理，本地录音已保存。".into()
+            } else if let Some(error) = recognition_error {
+                format!("本地录音已保存；实时识别未完成：{error}")
+            } else if ui.transcript.trim().is_empty() {
+                "本地录音已保存，本次未识别到文字。".into()
+            } else {
+                "听写结束，本地录音已保存。".into()
+            };
+        }
+        if let Some(delivery) = delivery_result.as_ref() {
+            ui.last_delivery_message = delivery.message.clone();
+        }
+        let phase_is_error = ui.phase == "error";
+        let _ = app.emit("jackvoice://state", ui.clone());
+        drop(ui);
+        if let Some(delivery) = delivery_result {
+            let _ = app.emit("jackvoice://delivery", delivery);
+        }
+        if phase_is_error {
+            crate::overlay::show_overlay(&app);
+            schedule_error_overlay_hide(&app, session_id);
+        } else if needs_copy_prompt {
+            crate::overlay::show_overlay(&app);
+        }
     }
 }
 
@@ -1397,7 +1692,6 @@ fn apply_settings_to_ui(ui: &mut UiState, settings: &AppSettings) {
     ui.mute_system_audio_during_dictation = settings.mute_system_audio_during_dictation;
     ui.system_audio_mute_supported = crate::output_mute::supported();
     ui.onboarding_completed = settings.onboarding_completed;
-    ui.audio_retention = settings.audio_retention.clone();
     ui.history_text_size = settings.history_text_size.clone();
 }
 

@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 type UiState = {
   phase: string;
+  recognitionPhase: string;
   status: string;
   transcript: string;
   needsCopyPrompt: boolean;
@@ -118,7 +119,7 @@ function renderPreview(state: UiState) {
     // The status line carries the real error message; keep the preview quiet.
     const text = textEl();
     if (text) {
-      text.textContent = "本次听写未开始";
+      text.textContent = "本地录音发生错误";
       text.classList.add("empty");
     }
     return;
@@ -216,7 +217,8 @@ function applyState(state: UiState) {
   // session winds down or a new one begins.
   if (
     activeNotice &&
-    (state.phase === "connecting" ||
+    (state.phase === "starting" ||
+      state.phase === "connecting" ||
       state.phase === "finalizing" ||
       state.phase === "idle" ||
       state.phase === "error")
@@ -238,7 +240,11 @@ function applyState(state: UiState) {
   const root = capsule();
   if (root) {
     root.classList.remove("recording", "finalizing", "error", "result");
-    if (state.phase === "recording" || state.phase === "connecting") {
+    if (
+      state.phase === "starting" ||
+      state.phase === "recording" ||
+      state.phase === "connecting"
+    ) {
       root.classList.add("recording");
     } else if (state.phase === "finalizing") {
       root.classList.add("finalizing");
@@ -249,8 +255,13 @@ function applyState(state: UiState) {
 
   const status = statusEl();
   if (status) {
-    if (state.phase === "connecting") status.textContent = "连接中";
-    else if (state.phase === "recording") status.textContent = "正在听写";
+    if (state.phase === "starting") status.textContent = "启动录音中";
+    else if (state.phase === "connecting") status.textContent = "连接中";
+    else if (state.phase === "recording") {
+      if (state.recognitionPhase === "connecting") status.textContent = "录音中 · 连接中";
+      else if (state.recognitionPhase === "streaming") status.textContent = "正在听写";
+      else status.textContent = "本地录音中";
+    }
     else if (state.phase === "finalizing") status.textContent = "收尾中";
     else if (state.phase === "error")
       status.textContent = state.status || "出错了";

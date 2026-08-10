@@ -116,3 +116,29 @@ pub fn request_accessibility_prompt() -> bool {
 pub fn microphone_permission() -> bool {
     true
 }
+
+pub fn validate_completion(
+    microphone_granted: bool,
+    privacy_confirmed: bool,
+) -> Result<(), String> {
+    if !microphone_granted {
+        return Err("请先授权并成功测试麦克风。麦克风是本地录音的必要权限。".into());
+    }
+    if !privacy_confirmed {
+        return Err("请先确认你已了解音频的云端处理和本地保存方式。".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_completion;
+
+    #[test]
+    fn completion_requires_microphone_and_privacy_confirmation() {
+        assert!(validate_completion(false, false).is_err());
+        assert!(validate_completion(false, true).is_err());
+        assert!(validate_completion(true, false).is_err());
+        assert!(validate_completion(true, true).is_ok());
+    }
+}
