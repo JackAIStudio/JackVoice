@@ -47,5 +47,6 @@ keyring = "4.1.6"
 core-foundation = "0.10"
 core-graphics = "0.25"
 objc2 = { version = "0.6", features = ["exception"] }
+objc2-core-audio = "0.3.2"
 objc2-foundation = "0.3"
 security-framework = "3.7"

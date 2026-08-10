@@ -22,7 +22,7 @@ cargo test --locked --manifest-path src-tauri/Cargo.toml
 ## 代码与产品约束
 
 - 默认使用简体中文编写界面文案和面向用户的错误提示。
-- 不在日志、测试夹具或截图中放入真实 APP Key、录音或转写内容。
+- 不在日志、测试夹具或截图中放入真实 App Key、录音或转写内容。
 - 新增网络请求、数据持久化、系统权限或第三方 SDK 时，必须同步更新 `PRIVACY.md`、首次启动披露和第三方许可说明。
 - 新的 Tauri 命令应遵循最小权限原则，不要恢复全局 `window.__TAURI__` 注入或宽泛 capability。
 - 视觉改动应基于 JackVoice 自己的任务模型与品牌语言，不复刻其他产品的页面结构、插画或文案。

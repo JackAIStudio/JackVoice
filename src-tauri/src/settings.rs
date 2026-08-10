@@ -12,7 +12,7 @@ const VARIANT_SETTINGS_FILE: &str = "variant-settings.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
-    /// 豆包流式录音识别所需的 API Key（控制台字段名为 APP Key，请求头为 X-Api-Key）。
+    /// 豆包流式录音识别所需的 App Key（请求头为 X-Api-Key）。
     #[serde(default)]
     pub volc_api_key: String,
     /// 豆包流式录音识别资源 ID，默认小时版 Seed-ASR 2.0。
@@ -22,6 +22,9 @@ pub struct AppSettings {
     #[serde(default)]
     pub volc_boosting_table_id: String,
     pub semantic_punctuation_enabled: bool,
+    /// 是否清理停顿词、语气词和重复表达；默认关闭以忠实保留原话。
+    #[serde(default)]
+    pub semantic_smoothing_enabled: bool,
     pub max_sentence_silence_ms: u32,
     #[serde(default)]
     pub selected_input_device_id: String,
@@ -29,6 +32,9 @@ pub struct AppSettings {
     pub shortcut: String,
     #[serde(default)]
     pub launch_at_login: bool,
+    /// 听写占用麦克风期间，临时静音系统输出；目前仅 macOS 支持。
+    #[serde(default)]
+    pub mute_system_audio_during_dictation: bool,
     #[serde(default)]
     pub input_gain_db: f32,
     #[serde(default)]
@@ -36,6 +42,9 @@ pub struct AppSettings {
     /// 本地 WAV 的保留策略：never / sevenDays / thirtyDays / forever。
     #[serde(default = "default_audio_retention")]
     pub audio_retention: String,
+    /// 首页听写文字大小：compact / standard / large。
+    #[serde(default = "default_history_text_size")]
+    pub history_text_size: String,
 }
 
 impl Default for AppSettings {
@@ -56,6 +65,8 @@ struct SharedSettings {
     volc_boosting_table_id: String,
     #[serde(default = "default_semantic_punctuation_enabled")]
     semantic_punctuation_enabled: bool,
+    #[serde(default)]
+    semantic_smoothing_enabled: bool,
     #[serde(default = "default_max_sentence_silence_ms")]
     max_sentence_silence_ms: u32,
     #[serde(default)]
@@ -66,6 +77,8 @@ struct SharedSettings {
     input_gain_db: f32,
     #[serde(default)]
     audio_retention: String,
+    #[serde(default = "default_history_text_size")]
+    history_text_size: String,
 }
 
 impl Default for SharedSettings {
@@ -75,11 +88,13 @@ impl Default for SharedSettings {
             volc_resource_id: default_volc_resource_id(),
             volc_boosting_table_id: String::new(),
             semantic_punctuation_enabled: default_semantic_punctuation_enabled(),
+            semantic_smoothing_enabled: false,
             max_sentence_silence_ms: default_max_sentence_silence_ms(),
             selected_input_device_id: String::new(),
             shortcut: default_shortcut(),
             input_gain_db: 0.0,
             audio_retention: String::new(),
+            history_text_size: default_history_text_size(),
         }
     }
 }
@@ -89,6 +104,8 @@ impl Default for SharedSettings {
 struct VariantSettings {
     #[serde(default)]
     launch_at_login: bool,
+    #[serde(default)]
+    mute_system_audio_during_dictation: bool,
     #[serde(default)]
     onboarding_completed: bool,
 }
@@ -122,13 +139,16 @@ impl AppSettings {
             volc_resource_id: shared.volc_resource_id,
             volc_boosting_table_id: shared.volc_boosting_table_id,
             semantic_punctuation_enabled: shared.semantic_punctuation_enabled,
+            semantic_smoothing_enabled: shared.semantic_smoothing_enabled,
             max_sentence_silence_ms: shared.max_sentence_silence_ms,
             selected_input_device_id: shared.selected_input_device_id,
             shortcut: shared.shortcut,
             launch_at_login: variant.launch_at_login,
+            mute_system_audio_during_dictation: variant.mute_system_audio_during_dictation,
             input_gain_db: shared.input_gain_db,
             onboarding_completed: variant.onboarding_completed,
             audio_retention,
+            history_text_size: normalize_history_text_size(&shared.history_text_size),
         }
     }
 
@@ -138,17 +158,20 @@ impl AppSettings {
             volc_resource_id: self.volc_resource_id.clone(),
             volc_boosting_table_id: self.volc_boosting_table_id.clone(),
             semantic_punctuation_enabled: self.semantic_punctuation_enabled,
+            semantic_smoothing_enabled: self.semantic_smoothing_enabled,
             max_sentence_silence_ms: self.max_sentence_silence_ms,
             selected_input_device_id: self.selected_input_device_id.clone(),
             shortcut: self.shortcut.clone(),
             input_gain_db: self.input_gain_db,
             audio_retention: normalize_audio_retention(&self.audio_retention),
+            history_text_size: normalize_history_text_size(&self.history_text_size),
         }
     }
 
     fn variant(&self) -> VariantSettings {
         VariantSettings {
             launch_at_login: self.launch_at_login,
+            mute_system_audio_during_dictation: self.mute_system_audio_during_dictation,
             onboarding_completed: self.onboarding_completed,
         }
     }
@@ -227,6 +250,7 @@ fn migrate_legacy_variant_settings(raw: &str, production_data_dir: &Path) -> Res
         production_data_dir,
         &VariantSettings {
             launch_at_login: legacy.launch_at_login.unwrap_or(false),
+            mute_system_audio_during_dictation: false,
             onboarding_completed: legacy.onboarding_completed.unwrap_or(false),
         },
     )
@@ -264,10 +288,21 @@ fn default_audio_retention() -> String {
     "thirtyDays".into()
 }
 
+fn default_history_text_size() -> String {
+    "standard".into()
+}
+
 pub fn normalize_audio_retention(value: &str) -> String {
     match value {
         "never" | "sevenDays" | "thirtyDays" | "forever" => value.to_string(),
         _ => default_audio_retention(),
+    }
+}
+
+pub fn normalize_history_text_size(value: &str) -> String {
+    match value {
+        "compact" | "standard" | "large" => value.to_string(),
+        _ => default_history_text_size(),
     }
 }
 
@@ -331,6 +366,8 @@ mod tests {
         let dev = load_settings(&shared, &development, &production).unwrap();
         assert_eq!(dev.volc_api_key, "key");
         assert_eq!(dev.audio_retention, "forever");
+        assert_eq!(dev.history_text_size, "standard");
+        assert!(!dev.semantic_smoothing_enabled);
         assert!(!dev.launch_at_login);
         assert!(!dev.onboarding_completed);
 
@@ -348,6 +385,7 @@ mod tests {
         let settings = AppSettings {
             volc_api_key: "secret".into(),
             onboarding_completed: true,
+            mute_system_audio_during_dictation: true,
             ..AppSettings::default()
         };
 
@@ -358,7 +396,35 @@ mod tests {
         assert!(!shared_raw.contains("secret"));
         assert!(!shared_raw.contains("volcApiKey"));
         assert!(!shared_raw.contains("onboardingCompleted"));
+        assert!(!shared_raw.contains("muteSystemAudioDuringDictation"));
         assert!(variant_raw.contains("onboardingCompleted"));
+        assert!(variant_raw.contains("muteSystemAudioDuringDictation"));
+        assert!(shared_raw.contains("\"historyTextSize\": \"standard\""));
+        assert!(shared_raw.contains("\"semanticSmoothingEnabled\": false"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn normalizes_history_text_size() {
+        assert_eq!(normalize_history_text_size("compact"), "compact");
+        assert_eq!(normalize_history_text_size("large"), "large");
+        assert_eq!(normalize_history_text_size("unexpected"), "standard");
+    }
+
+    #[test]
+    fn saves_semantic_smoothing_preference() {
+        let root = test_dir("semantic-smoothing");
+        let shared = root.join("shared");
+        let variant = root.join("variant");
+        let settings = AppSettings {
+            semantic_smoothing_enabled: true,
+            ..AppSettings::default()
+        };
+
+        save_settings(&shared, &variant, &settings).unwrap();
+        let loaded = load_settings(&shared, &variant, &variant).unwrap();
+
+        assert!(loaded.semantic_smoothing_enabled);
         fs::remove_dir_all(root).unwrap();
     }
 }

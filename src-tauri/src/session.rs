@@ -1,10 +1,9 @@
-use crate::asr::{
-    RealtimeSession, TranscriptUpdate, VolcAsrConfig, ASR_ENGINE_ID, ASR_ENGINE_NAME,
-};
+use crate::asr::{RealtimeSession, TranscriptUpdate, VolcAsrConfig, ASR_ENGINE_NAME};
 use crate::audio::{self, AudioCapture, InputDeviceInfo};
 use crate::credentials::{CredentialMode, CredentialSource};
 use crate::delivery::{self, DeliveryResult};
 use crate::history::{AudioRecorder, RecognitionContext};
+use crate::output_mute::OutputMuteGuard;
 use crate::settings::{self, AppSettings};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -42,6 +41,7 @@ pub struct UiState {
     pub volc_resource_id: String,
     pub volc_boosting_table_id: String,
     pub semantic_punctuation_enabled: bool,
+    pub semantic_smoothing_enabled: bool,
     pub max_sentence_silence_ms: u32,
     pub input_gain_db: f32,
     pub selected_input_device_id: String,
@@ -59,9 +59,12 @@ pub struct UiState {
     pub mic_notice_seq: u32,
     pub shortcut: String,
     pub launch_at_login: bool,
+    pub mute_system_audio_during_dictation: bool,
+    pub system_audio_mute_supported: bool,
     /// Whether the first-run onboarding walkthrough has been completed.
     pub onboarding_completed: bool,
     pub audio_retention: String,
+    pub history_text_size: String,
 }
 
 impl Default for UiState {
@@ -77,6 +80,7 @@ impl Default for UiState {
             volc_resource_id: "volc.seedasr.sauc.duration".into(),
             volc_boosting_table_id: String::new(),
             semantic_punctuation_enabled: true,
+            semantic_smoothing_enabled: false,
             max_sentence_silence_ms: 1300,
             input_gain_db: 0.0,
             selected_input_device_id: String::new(),
@@ -89,8 +93,11 @@ impl Default for UiState {
             mic_notice_seq: 0,
             shortcut: "Alt+Space".into(),
             launch_at_login: false,
+            mute_system_audio_during_dictation: false,
+            system_audio_mute_supported: crate::output_mute::supported(),
             onboarding_completed: false,
             audio_retention: "thirtyDays".into(),
+            history_text_size: "standard".into(),
         }
     }
 }
@@ -99,6 +106,8 @@ struct ActiveSession {
     stop_tx: Option<mpsc::Sender<()>>,
     /// Stop the dedicated audio owner thread (Send).
     audio_stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    /// Owns only the mute state applied by this dictation session.
+    output_mute: Option<OutputMuteGuard>,
     started_at: Option<Instant>,
 }
 
@@ -163,7 +172,7 @@ impl AppState {
                     settings.volc_api_key = legacy_api_key;
                     credential_source = CredentialSource::Session;
                     credential_warning =
-                        format!("旧版 API Key 本次仍可使用，但无法安全迁移：{error}");
+                        format!("旧版 App Key 本次仍可使用，但无法安全迁移：{error}");
                 }
             }
         } else {
@@ -173,6 +182,11 @@ impl AppState {
             settings::remove_legacy_settings_backup(&shared_data_dir)?;
         }
         crate::history::apply_audio_retention(&shared_data_dir, &settings.audio_retention)?;
+        match crate::output_mute::restore_stale(&shared_data_dir) {
+            Ok(true) => eprintln!("[output-mute] 已恢复上次异常退出遗留的系统音频状态"),
+            Ok(false) => {}
+            Err(error) => eprintln!("[output-mute] 启动恢复失败：{error}"),
+        }
         let mut ui = UiState::default();
         apply_settings_to_ui(&mut ui, &settings);
         ui.volc_credential_source = credential_source.as_str().into();
@@ -198,6 +212,10 @@ impl AppState {
 
     pub fn snapshot(&self) -> UiState {
         self.ui.lock().clone()
+    }
+
+    pub fn shortcut(&self) -> String {
+        self.settings.lock().shortcut.clone()
     }
 
     pub fn data_dir(&self) -> PathBuf {
@@ -430,6 +448,9 @@ impl AppState {
         }
         let mut settings = self.settings.lock();
         let api_key = api_key.trim().to_string();
+        if api_key.is_empty() {
+            return Err("请输入豆包语音 App Key。".into());
+        }
         let credential_source = crate::credentials::save_volc_api_key(
             self.credential_mode,
             &self.variant_data_dir,
@@ -448,16 +469,33 @@ impl AppState {
         apply_settings_to_ui(&mut ui, &settings);
         ui.volc_credential_source = credential_source.as_str().into();
         ui.volc_credential_warning.clear();
-        ui.status = if settings.volc_api_key.is_empty() {
-            "豆包识别配置已保存（API Key 为空）。".into()
-        } else {
-            "豆包识别配置已保存。".into()
-        };
+        ui.status = "豆包语音 App Key 已保存。".into();
         Ok(ui.clone())
     }
 
-    /// 使用真实识别服务验证 API Key 与资源 ID，但不打开麦克风或发送音频。
-    /// 输入框为空时测试当前已保存的 API Key，便于用户随时重新验证。
+    /// 显式移除当前应用身份保存的凭据，避免空输入框被误当成删除操作。
+    pub fn remove_volc_api_key(&self) -> Result<UiState, String> {
+        if self.active.lock().is_some() {
+            return Err("正在听写中，请先结束听写再移除 App Key。".into());
+        }
+        let mut settings = self.settings.lock();
+        let credential_source = crate::credentials::save_volc_api_key(
+            self.credential_mode,
+            &self.variant_data_dir,
+            "",
+        )?;
+        settings.volc_api_key.clear();
+        self.save_settings(&settings)?;
+        let mut ui = self.ui.lock();
+        apply_settings_to_ui(&mut ui, &settings);
+        ui.volc_credential_source = credential_source.as_str().into();
+        ui.volc_credential_warning.clear();
+        ui.status = "豆包语音 App Key 已移除。".into();
+        Ok(ui.clone())
+    }
+
+    /// 使用真实识别服务验证 App Key 与资源 ID，但不打开麦克风或发送音频。
+    /// 输入框为空时测试当前已保存的 App Key，便于用户随时重新验证。
     pub async fn test_volc_connection(
         &self,
         api_key: String,
@@ -474,7 +512,7 @@ impl AppState {
             api_key.trim().to_string()
         };
         if api_key.is_empty() {
-            return Err("请先填写或保存豆包语音 API Key。".into());
+            return Err("请先填写或保存豆包语音 App Key。".into());
         }
         let resource_id = if resource_id.trim().is_empty() {
             settings.volc_resource_id.trim().to_string()
@@ -490,7 +528,7 @@ impl AppState {
 
         match crate::asr::test_connection(config).await {
             Ok(()) => {
-                let message = "连接测试通过：API Key 与资源 ID 已生效。".to_string();
+                let message = "豆包语音服务连接正常。".to_string();
                 self.ui.lock().status = message.clone();
                 Ok(message)
             }
@@ -637,7 +675,7 @@ impl AppState {
         }
         let settings = self.settings.lock().clone();
         if settings.volc_api_key.trim().is_empty() {
-            return Err("请先填写豆包录音识别 API Key。".into());
+            return Err("请先填写豆包语音 App Key。".into());
         }
 
         let local_words = crate::hotwords::load(&self.shared_data_dir);
@@ -701,9 +739,9 @@ impl AppState {
         let mut ui = self.ui.lock();
         apply_settings_to_ui(&mut ui, &settings);
         ui.status = if clamped <= 0.0 {
-            "手动增益偏移为 0，自动增益（AGC）保持开启。".into()
+            "麦克风音量增强已恢复为默认。".into()
         } else {
-            format!("手动增益偏移已设为 +{clamped:.0} dB（叠加在自动增益之上）。")
+            format!("麦克风音量增强已设为 +{clamped:.0} dB。")
         };
         Ok(ui.clone())
     }
@@ -711,10 +749,12 @@ impl AppState {
     pub fn update_recognition_options(
         &self,
         semantic_punctuation_enabled: bool,
+        semantic_smoothing_enabled: bool,
         max_sentence_silence_ms: u32,
     ) -> Result<UiState, String> {
         let mut settings = self.settings.lock();
         settings.semantic_punctuation_enabled = semantic_punctuation_enabled;
+        settings.semantic_smoothing_enabled = semantic_smoothing_enabled;
         settings.max_sentence_silence_ms = max_sentence_silence_ms.max(200);
         self.save_settings(&settings)?;
         let mut ui = self.ui.lock();
@@ -746,6 +786,16 @@ impl AppState {
         Ok(ui.clone())
     }
 
+    pub fn set_history_text_size(&self, size: String) -> Result<UiState, String> {
+        let mut settings = self.settings.lock();
+        settings.history_text_size = settings::normalize_history_text_size(size.trim());
+        self.save_settings(&settings)?;
+        let mut ui = self.ui.lock();
+        apply_settings_to_ui(&mut ui, &settings);
+        ui.status = "听写文字大小已更新。".into();
+        Ok(ui.clone())
+    }
+
     pub fn set_shortcut(&self, shortcut: String) -> Result<UiState, String> {
         let mut settings = self.settings.lock();
         settings.shortcut = shortcut.clone();
@@ -768,6 +818,37 @@ impl AppState {
             "已关闭开机时启动应用。".into()
         };
         Ok(ui.clone())
+    }
+
+    pub fn set_mute_system_audio_during_dictation(&self, enabled: bool) -> Result<UiState, String> {
+        if enabled && !crate::output_mute::supported() {
+            return Err("当前系统暂不支持听写时自动静音。".into());
+        }
+        if self.active.lock().is_some() {
+            return Err("正在听写中，请结束后再修改系统音频设置。".into());
+        }
+        let mut settings = self.settings.lock();
+        settings.mute_system_audio_during_dictation = enabled;
+        self.save_settings(&settings)?;
+        let mut ui = self.ui.lock();
+        apply_settings_to_ui(&mut ui, &settings);
+        ui.status = if enabled {
+            "已开启听写时临时静音系统音频。".into()
+        } else {
+            "已关闭听写时临时静音系统音频。".into()
+        };
+        Ok(ui.clone())
+    }
+
+    /// Best-effort process-exit cleanup. Session stop paths call the same
+    /// guard earlier, immediately after microphone capture ends.
+    pub fn restore_output_audio(&self) {
+        let guard = self
+            .active
+            .lock()
+            .as_mut()
+            .and_then(|active| active.output_mute.take());
+        restore_output_mute(guard);
     }
 
     /// Persist the "onboarding finished" flag so future launches go straight
@@ -840,7 +921,7 @@ impl AppState {
             let mut ui = self.ui.lock();
             ui.phase = "error".into();
             ui.status = if ui.volc_credential_warning.is_empty() {
-                "未配置豆包录音识别 API Key，请打开 JackVoice 设置 → 识别。".into()
+                "尚未连接豆包语音，请打开 JackVoice 设置 → 识别。".into()
             } else {
                 ui.volc_credential_warning.clone()
             };
@@ -940,17 +1021,35 @@ impl AppState {
             }
         }
 
+        let output_mute = if settings.mute_system_audio_during_dictation {
+            match OutputMuteGuard::engage(&self.shared_data_dir) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    eprintln!("[output-mute] 本次听写未能静音系统音频：{error}");
+                    let mut ui = self.ui.lock();
+                    ui.mic_notice = format!("系统音频未静音：{error}");
+                    ui.mic_notice_seq = ui.mic_notice_seq.wrapping_add(1);
+                    let _ = app.emit("jackvoice://state", ui.clone());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         {
             let mut active = self.active.lock();
             *active = Some(ActiveSession {
                 stop_tx: Some(stop_tx),
                 audio_stop_tx: Some(audio_stop_tx),
+                output_mute,
                 started_at: Some(Instant::now()),
             });
         }
 
         let app_for_task = app.clone();
-        let semantic = settings.semantic_punctuation_enabled;
+        let punctuation = settings.semantic_punctuation_enabled;
+        let smoothing = settings.semantic_smoothing_enabled;
         let silence = settings.max_sentence_silence_ms;
         let volc_config = VolcAsrConfig {
             api_key: settings.volc_api_key.clone(),
@@ -965,9 +1064,9 @@ impl AppState {
         let recording_dir = self.shared_data_dir.clone();
         let save_audio = crate::history::should_save_audio(&settings.audio_retention);
         let recognition_context = RecognitionContext {
-            engine: ASR_ENGINE_ID.to_string(),
             hotwords: hotwords.clone(),
-            semantic_punctuation_enabled: semantic,
+            semantic_punctuation_enabled: punctuation,
+            semantic_smoothing_enabled: smoothing,
             max_sentence_silence_ms: silence,
             input_gain_db: settings.input_gain_db,
             input_device_id: settings.selected_input_device_id.clone(),
@@ -975,7 +1074,7 @@ impl AppState {
 
         tokio::spawn(async move {
             let session_result =
-                RealtimeSession::connect(volc_config, semantic, silence, hotwords, {
+                RealtimeSession::connect(volc_config, punctuation, smoothing, silence, hotwords, {
                     let app = app_for_task.clone();
                     let replacement_rules_for_updates = replacement_rules.clone();
                     move |update: TranscriptUpdate| {
@@ -1097,11 +1196,17 @@ impl AppState {
 
             // Stop microphone before finalization.
             if let Some(state) = app_for_task.try_state::<AppState>() {
-                if let Some(active) = state.active.lock().as_mut() {
-                    if let Some(tx) = active.audio_stop_tx.take() {
-                        let _ = tx.send(());
+                let (audio_stop_tx, output_mute) = {
+                    let mut active = state.active.lock();
+                    match active.as_mut() {
+                        Some(active) => (active.audio_stop_tx.take(), active.output_mute.take()),
+                        None => (None, None),
                     }
+                };
+                if let Some(tx) = audio_stop_tx {
+                    let _ = tx.send(());
                 }
+                restore_output_mute(output_mute);
                 let mut ui = state.ui.lock();
                 ui.audio_level = 0.0;
                 ui.phase = "finalizing".into();
@@ -1243,17 +1348,22 @@ impl AppState {
         // window they are actually typing in.
         crate::overlay::remember_frontmost_app();
 
-        let (stop_tx, audio_stop_tx) = {
+        let (stop_tx, audio_stop_tx, output_mute) = {
             let mut active = self.active.lock();
             match active.as_mut() {
-                Some(session) => (session.stop_tx.take(), session.audio_stop_tx.take()),
-                None => (None, None),
+                Some(session) => (
+                    session.stop_tx.take(),
+                    session.audio_stop_tx.take(),
+                    session.output_mute.take(),
+                ),
+                None => (None, None, None),
             }
         };
 
         if let Some(tx) = audio_stop_tx {
             let _ = tx.send(());
         }
+        restore_output_mute(output_mute);
 
         {
             let mut ui = self.ui.lock();
@@ -1278,13 +1388,25 @@ fn apply_settings_to_ui(ui: &mut UiState, settings: &AppSettings) {
     ui.volc_resource_id = settings.volc_resource_id.clone();
     ui.volc_boosting_table_id = settings.volc_boosting_table_id.clone();
     ui.semantic_punctuation_enabled = settings.semantic_punctuation_enabled;
+    ui.semantic_smoothing_enabled = settings.semantic_smoothing_enabled;
     ui.max_sentence_silence_ms = settings.max_sentence_silence_ms;
     ui.input_gain_db = settings.input_gain_db;
     ui.selected_input_device_id = settings.selected_input_device_id.clone();
     ui.shortcut = settings.shortcut.clone();
     ui.launch_at_login = settings.launch_at_login;
+    ui.mute_system_audio_during_dictation = settings.mute_system_audio_during_dictation;
+    ui.system_audio_mute_supported = crate::output_mute::supported();
     ui.onboarding_completed = settings.onboarding_completed;
     ui.audio_retention = settings.audio_retention.clone();
+    ui.history_text_size = settings.history_text_size.clone();
+}
+
+fn restore_output_mute(mut guard: Option<OutputMuteGuard>) {
+    if let Some(guard) = guard.as_mut() {
+        if let Err(error) = guard.restore() {
+            eprintln!("[output-mute] 恢复系统音频失败：{error}");
+        }
+    }
 }
 
 /// Human-readable text for microphone fault notices.
@@ -1317,7 +1439,7 @@ fn format_volc_connection_error(raw: &str) -> String {
         || raw.contains("鉴权失败")
     {
         return format!(
-            "API Key 未通过认证。请确认填写的是豆包语音新版控制台中的 APP Key，而不是 Access Key、Secret Key 或其他产品的 API Key。服务端错误：{raw}"
+            "App Key 未通过认证。请确认填写的是豆包语音控制台中的 App Key，而不是 Access Key、Secret Key 或其他产品的凭据。服务端错误：{raw}"
         );
     }
     if lower.contains("403")
@@ -1325,11 +1447,14 @@ fn format_volc_connection_error(raw: &str) -> String {
         || raw.contains("服务未授权")
     {
         return format!(
-            "豆包语音服务拒绝访问。请确认当前项目已开通该识别资源，并核对资源 ID。服务端错误：{raw}"
+            "豆包语音服务拒绝访问。请确认当前账号已经开通所需的语音识别套餐。服务端错误：{raw}"
         );
     }
     if lower.contains("timed out") || raw.contains("超时") {
         return format!("连接豆包语音服务超时，请检查网络后重试。原始错误：{raw}");
+    }
+    if raw.contains("资源 ID") {
+        return "豆包语音服务配置异常，请重新连接后再试。".into();
     }
     format!("豆包语音连接测试失败：{raw}")
 }
@@ -1363,15 +1488,15 @@ mod volc_connection_error_tests {
     #[test]
     fn explains_unauthenticated_key() {
         let message = format_volc_connection_error("HTTP error: 401 Unauthorized");
-        assert!(message.contains("API Key 未通过认证"));
-        assert!(message.contains("APP Key"));
+        assert!(message.contains("App Key 未通过认证"));
+        assert!(message.contains("豆包语音控制台"));
     }
 
     #[test]
     fn explains_missing_resource_grant() {
         let message = format_volc_connection_error("requested grant not found (403)");
         assert!(message.contains("服务拒绝访问"));
-        assert!(message.contains("资源 ID"));
+        assert!(message.contains("语音识别套餐"));
     }
 
     #[test]

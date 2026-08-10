@@ -6,9 +6,11 @@ mod history;
 mod hotwords;
 mod normalize;
 mod onboarding;
+mod output_mute;
 mod overlay;
 mod session;
 mod settings;
+mod shortcut;
 mod storage;
 mod volc_hotword_api;
 
@@ -110,19 +112,51 @@ fn update_shortcut(
     state: tauri::State<'_, AppState>,
 ) -> Result<UiState, String> {
     let trimmed = shortcut.trim().to_string();
-    let new_shortcut: Shortcut = trimmed
-        .parse()
-        .map_err(|_| "快捷键格式无效，可参考 CommandOrControl+Shift+K 形式。".to_string())?;
+    let uses_fn = shortcut::uses_fn_modifier(&trimmed);
+    let new_shortcut =
+        if uses_fn {
+            shortcut::validate_fn_shortcut(&trimmed)?;
+            None
+        } else {
+            Some(trimmed.parse::<Shortcut>().map_err(|_| {
+                "快捷键格式无效，可参考 CommandOrControl+Shift+K 形式。".to_string()
+            })?)
+        };
     let old_shortcut = state.snapshot().shortcut;
     let global_shortcut = app.global_shortcut();
     let _ = global_shortcut.unregister_all();
-    if let Err(err) = global_shortcut.register(new_shortcut) {
-        if let Ok(old) = old_shortcut.parse::<Shortcut>() {
-            let _ = global_shortcut.register(old);
+    if let Some(new_shortcut) = new_shortcut {
+        if let Err(err) = global_shortcut.register(new_shortcut) {
+            if !shortcut::uses_fn_modifier(&old_shortcut) {
+                if let Ok(old) = old_shortcut.parse::<Shortcut>() {
+                    let _ = global_shortcut.register(old);
+                }
+            }
+            return Err(format!("无法注册该快捷键（可能与其他应用冲突）：{err}"));
         }
-        return Err(format!("无法注册该快捷键（可能与其他应用冲突）：{err}"));
     }
-    state.set_shortcut(trimmed)
+    match state.set_shortcut(trimmed) {
+        Ok(ui) => Ok(ui),
+        Err(error) => {
+            let _ = global_shortcut.unregister_all();
+            if !shortcut::uses_fn_modifier(&old_shortcut) {
+                if let Ok(old) = old_shortcut.parse::<Shortcut>() {
+                    let _ = global_shortcut.register(old);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+fn start_shortcut_recording(state: tauri::State<'_, shortcut::ShortcutCaptureState>) {
+    state.start();
+}
+
+#[tauri::command]
+fn cancel_shortcut_recording(state: tauri::State<'_, shortcut::ShortcutCaptureState>) {
+    state.stop();
 }
 
 #[tauri::command]
@@ -142,6 +176,14 @@ fn set_launch_at_login(
             .map_err(|e| format!("关闭开机启动失败：{e}"))?;
     }
     state.set_launch_at_login_flag(enabled)
+}
+
+#[tauri::command]
+fn set_mute_system_audio_during_dictation(
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiState, String> {
+    state.set_mute_system_audio_during_dictation(enabled)
 }
 
 #[tauri::command]
@@ -178,6 +220,11 @@ fn save_volc_settings(
 }
 
 #[tauri::command]
+fn remove_volc_api_key(state: tauri::State<'_, AppState>) -> Result<UiState, String> {
+    state.remove_volc_api_key()
+}
+
+#[tauri::command]
 async fn test_volc_connection(
     api_key: String,
     resource_id: String,
@@ -197,6 +244,14 @@ fn set_audio_retention(
     state: tauri::State<'_, AppState>,
 ) -> Result<UiState, String> {
     state.set_audio_retention(retention)
+}
+
+#[tauri::command]
+fn set_history_text_size(
+    size: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiState, String> {
+    state.set_history_text_size(size)
 }
 
 #[tauri::command]
@@ -227,10 +282,15 @@ fn complete_onboarding(state: tauri::State<'_, AppState>) -> Result<UiState, Str
 #[tauri::command]
 fn update_recognition_options(
     semantic_punctuation_enabled: bool,
+    semantic_smoothing_enabled: bool,
     max_sentence_silence_ms: u32,
     state: tauri::State<'_, AppState>,
 ) -> Result<UiState, String> {
-    state.update_recognition_options(semantic_punctuation_enabled, max_sentence_silence_ms)
+    state.update_recognition_options(
+        semantic_punctuation_enabled,
+        semantic_smoothing_enabled,
+        max_sentence_silence_ms,
+    )
 }
 
 #[tauri::command]
@@ -405,6 +465,8 @@ pub fn run() {
             .map_err(Box::<dyn std::error::Error>::from)?;
             app.manage(instance_guard);
             app.manage(state);
+            app.manage(shortcut::ShortcutCaptureState::default());
+            shortcut::install_fn_shortcut_monitor(app.handle().clone());
             let _ = crate::overlay::ensure_overlay(app.handle());
 
             // First run (onboarding not finished yet): show the main window so
@@ -428,11 +490,15 @@ pub fn run() {
 
             // Register the user-configured hands-free shortcut (fallback: Alt+Space).
             let saved_shortcut = app.state::<AppState>().snapshot().shortcut;
-            let registered = saved_shortcut
-                .parse::<Shortcut>()
-                .ok()
-                .and_then(|sc| app.global_shortcut().register(sc).ok())
-                .is_some();
+            let registered = if shortcut::uses_fn_modifier(&saved_shortcut) {
+                shortcut::validate_fn_shortcut(&saved_shortcut).is_ok()
+            } else {
+                saved_shortcut
+                    .parse::<Shortcut>()
+                    .ok()
+                    .and_then(|sc| app.global_shortcut().register(sc).ok())
+                    .is_some()
+            };
             if !registered {
                 app.global_shortcut()
                     .register("Alt+Space")
@@ -465,15 +531,20 @@ pub fn run() {
             save_replacements,
             sync_volc_hotword_table,
             update_shortcut,
+            start_shortcut_recording,
+            cancel_shortcut_recording,
             set_launch_at_login,
+            set_mute_system_audio_during_dictation,
             list_input_devices,
             set_input_device,
             start_mic_test,
             stop_mic_test,
             save_volc_settings,
+            remove_volc_api_key,
             test_volc_connection,
             set_input_gain,
             set_audio_retention,
+            set_history_text_size,
             get_permissions,
             request_accessibility_permission,
             check_permissions,
@@ -491,13 +562,12 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building JackVoice")
-        .run(|app, event| {
+        .run(|app, event| match event {
             // Clicking the Dock icon should open settings manually.
-            if let tauri::RunEvent::Reopen {
+            tauri::RunEvent::Reopen {
                 has_visible_windows,
                 ..
-            } = event
-            {
+            } => {
                 if !has_visible_windows {
                     if let Some(main) = app.get_webview_window("main") {
                         let _ = main.show();
@@ -505,6 +575,12 @@ pub fn run() {
                     }
                 }
             }
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.restore_output_audio();
+                }
+            }
+            _ => {}
         });
 }
 
