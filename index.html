@@ -17,11 +17,11 @@
           </div>
           <div class="brand-text">
             <strong>JackVoice</strong>
-            <span>安静地说，准确地写</span>
+            <span>跨应用语音听写</span>
           </div>
         </div>
         <nav class="top-nav" aria-label="主导航">
-          <button class="nav-item active" data-view="home">记录</button>
+          <button class="nav-item active" data-view="home">听写</button>
           <button class="nav-item" data-view="dict">词库</button>
         </nav>
         <button id="open-settings" class="settings-button" title="设置" aria-label="打开设置">
@@ -39,10 +39,9 @@
             <div class="console-copy">
               <div class="console-state">
                 <span id="phase-dot" class="phase-dot" aria-hidden="true"></span>
-                <span id="phase-pill" class="pill">准备就绪</span>
+                <h1 id="console-title" aria-live="polite">听写已就绪</h1>
               </div>
-              <h1 id="console-title">随时开始听写</h1>
-              <p>在任意应用中按 <kbd id="shortcut-kbd" class="shortcut">⌥ + Space</kbd>，说完再按一次。</p>
+              <p>在任意应用按 <kbd id="shortcut-kbd" class="shortcut">⌥ + Space</kbd> 开始，说完再按一次。</p>
             </div>
             <div class="console-signal" aria-hidden="true">
               <span></span><span></span><span></span><span></span><span></span>
@@ -50,34 +49,43 @@
             <button id="toggle-btn" class="console-action">开始听写</button>
           </section>
 
-          <div class="usage-summary" aria-label="使用摘要">
-            <span>累计使用</span>
-            <strong id="stat-sessions">0 次</strong>
-            <i></i>
-            <strong id="stat-duration">0 分</strong>
-            <i></i>
-            <strong id="stat-chars">0 字</strong>
+          <div class="history-workbench">
+            <header class="workbench-head">
+              <div class="workbench-title">
+                <div class="workbench-title-row">
+                  <h2>听写记录</h2>
+                  <span id="history-count">0 条</span>
+                </div>
+                <div class="usage-summary" aria-label="累计使用">
+                  <span>累计</span>
+                  <strong id="stat-sessions">0 次</strong>
+                  <i></i>
+                  <strong id="stat-duration">0 分</strong>
+                  <i></i>
+                  <strong id="stat-chars">0 字</strong>
+                </div>
+              </div>
+              <div class="history-tools">
+                <label class="history-search">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" />
+                  </svg>
+                  <input id="history-search" type="search" placeholder="搜索听写内容" autocomplete="off" />
+                </label>
+                <details class="history-menu">
+                  <summary title="更多操作" aria-label="更多历史操作">
+                    <span></span><span></span><span></span>
+                  </summary>
+                  <div class="history-menu-popover">
+                    <button id="clear-history" class="text-button danger" type="button">清空全部记录</button>
+                  </div>
+                </details>
+              </div>
+            </header>
+            <div id="history"></div>
           </div>
 
-          <div class="history-workbench">
-            <section class="history-browser">
-              <header class="workbench-head">
-                <div>
-                  <h2>最近听写</h2>
-                  <span id="history-count">0 条记录</span>
-                </div>
-                <button id="clear-history" class="text-button danger" type="button">清空</button>
-              </header>
-              <div id="history"></div>
-            </section>
-            <section id="history-detail" class="history-detail">
-              <div class="detail-empty">
-                <div class="detail-empty-mark" aria-hidden="true">⌁</div>
-                <strong>选择一条听写记录</strong>
-                <span>在这里查看完整文字、播放录音或管理文件。</span>
-              </div>
-            </section>
-          </div>
+          <dialog id="history-detail" class="history-detail" aria-label="听写详情"></dialog>
         </section>
 
         <!-- ================= 词库 ================= -->

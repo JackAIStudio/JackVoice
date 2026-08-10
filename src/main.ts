@@ -95,11 +95,13 @@ let replacementFilter = "";
 let recordingShortcut = false;
 let historyRecords: HistoryRecord[] = [];
 let selectedHistoryId: string | null = null;
+let historyQuery = "";
+let historyPlaybackRate = 1;
+let historyPlaybackLoadingId: string | null = null;
 let historyPlayback: {
   recordId: string;
   audio: HTMLAudioElement;
   objectUrl: string;
-  button: HTMLButtonElement;
 } | null = null;
 let toastTimer: number | undefined;
 
@@ -228,6 +230,10 @@ function formatClipDuration(ms: number): string {
   return `${minutes}:${seconds}`;
 }
 
+function formatPlaybackTime(seconds: number): string {
+  return formatClipDuration(Math.max(0, seconds) * 1000);
+}
+
 function formatFileSize(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   return `${Math.max(1, Math.round(bytes / 1024))} KB`;
@@ -262,13 +268,6 @@ function applyState(state: UiState) {
   const kbd = $("#shortcut-kbd");
   if (kbd) kbd.textContent = formatShortcut(state.shortcut || "Alt+Space");
 
-  const pill = $("#phase-pill");
-  if (pill) {
-    pill.className = `pill ${state.phase || "idle"}`;
-    pill.textContent = phaseLabel(state.phase);
-    pill.title = state.status;
-  }
-
   const phaseDot = $("#phase-dot");
   if (phaseDot) phaseDot.className = `phase-dot ${state.phase || "idle"}`;
   const console = $(".dictation-console");
@@ -278,9 +277,10 @@ function applyState(state: UiState) {
   if (consoleTitle) {
     if (state.phase === "recording") consoleTitle.textContent = "正在听写";
     else if (state.phase === "connecting") consoleTitle.textContent = "正在连接识别服务";
-    else if (state.phase === "finalizing") consoleTitle.textContent = "正在生成最终结果";
+    else if (state.phase === "finalizing") consoleTitle.textContent = "正在整理文字";
     else if (state.phase === "error") consoleTitle.textContent = "本次听写未能完成";
-    else consoleTitle.textContent = "随时开始听写";
+    else consoleTitle.textContent = "听写已就绪";
+    consoleTitle.title = state.status || phaseLabel(state.phase);
   }
 
   const toggle = $("#toggle-btn") as HTMLButtonElement | null;
@@ -518,29 +518,44 @@ function renderStats(stats: HistoryStats) {
 function renderHistory(records: HistoryRecord[]) {
   const host = $("#history");
   if (!host) return;
-  stopHistoryPlayback();
   historyRecords = records;
-  if (!selectedHistoryId || !records.some((record) => record.id === selectedHistoryId)) {
-    selectedHistoryId = records[0]?.id ?? null;
+  if (selectedHistoryId && !records.some((record) => record.id === selectedHistoryId)) {
+    selectedHistoryId = null;
+    const detail = $("#history-detail") as HTMLDialogElement | null;
+    if (detail?.open) detail.close();
+  }
+  if (historyPlayback && !records.some((record) => record.id === historyPlayback?.recordId)) {
+    stopHistoryPlayback();
   }
   host.innerHTML = "";
 
+  const query = historyQuery.trim().toLocaleLowerCase();
+  const visibleRecords = query
+    ? records.filter((record) => record.text.toLocaleLowerCase().includes(query))
+    : records;
   const count = $("#history-count");
-  if (count) count.textContent = `${records.length} 条记录`;
+  if (count) {
+    count.textContent = query ? `${visibleRecords.length} / ${records.length} 条` : `${records.length} 条`;
+  }
   const clear = $("#clear-history") as HTMLButtonElement | null;
   if (clear) clear.disabled = records.length === 0;
 
-  if (records.length === 0) {
+  if (visibleRecords.length === 0) {
     const empty = document.createElement("div");
-    empty.className = "empty-hint";
-    empty.textContent = "还没有听写记录。\n按下快捷键，说出你的第一段文字。";
+    empty.className = "history-empty";
+    const title = document.createElement("strong");
+    title.textContent = query ? "没有找到相关记录" : "还没有听写记录";
+    const hint = document.createElement("span");
+    hint.textContent = query
+      ? "换一个关键词再试试。"
+      : "按下快捷键，说出你的第一段文字。";
+    empty.append(title, hint);
     host.appendChild(empty);
-    renderHistoryDetail(null);
     return;
   }
 
   const groups: { key: string; label: string; items: HistoryRecord[] }[] = [];
-  for (const record of records) {
+  for (const record of visibleRecords) {
     const d = new Date(record.finishedAtMs);
     const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
     let group = groups.find((g) => g.key === key);
@@ -559,66 +574,91 @@ function renderHistory(records: HistoryRecord[]) {
     day.appendChild(label);
 
     for (const record of group.items) {
-      const row = document.createElement("button");
-      row.type = "button";
+      const row = document.createElement("div");
       row.className = `history-row${record.id === selectedHistoryId ? " active" : ""}`;
-      row.addEventListener("click", () => {
-        selectedHistoryId = record.id;
-        renderHistory(records);
+      row.dataset.historyRow = record.id;
+      row.tabIndex = 0;
+      row.setAttribute("role", "button");
+      row.setAttribute("aria-label", `查看 ${timeLabel(new Date(record.finishedAtMs))} 的听写记录`);
+      const openDetail = () => openHistoryDetail(record);
+      row.addEventListener("click", openDetail);
+      row.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        openDetail();
       });
 
       const meta = document.createElement("div");
       meta.className = "history-row-meta";
       const time = document.createElement("span");
+      time.className = "history-row-time";
       time.textContent = timeLabel(new Date(record.finishedAtMs));
       const duration = document.createElement("span");
+      duration.className = `history-row-duration${record.audio ? " audio" : ""}`;
       duration.textContent = formatClipDuration(record.durationMs);
       meta.append(time, duration);
 
       const text = document.createElement("div");
       text.className = "history-row-text";
       text.textContent = record.text;
-      row.append(meta, text);
+
+      const actions = document.createElement("div");
+      actions.className = "history-row-actions";
+      const copy = document.createElement("button");
+      copy.type = "button";
+      copy.className = "history-row-action";
+      copy.textContent = "复制";
+      copy.addEventListener("click", (event) => {
+        event.stopPropagation();
+        void copyHistoryText(record.text, copy);
+      });
+      actions.appendChild(copy);
+
+      if (record.audio) {
+        const play = document.createElement("button");
+        play.type = "button";
+        play.className = "history-row-action";
+        play.dataset.historyPlay = record.id;
+        play.textContent = "播放";
+        play.addEventListener("click", (event) => {
+          event.stopPropagation();
+          void toggleHistoryPlayback(record.id);
+        });
+        actions.appendChild(play);
+      }
+
+      row.append(meta, text, actions);
       day.appendChild(row);
     }
     host.appendChild(day);
   }
-  renderHistoryDetail(records.find((record) => record.id === selectedHistoryId) ?? null);
+  syncPlaybackUi();
 }
 
-function renderHistoryDetail(record: HistoryRecord | null) {
-  const host = $("#history-detail");
+function openHistoryDetail(record: HistoryRecord) {
+  selectedHistoryId = record.id;
+  document.querySelectorAll<HTMLElement>("[data-history-row]").forEach((row) => {
+    row.classList.toggle("active", row.dataset.historyRow === record.id);
+  });
+  renderHistoryDetail(record);
+}
+
+function renderHistoryDetail(record: HistoryRecord) {
+  const host = $("#history-detail") as HTMLDialogElement | null;
   if (!host) return;
   host.innerHTML = "";
-  if (!record) {
-    const empty = document.createElement("div");
-    empty.className = "detail-empty";
-    const mark = document.createElement("div");
-    mark.className = "detail-empty-mark";
-    mark.textContent = "⌁";
-    const title = document.createElement("strong");
-    title.textContent = "还没有听写记录";
-    const hint = document.createElement("span");
-    hint.textContent = "完成一次听写后，可以在这里查看、复制和管理结果。";
-    empty.append(mark, title, hint);
-    host.appendChild(empty);
-    return;
-  }
 
   const date = new Date(record.finishedAtMs);
   const head = document.createElement("header");
   head.className = "detail-head";
   const heading = document.createElement("div");
   const title = document.createElement("h2");
-  title.textContent = "听写详情";
+  title.textContent = `${dayLabel(date)} ${timeLabel(date)}`;
   const meta = document.createElement("div");
   meta.className = "detail-meta";
-  const engine = engineLabel(record.recognition?.engine);
   meta.textContent = [
-    `${dayLabel(date)} ${timeLabel(date)}`,
     formatClipDuration(record.durationMs),
     `${record.charCount} 字`,
-    engine,
   ].filter(Boolean).join(" · ");
   heading.append(title, meta);
 
@@ -630,50 +670,151 @@ function renderHistoryDetail(record: HistoryRecord | null) {
   copy.textContent = "复制文字";
   copy.addEventListener("click", () => void copyHistoryText(record.text, copy));
   actions.appendChild(copy);
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "detail-close";
+  close.setAttribute("aria-label", "关闭详情");
+  close.textContent = "×";
+  close.addEventListener("click", () => host.close());
+  actions.appendChild(close);
+  head.append(heading, actions);
+
+  const content = document.createElement("div");
+  content.className = "detail-content";
 
   if (record.audio) {
+    const player = document.createElement("div");
+    player.className = "detail-player";
+    const playerMain = document.createElement("div");
+    playerMain.className = "detail-player-main";
     const play = document.createElement("button");
     play.type = "button";
-    play.className = "detail-action";
-    play.textContent = "播放录音";
-    play.addEventListener("click", () => void toggleHistoryPlayback(record.id, play));
+    play.className = "detail-play";
+    play.dataset.historyPlay = record.id;
+    play.setAttribute("aria-label", "播放录音");
+    play.textContent = "▶";
+    play.addEventListener("click", () => void toggleHistoryPlayback(record.id));
+
+    const timeline = document.createElement("div");
+    timeline.className = "detail-timeline";
+    const progress = document.createElement("input");
+    progress.type = "range";
+    progress.className = "detail-progress";
+    progress.id = "detail-progress";
+    progress.dataset.recordId = record.id;
+    progress.min = "0";
+    progress.max = String(Math.max(0.1, record.audio.durationMs / 1000));
+    progress.step = "0.1";
+    progress.value = "0";
+    progress.setAttribute("aria-label", "录音播放进度");
+    const times = document.createElement("div");
+    times.className = "detail-times";
+    const elapsed = document.createElement("span");
+    elapsed.id = "detail-elapsed";
+    elapsed.textContent = "0:00";
+    const total = document.createElement("span");
+    total.id = "detail-total";
+    total.textContent = formatClipDuration(record.audio.durationMs);
+    times.append(elapsed, total);
+    timeline.append(progress, times);
+    progress.addEventListener("input", () => {
+      elapsed.textContent = formatPlaybackTime(Number(progress.value));
+      if (historyPlayback?.recordId === record.id) {
+        historyPlayback.audio.currentTime = Number(progress.value);
+      }
+    });
+    progress.addEventListener("change", () => {
+      void seekHistoryPlayback(record.id, Number(progress.value));
+    });
+
+    const speed = document.createElement("button");
+    speed.type = "button";
+    speed.className = "detail-speed";
+    speed.id = "detail-speed";
+    speed.textContent = `${historyPlaybackRate}×`;
+    speed.setAttribute("aria-label", "切换播放速度");
+    speed.addEventListener("click", cycleHistoryPlaybackRate);
+    playerMain.append(play, timeline, speed);
+    player.appendChild(playerMain);
+    content.appendChild(player);
+  } else {
+    const noAudio = document.createElement("div");
+    noAudio.className = "detail-no-audio";
+    noAudio.textContent = "本条记录没有保留本地录音";
+    content.appendChild(noAudio);
+  }
+
+  const transcriptLabel = document.createElement("div");
+  transcriptLabel.className = "detail-section-label";
+  transcriptLabel.textContent = "听写文字";
+  const transcript = document.createElement("div");
+  transcript.className = "detail-transcript";
+  transcript.textContent = record.text;
+  content.append(transcriptLabel, transcript);
+
+  const info = document.createElement("details");
+  info.className = "detail-info";
+  const infoSummary = document.createElement("summary");
+  infoSummary.textContent = "记录信息";
+  const infoGrid = document.createElement("dl");
+  infoGrid.className = "detail-info-grid";
+  const addInfo = (label: string, value: string) => {
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const description = document.createElement("dd");
+    description.textContent = value;
+    infoGrid.append(term, description);
+  };
+  addInfo("完成时间", date.toLocaleString("zh-CN"));
+  addInfo("识别模型", engineLabel(record.recognition?.engine) || "未记录");
+  addInfo("文字", `${record.charCount} 字`);
+  if (record.audio) {
+    addInfo(
+      "本地录音",
+      `WAV · ${record.audio.sampleRateHz / 1000} kHz · ${formatFileSize(record.audio.sizeBytes)}`,
+    );
+  } else {
+    addInfo("本地录音", "未保留");
+  }
+  info.append(infoSummary, infoGrid);
+  content.appendChild(info);
+
+  const footer = document.createElement("div");
+  footer.className = "detail-footer";
+  const footerStart = document.createElement("div");
+  if (record.audio) {
     const reveal = document.createElement("button");
     reveal.type = "button";
     reveal.className = "detail-action";
-    reveal.textContent = "显示文件";
+    reveal.textContent = "显示录音文件";
     reveal.addEventListener("click", () => {
       reveal.disabled = true;
       void invoke("reveal_history_audio", { recordId: record.id })
         .catch((error) => showToast(String(error), "error"))
         .finally(() => (reveal.disabled = false));
     });
-    actions.append(play, reveal);
+    footerStart.appendChild(reveal);
   }
-
   const remove = document.createElement("button");
   remove.type = "button";
   remove.className = "detail-action danger";
-  remove.textContent = "删除";
+  remove.textContent = "删除这条记录";
   remove.addEventListener("click", () => void deleteHistoryRecord(record.id));
-  actions.appendChild(remove);
-  head.append(heading, actions);
+  footer.append(footerStart, remove);
+  content.appendChild(footer);
 
-  const transcript = document.createElement("div");
-  transcript.className = "detail-transcript";
-  transcript.textContent = record.text;
-  const audioNote = document.createElement("div");
-  audioNote.className = "detail-audio-note";
-  audioNote.textContent = record.audio
-    ? `本地 WAV · ${record.audio.sampleRateHz / 1000} kHz · ${formatFileSize(record.audio.sizeBytes)}`
-    : "本条记录没有保留本地录音";
-  host.append(head, transcript, audioNote);
+  host.append(head, content);
+  if (!host.open) host.showModal();
+  syncPlaybackUi();
 }
 
 async function deleteHistoryRecord(recordId: string) {
   if (!window.confirm("删除这条听写记录及其本地录音？此操作无法撤销。")) return;
-  stopHistoryPlayback();
+  if (historyPlayback?.recordId === recordId) stopHistoryPlayback();
   try {
     const data = await invoke<HistoryData>("delete_history_record", { recordId });
+    const detail = $("#history-detail") as HTMLDialogElement | null;
+    if (detail?.open) detail.close();
     selectedHistoryId = null;
     renderStats(data.stats);
     renderHistory(data.records);
@@ -690,6 +831,10 @@ async function clearAllHistory() {
   stopHistoryPlayback();
   try {
     const data = await invoke<HistoryData>("clear_history");
+    const detail = $("#history-detail") as HTMLDialogElement | null;
+    if (detail?.open) detail.close();
+    const menu = document.querySelector<HTMLDetailsElement>(".history-menu");
+    if (menu) menu.open = false;
     selectedHistoryId = null;
     renderStats(data.stats);
     renderHistory(data.records);
@@ -703,54 +848,133 @@ async function clearAllHistory() {
 function stopHistoryPlayback() {
   if (!historyPlayback) return;
   historyPlayback.audio.pause();
-  historyPlayback.button.textContent = "播放录音";
   URL.revokeObjectURL(historyPlayback.objectUrl);
   historyPlayback = null;
+  historyPlaybackLoadingId = null;
+  syncPlaybackUi();
 }
 
-async function toggleHistoryPlayback(recordId: string, button: HTMLButtonElement) {
-  if (historyPlayback?.recordId === recordId) {
-    if (historyPlayback.audio.paused) {
-      try {
-        await historyPlayback.audio.play();
-        button.textContent = "暂停";
-      } catch (error) {
-        console.error("resume history audio failed", error);
-        stopHistoryPlayback();
-      }
-    } else {
-      historyPlayback.audio.pause();
-      button.textContent = "播放录音";
-    }
-    return;
+function syncPlaybackUi() {
+  const activeId = historyPlayback?.recordId ?? null;
+  const playing = !!historyPlayback && !historyPlayback.audio.paused;
+
+  document.querySelectorAll<HTMLButtonElement>("[data-history-play]").forEach((button) => {
+    const recordId = button.dataset.historyPlay ?? "";
+    const current = recordId === activeId;
+    const loading = recordId === historyPlaybackLoadingId;
+    const detailButton = button.classList.contains("detail-play");
+    button.disabled = loading;
+    button.textContent = loading ? (detailButton ? "…" : "加载中") : current && playing
+      ? (detailButton ? "Ⅱ" : "暂停")
+      : (detailButton ? "▶" : "播放");
+    button.setAttribute("aria-label", current && playing ? "暂停录音" : "播放录音");
+  });
+
+  document.querySelectorAll<HTMLElement>("[data-history-row]").forEach((row) => {
+    row.classList.toggle("playing", row.dataset.historyRow === activeId && playing);
+  });
+
+  const progress = $("#detail-progress") as HTMLInputElement | null;
+  if (progress) {
+    const recordId = progress.dataset.recordId ?? "";
+    const record = historyRecords.find((item) => item.id === recordId);
+    const current = recordId === activeId;
+    const fallbackDuration = (record?.audio?.durationMs ?? record?.durationMs ?? 0) / 1000;
+    const audioDuration = current && Number.isFinite(historyPlayback?.audio.duration)
+      ? historyPlayback?.audio.duration ?? fallbackDuration
+      : fallbackDuration;
+    progress.max = String(Math.max(0.1, audioDuration));
+    progress.value = String(current ? historyPlayback?.audio.currentTime ?? 0 : 0);
+    const elapsed = $("#detail-elapsed");
+    if (elapsed) elapsed.textContent = formatPlaybackTime(Number(progress.value));
+    const total = $("#detail-total");
+    if (total) total.textContent = formatPlaybackTime(audioDuration);
   }
 
+  const speed = $("#detail-speed");
+  if (speed) speed.textContent = `${historyPlaybackRate}×`;
+}
+
+async function loadHistoryPlayback(recordId: string): Promise<HTMLAudioElement | null> {
+  if (historyPlayback?.recordId === recordId) return historyPlayback.audio;
   stopHistoryPlayback();
-  button.disabled = true;
-  button.textContent = "加载中…";
+  historyPlaybackLoadingId = recordId;
+  syncPlaybackUi();
   try {
     const wav = await invoke<ArrayBuffer>("get_history_audio", { recordId });
     const objectUrl = URL.createObjectURL(new Blob([wav], { type: "audio/wav" }));
     const audio = new Audio(objectUrl);
-    historyPlayback = { recordId, audio, objectUrl, button };
+    audio.preload = "metadata";
+    audio.playbackRate = historyPlaybackRate;
+    historyPlayback = { recordId, audio, objectUrl };
+    audio.addEventListener("play", syncPlaybackUi);
+    audio.addEventListener("pause", syncPlaybackUi);
+    audio.addEventListener("timeupdate", syncPlaybackUi);
+    audio.addEventListener("loadedmetadata", syncPlaybackUi);
+    audio.addEventListener("ratechange", syncPlaybackUi);
     audio.addEventListener("ended", stopHistoryPlayback, { once: true });
     audio.addEventListener(
       "error",
       () => {
         console.error("play history audio failed", audio.error);
+        showToast("录音播放失败", "error");
         stopHistoryPlayback();
       },
       { once: true },
     );
-    await audio.play();
-    button.textContent = "暂停";
+    return audio;
   } catch (error) {
     console.error("load history audio failed", error);
-    stopHistoryPlayback();
-    button.textContent = "播放录音";
+    showToast(`录音加载失败：${String(error)}`, "error");
+    return null;
   } finally {
-    button.disabled = false;
+    historyPlaybackLoadingId = null;
+    syncPlaybackUi();
   }
+}
+
+async function toggleHistoryPlayback(recordId: string) {
+  if (historyPlayback?.recordId === recordId) {
+    if (historyPlayback.audio.paused) {
+      try {
+        await historyPlayback.audio.play();
+      } catch (error) {
+        console.error("resume history audio failed", error);
+        showToast("录音播放失败", "error");
+        stopHistoryPlayback();
+      }
+    } else {
+      historyPlayback.audio.pause();
+    }
+    syncPlaybackUi();
+    return;
+  }
+
+  const audio = await loadHistoryPlayback(recordId);
+  if (!audio) return;
+  try {
+    await audio.play();
+  } catch (error) {
+    console.error("play history audio failed", error);
+    showToast("录音播放失败", "error");
+    stopHistoryPlayback();
+  }
+  syncPlaybackUi();
+}
+
+async function seekHistoryPlayback(recordId: string, seconds: number) {
+  const audio = await loadHistoryPlayback(recordId);
+  if (!audio) return;
+  audio.currentTime = Math.max(0, Math.min(seconds, Number.isFinite(audio.duration) ? audio.duration : seconds));
+  syncPlaybackUi();
+}
+
+function cycleHistoryPlaybackRate() {
+  const rates = [1, 1.5, 2];
+  const index = rates.indexOf(historyPlaybackRate);
+  historyPlaybackRate = rates[(index + 1) % rates.length];
+  if (historyPlayback) historyPlayback.audio.playbackRate = historyPlaybackRate;
+  syncPlaybackUi();
 }
 
 /* ---------------- 词库 ---------------- */
@@ -1664,6 +1888,24 @@ function bindExternalLinks() {
 function bindHome() {
   $("#toggle-btn")?.addEventListener("click", () => void toggleDictation());
   $("#clear-history")?.addEventListener("click", () => void clearAllHistory());
+  $("#history-search")?.addEventListener("input", (event) => {
+    historyQuery = (event.target as HTMLInputElement).value;
+    renderHistory(historyRecords);
+  });
+
+  const detail = $("#history-detail") as HTMLDialogElement | null;
+  detail?.addEventListener("close", () => {
+    selectedHistoryId = null;
+    document.querySelectorAll<HTMLElement>("[data-history-row]").forEach((row) => {
+      row.classList.remove("active");
+    });
+  });
+  detail?.addEventListener("click", (event) => {
+    const rect = detail.getBoundingClientRect();
+    if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) {
+      detail.close();
+    }
+  });
 }
 
 function bindDict() {
