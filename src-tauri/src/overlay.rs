@@ -129,6 +129,20 @@ pub fn hide_overlay(app: &AppHandle) {
     ensure_main_stays_in_background(app);
 }
 
+/// Hide the capsule before delivery. When the chosen target is already the
+/// current app, do not activate it again: `activate` can select a different
+/// window in multi-window apps and discard the user's original caret.
+pub fn hide_overlay_for_delivery(app: &AppHandle, reactivate_target: bool) {
+    if reactivate_target {
+        hide_overlay(app);
+        return;
+    }
+    if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
+        let _ = window.hide();
+    }
+    previous_frontmost().lock().take();
+}
+
 /// Settings/main window is manual-only. Never auto-present it because overlay closed.
 static PREVIOUS_FRONTMOST: std::sync::OnceLock<parking_lot::Mutex<Option<String>>> =
     std::sync::OnceLock::new();
@@ -142,19 +156,24 @@ fn frontmost_app_name() -> Option<String> {
     use std::process::Command;
     let out = Command::new("osascript")
         .arg("-e")
-        .arg(
-            r#"tell application "System Events" to get name of first application process whose frontmost is true"#,
-        )
+        .arg(concat!(
+            "tell application \"System Events\"\n",
+            "set p to first application process whose frontmost is true\n",
+            "return (name of p as string) & tab & (count of windows of p as string)\n",
+            "end tell"
+        ))
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if name.is_empty() || name == "JackVoice" {
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let (name, window_count) = raw.trim().rsplit_once('\t')?;
+    let window_count = window_count.parse::<usize>().ok()?;
+    if name.is_empty() || name.starts_with("JackVoice") || window_count == 0 {
         None
     } else {
-        Some(name)
+        Some(name.to_string())
     }
 }
 
@@ -171,10 +190,30 @@ fn activate_app(name: &str) {
 pub fn remember_frontmost_app() {
     #[cfg(target_os = "macos")]
     {
-        if let Some(name) = frontmost_app_name() {
+        if let Some(name) = current_frontmost_app() {
             *previous_frontmost().lock() = Some(name);
         }
     }
+}
+
+/// Read the current non-JackVoice frontmost app without changing the target
+/// captured when dictation started.
+pub fn current_frontmost_app() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        frontmost_app_name()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// Replace the remembered target only after delivery logic has determined
+/// that a deliberate app switch occurred.
+pub fn set_remembered_frontmost_app(target: Option<String>) {
+    *previous_frontmost().lock() = target;
 }
 
 /// Peek (without consuming) the app that was frontmost when the capsule

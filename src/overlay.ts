@@ -22,6 +22,7 @@ const capsule = () => document.querySelector<HTMLElement>("#capsule");
 const statusEl = () => document.querySelector<HTMLElement>("#overlay-status");
 const textEl = () => document.querySelector<HTMLElement>("#overlay-text");
 const copyBtn = () => document.querySelector<HTMLButtonElement>("#copy-btn");
+const retryBtn = () => document.querySelector<HTMLButtonElement>("#retry-btn");
 
 /**
  * Result mode: dictation ended but insertion was NOT detected.
@@ -40,6 +41,7 @@ function paintResultChrome() {
   capsule()?.classList.add("result");
   const status = statusEl();
   if (status) status.textContent = resultStatusText;
+  retryBtn()?.classList.remove("hidden");
   copyBtn()?.classList.remove("hidden");
 }
 
@@ -64,6 +66,7 @@ function exitResultMode() {
     copyDismissTimer = undefined;
   }
   capsule()?.classList.remove("result");
+  retryBtn()?.classList.add("hidden");
   copyBtn()?.classList.add("hidden");
 }
 
@@ -145,6 +148,32 @@ async function copyResult() {
     resultStatusText = "复制失败，请重试";
     const status = statusEl();
     if (status) status.textContent = resultStatusText;
+  }
+}
+
+async function retryResult() {
+  const retry = retryBtn();
+  const copy = copyBtn();
+  if (retry) retry.disabled = true;
+  if (copy) copy.disabled = true;
+  resultStatusText = "正在重试";
+  const status = statusEl();
+  if (status) status.textContent = resultStatusText;
+
+  try {
+    const delivery = await invoke<DeliveryResult>("retry_last_transcript");
+    if (delivery.pasted) {
+      exitResultMode();
+      return;
+    }
+    resultStatusText = "仍未插入 · 剪贴板未改变";
+    paintResultChrome();
+  } catch {
+    resultStatusText = "重试失败 · 剪贴板未改变";
+    paintResultChrome();
+  } finally {
+    if (retry) retry.disabled = false;
+    if (copy) copy.disabled = false;
   }
 }
 
@@ -316,6 +345,10 @@ window.addEventListener("DOMContentLoaded", async () => {
   copyBtn()?.addEventListener("click", (e) => {
     e.stopPropagation();
     void copyResult();
+  });
+  retryBtn()?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    void retryResult();
   });
 
   // Drag the capsule body itself.

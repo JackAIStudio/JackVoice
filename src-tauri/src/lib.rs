@@ -18,7 +18,7 @@ use audio::InputDeviceInfo;
 use delivery::DeliveryResult;
 use hotwords::ReplacementRule;
 use session::{AppState, SaveHotwordsResult, UiState};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{
@@ -400,6 +400,34 @@ fn copy_last_transcript(
     })
 }
 
+/// Retry delivery without sacrificing whatever is currently on the clipboard.
+/// The last transcript lives in JackVoice history/state, so retry can use the
+/// same transparent clipboard transaction as first delivery.
+#[tauri::command]
+async fn retry_last_transcript(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<DeliveryResult, String> {
+    let text = state.snapshot().transcript.trim().to_string();
+    if text.is_empty() {
+        return Err("没有可重试的听写文字。".into());
+    }
+
+    let target = crate::overlay::remembered_frontmost_app();
+    crate::overlay::hide_overlay(&app);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let probe = delivery::probe_insertion_target(target.as_deref());
+    let result = delivery::deliver_text(&app, &text, probe).await;
+    let ui = state.apply_delivery_result(&result);
+    let _ = app.emit("jackvoice://state", ui);
+    let _ = app.emit("jackvoice://delivery", result.clone());
+    if !result.pasted {
+        crate::overlay::show_overlay(&app);
+    }
+    Ok(result)
+}
+
 /// Hide the capsule from the frontend (e.g. after manual copy or timeout).
 #[tauri::command]
 fn dismiss_overlay(app: AppHandle) -> Result<(), String> {
@@ -626,6 +654,7 @@ pub fn run() {
             reset_overlay_position,
             start_overlay_drag,
             copy_last_transcript,
+            retry_last_transcript,
             dismiss_overlay,
             open_settings_window,
             open_external_url

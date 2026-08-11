@@ -123,9 +123,9 @@ body {
   color: rgba(255, 177, 74, 0.95);
 }
 
-/* Result mode: insertion was not detected, offer a manual copy. */
+/* Result mode: insertion was not detected, offer safe retry and explicit copy. */
 .capsule.result {
-  grid-template-columns: 28px minmax(0, 1fr) auto;
+  grid-template-columns: 28px minmax(0, 1fr) auto auto;
   border-color: rgba(255, 177, 74, 0.45);
 }
 
@@ -133,10 +133,11 @@ body {
   display: none;
 }
 
+.result-btn,
 .copy-btn {
   border: 0;
   border-radius: 999px;
-  padding: 5px 12px;
+  padding: 5px 10px;
   font-size: 12px;
   font-weight: 700;
   line-height: 1.2;
@@ -147,6 +148,18 @@ body {
   flex: 0 0 auto;
 }
 
+.retry-btn {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+.result-btn:disabled,
+.copy-btn:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.result-btn:hover,
 .copy-btn:hover {
   filter: brightness(1.08);
 }

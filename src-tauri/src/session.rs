@@ -76,7 +76,7 @@ pub struct UiState {
     pub mic_testing: bool,
     pub last_delivery_message: String,
     /// True when the last dictation ended without a detected insertion,
-    /// so the overlay should offer a manual copy button.
+    /// so the overlay should offer retry and explicit-copy actions.
     pub needs_copy_prompt: bool,
     /// Transient microphone notice (fallback / disconnect / restore) shown
     /// as a toast on the capsule. `mic_notice_seq` increments on every new
@@ -270,6 +270,13 @@ impl AppState {
 
     pub fn snapshot(&self) -> UiState {
         self.ui.lock().clone()
+    }
+
+    pub fn apply_delivery_result(&self, delivery: &DeliveryResult) -> UiState {
+        let mut ui = self.ui.lock();
+        ui.needs_copy_prompt = !delivery.pasted;
+        ui.last_delivery_message = delivery.message.clone();
+        ui.clone()
     }
 
     pub fn shortcut(&self) -> String {
@@ -1741,13 +1748,37 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
         let mut delivery_result = None;
         let mut needs_copy_prompt = false;
         if !final_text.trim().is_empty() && local_error.is_none() && recognition_error.is_none() {
-            crate::overlay::remember_frontmost_app();
-            let target = crate::overlay::remembered_frontmost_app();
-            let probe = delivery::probe_insertion_target(target.as_deref());
-            crate::overlay::hide_overlay(&app);
-            crate::overlay::ensure_main_stays_in_background(&app);
+            let initial_target = crate::overlay::remembered_frontmost_app();
+            let current_target = crate::overlay::current_frontmost_app();
+            let current_probe = current_target
+                .as_deref()
+                .map(|target| delivery::probe_insertion_target(Some(target)))
+                .unwrap_or(delivery::InsertionProbe::Unknown);
+            let target = delivery::choose_delivery_target(
+                initial_target.clone(),
+                current_target.clone(),
+                current_probe,
+            );
+            eprintln!(
+                "[delivery] target initial={initial_target:?} current={current_target:?} current_probe={current_probe:?} selected={target:?}"
+            );
+            let reactivate_target = target.is_some() && target != current_target;
+            crate::overlay::set_remembered_frontmost_app(target.clone());
+            crate::overlay::hide_overlay_for_delivery(&app, reactivate_target);
+            // Keep the original working delay for every delivery, including
+            // when the target app never changed. The global shortcut fires
+            // while Option is still physically held; posting Cmd+V
+            // immediately can therefore become Cmd+Option+V in the target.
             tokio::time::sleep(Duration::from_millis(350)).await;
-            let delivery = delivery::deliver_text(&app, &final_text, probe);
+            let probe = if reactivate_target {
+                // Probe after a genuinely different target has been restored.
+                delivery::probe_insertion_target(target.as_deref())
+            } else {
+                // Preserve the already-valid caret and the probe captured while
+                // its exact window was still active.
+                current_probe
+            };
+            let delivery = delivery::deliver_text(&app, &final_text, probe).await;
             needs_copy_prompt = !delivery.pasted;
             delivery_result = Some(delivery);
         } else if local_error.is_none() {
