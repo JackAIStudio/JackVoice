@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 const APPLE_ID_NOTARIZATION_ENV = ["APPLE_ID", "APPLE_PASSWORD", "APPLE_TEAM_ID"];
 const API_KEY_NOTARIZATION_ENV = [
@@ -7,6 +8,14 @@ const API_KEY_NOTARIZATION_ENV = [
   "APPLE_API_KEY",
   "APPLE_API_KEY_PATH",
 ];
+const LOCAL_NOTARIZATION_CONFIG_KEYS = [
+  "JACKVOICE_APPLE_TEAM_ID",
+  "APPLE_API_ISSUER",
+  "APPLE_API_KEY",
+  "APPLE_API_KEY_PATH",
+];
+
+export const LOCAL_NOTARIZATION_CONFIG_FILE = ".jackvoice-release.local";
 
 export const NOTARIZATION_ENV_NAMES = [
   ...APPLE_ID_NOTARIZATION_ENV,
@@ -21,6 +30,44 @@ function present(env, name) {
 
 function missingNames(env, names) {
   return names.filter((name) => !present(env, name));
+}
+
+export function mergeLocalNotarizationConfig(env, config) {
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    throw new Error(`${LOCAL_NOTARIZATION_CONFIG_FILE} 必须是 JSON 对象。`);
+  }
+  const merged = { ...env };
+  for (const name of LOCAL_NOTARIZATION_CONFIG_KEYS) {
+    const value = config[name];
+    if (value !== undefined && (typeof value !== "string" || !value.trim())) {
+      throw new Error(`${LOCAL_NOTARIZATION_CONFIG_FILE} 中的 ${name} 必须是非空字符串。`);
+    }
+    if (!present(merged, name) && typeof value === "string") merged[name] = value.trim();
+  }
+  return merged;
+}
+
+export function loadLocalNotarizationConfig(
+  env = process.env,
+  {
+    currentDirectory = process.cwd(),
+    fileExists = existsSync,
+    readFile = readFileSync,
+  } = {},
+) {
+  const configPath = join(currentDirectory, LOCAL_NOTARIZATION_CONFIG_FILE);
+  if (!fileExists(configPath)) return { environment: { ...env }, configPath: null };
+
+  let config;
+  try {
+    config = JSON.parse(readFile(configPath, "utf8"));
+  } catch (error) {
+    throw new Error(`无法读取本机 Apple 公证配置 ${configPath}：${error.message}`);
+  }
+  return {
+    environment: mergeLocalNotarizationConfig(env, config),
+    configPath,
+  };
 }
 
 export function validateNotarizationCredentials(env = process.env, fileExists = existsSync) {

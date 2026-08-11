@@ -10,6 +10,7 @@ import {
   verifyProductionApp,
 } from "./macos-signing.mjs";
 import {
+  loadLocalNotarizationConfig,
   notarizeDmg,
   stapleAndVerifyNotarizedDmg,
   validateNotarizationCredentials,
@@ -198,6 +199,11 @@ let notarizationCredentials = null;
 if (build && production && platform() === "darwin") {
   if (notarize) {
     try {
+      const localConfig = loadLocalNotarizationConfig(buildEnvironment);
+      buildEnvironment = localConfig.environment;
+      if (localConfig.configPath) {
+        console.log(`[JackVoice] 已读取本机 Apple 公证配置：${localConfig.configPath}`);
+      }
       notarizationCredentials = validateNotarizationCredentials(buildEnvironment);
     } catch (error) {
       console.error(`[JackVoice] 正式发布已阻止：${error.message}`);

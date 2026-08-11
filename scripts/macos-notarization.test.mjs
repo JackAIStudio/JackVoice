@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 import {
+  loadLocalNotarizationConfig,
+  mergeLocalNotarizationConfig,
   notarizeDmg,
   parseNotarytoolSubmission,
   stapleAndVerifyNotarizedDmg,
@@ -11,6 +14,60 @@ import {
 } from "./macos-notarization.mjs";
 
 const teamId = "ABCDEFGHIJ";
+
+test("桌面构建入口可以完整解析签名与公证模块", () => {
+  const result = spawnSync(process.execPath, ["scripts/run-desktop-dev.mjs", "--notarize"], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Apple 公证只能用于 macOS 正式桌面构建/);
+  assert.doesNotMatch(result.stderr, /SyntaxError|does not provide an export/);
+});
+
+test("本机项目配置只补充缺失的公证变量，显式环境变量优先", () => {
+  assert.deepEqual(
+    mergeLocalNotarizationConfig(
+      { APPLE_API_KEY: "EXPLICIT_KEY" },
+      {
+        JACKVOICE_APPLE_TEAM_ID: teamId,
+        APPLE_API_ISSUER: "issuer-id",
+        APPLE_API_KEY: "LOCAL_KEY",
+        APPLE_API_KEY_PATH: "/tmp/AuthKey_LOCAL_KEY.p8",
+      },
+    ),
+    {
+      JACKVOICE_APPLE_TEAM_ID: teamId,
+      APPLE_API_ISSUER: "issuer-id",
+      APPLE_API_KEY: "EXPLICIT_KEY",
+      APPLE_API_KEY_PATH: "/tmp/AuthKey_LOCAL_KEY.p8",
+    },
+  );
+});
+
+test("release 命令可读取项目内被 Git 忽略的本机公证配置", () => {
+  const loaded = loadLocalNotarizationConfig(
+    { PATH: "/usr/bin" },
+    {
+      currentDirectory: "/project",
+      fileExists: () => true,
+      readFile: () =>
+        JSON.stringify({
+          JACKVOICE_APPLE_TEAM_ID: teamId,
+          APPLE_API_ISSUER: "issuer-id",
+          APPLE_API_KEY: "KEY123",
+          APPLE_API_KEY_PATH: "/tmp/AuthKey_KEY123.p8",
+        }),
+    },
+  );
+  assert.equal(loaded.configPath, "/project/.jackvoice-release.local");
+  assert.equal(loaded.environment.JACKVOICE_APPLE_TEAM_ID, teamId);
+  assert.equal(loaded.environment.APPLE_API_KEY, "KEY123");
+  assert.throws(
+    () => mergeLocalNotarizationConfig({}, { APPLE_API_KEY: "" }),
+    /必须是非空字符串/,
+  );
+});
 
 test("正式发布接受完整的 App Store Connect API Key 凭据", () => {
   assert.deepEqual(
