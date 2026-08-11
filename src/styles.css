@@ -1741,6 +1741,11 @@ input[type="range"]#gain-db {
   font-weight: 600;
 }
 
+.ob-status.warn {
+  color: #b36d14;
+  font-weight: 600;
+}
+
 .ob-key-row .inline-fields {
   max-width: 300px;
 }

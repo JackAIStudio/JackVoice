@@ -150,6 +150,8 @@ npm run reset:first-run:production
 
 脚本会把原客户端状态备份到对应数据目录下的 `.first-run-backups`，不会触碰共享业务数据。正式版 App Key 位于系统凭据库，脚本不会删除；如需复测正式版的密钥录入，请先在应用设置中主动移除。
 
+macOS QA 构建产物默认放在 `~/Library/Caches/JackVoice/qa-cargo-target`。这样即使源码仓库位于 iCloud 同步的“桌面”或“文稿”目录，File Provider 附加的 FinderInfo 也不会破坏开发版 `.app` 的本地签名；首次构建缓存会稍慢，之后会增量复用。
+
 macOS 权限测试必须使用 `qa:first-run:dev` 打开的构建后 `.app`，期间不要再执行 `npm run dev`。后者直接运行 `target/debug/jackvoice` 裸二进制，它的临时代码签名哈希是另一套 TCC 身份：按 `com.jackvoice.app.dev` 重置的权限不会作用到这个裸进程，也不能代表用户下载、安装后的真实授权行为。
 
 这套本机重置适合快速回归；发布前仍应在新的 macOS 用户账户或干净虚拟机中安装最终签名、公证的产物，完成一次真正无旧数据、无旧权限、无旧钥匙串条目的验收。

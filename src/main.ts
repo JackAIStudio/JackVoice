@@ -4,6 +4,12 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
 type InputDeviceInfo = { id: string; name: string; isDefault: boolean };
 
+type PermissionStatus = {
+  microphone: boolean;
+  microphoneAuthorization: "notDetermined" | "restricted" | "denied" | "authorized";
+  accessibility: boolean;
+};
+
 type UiState = {
   phase: string;
   recognitionPhase: string;
@@ -115,6 +121,7 @@ let lastDictationPhase = "idle";
 let credentialEditorOpen = false;
 let onboardingCredentialEditorOpen = false;
 let onboardingMicVerified = false;
+let onboardingMicNeedsManualRecovery = false;
 let onboardingAccessibilityGranted = false;
 
 const COPY_SUCCESS_ICON =
@@ -337,6 +344,7 @@ function renderDictationError(message: string) {
 /* ---------------- 状态渲染 ---------------- */
 
 function applyState(state: UiState) {
+  const permissionsWereComplete = currentState?.onboardingCompleted === true;
   currentState = state;
 
   const historyTextSize = ["compact", "standard", "large"].includes(state.historyTextSize)
@@ -521,6 +529,12 @@ function applyState(state: UiState) {
 
   const ob = $("#onboarding");
   if (ob) ob.classList.toggle("hidden", !!state.onboardingCompleted);
+  if (permissionsWereComplete && !state.onboardingCompleted) {
+    onboardingMicVerified = false;
+    onboardingMicNeedsManualRecovery = false;
+    onboardingAccessibilityGranted = false;
+    goObStep(state.status.includes("辅助功能") && !state.status.includes("麦克风") ? 2 : 1);
+  }
 
   applyMicUi(state);
 }
@@ -597,9 +611,14 @@ function applyMicUi(state: UiState) {
   if (obTestBtn) {
     obTestBtn.textContent = state.micTesting ? "测试中…" : "测试麦克风";
     obTestBtn.disabled = state.micTesting;
+    obTestBtn.classList.toggle("hidden", onboardingMicNeedsManualRecovery);
   }
   const obStopBtn = $("#ob-mic-stop-btn");
   if (obStopBtn) obStopBtn.classList.toggle("hidden", !state.micTesting);
+  $("#ob-mic-recovery")?.classList.toggle(
+    "hidden",
+    !onboardingMicNeedsManualRecovery || state.micTesting,
+  );
 
   if (!state.micTesting) renderLevel(0, $("#ob-level-segments"));
 }
@@ -1838,7 +1857,12 @@ async function onMicChanged() {
 async function startMicTest() {
   const onboardingVisible = !$("#onboarding")?.classList.contains("hidden");
   if (onboardingVisible) {
-    setOnboardingMicHint("正在请求麦克风权限，请在系统弹窗中选择「允许」。", "warn");
+    setOnboardingMicHint(
+      onboardingMicNeedsManualRecovery
+        ? "正在重新检测麦克风权限…"
+        : "正在请求麦克风权限，请在系统弹窗中选择「允许」。",
+      "warn",
+    );
     // Paint the permission explanation before the synchronous native capture
     // call can display a blocking macOS TCC dialog.
     await waitForNextPaint();
@@ -1846,6 +1870,7 @@ async function startMicTest() {
   try {
     const state = await invoke<UiState>("start_mic_test");
     onboardingMicVerified = true;
+    onboardingMicNeedsManualRecovery = false;
     applyState(state);
     if (onboardingVisible) {
       setOnboardingMicHint("✓ 麦克风已授权。对着麦克风说话，确认音量条会跳动。", "ok");
@@ -1853,12 +1878,37 @@ async function startMicTest() {
   } catch (error) {
     onboardingMicVerified = false;
     console.error("mic test failed", error);
-    if (onboardingVisible) {
-      const message = error instanceof Error ? error.message : String(error);
+    const message = error instanceof Error ? error.message : String(error);
+    try {
+      const permissions = await invoke<PermissionStatus>("get_permissions");
+      onboardingMicNeedsManualRecovery = !permissions.microphone;
+    } catch (permissionError) {
+      console.error("read microphone permission after test failure failed", permissionError);
+      onboardingMicNeedsManualRecovery =
+        message.includes("已被拒绝") ||
+        message.includes("系统限制") ||
+        message.includes("尚未授权");
+    }
+    if (onboardingMicNeedsManualRecovery) {
+      try {
+        applyState(await invoke<UiState>("get_state"));
+        onboardingMicNeedsManualRecovery = true;
+      } catch (stateError) {
+        console.error("refresh state after microphone denial failed", stateError);
+      }
+    }
+    const onboardingNowVisible = !$("#onboarding")?.classList.contains("hidden");
+    if (onboardingVisible || onboardingNowVisible) {
+      updateOnboardingNextLabel();
+      if (currentState) applyMicUi(currentState);
       setOnboardingMicHint(
-        `未能使用麦克风：${message} 如果刚才选择了「不允许」，请到系统设置的「隐私与安全性 → 麦克风」中开启 JackVoice。`,
+        onboardingMicNeedsManualRecovery
+          ? `未能使用麦克风：${message} 请点击「打开麦克风设置」，手动开启 JackVoice 后再回来重新检测。`
+          : `未能使用麦克风：${message}`,
         "warn",
       );
+    } else {
+      window.alert(`未能使用麦克风：${message}`);
     }
   }
 }
@@ -1917,10 +1967,11 @@ let obBound = false;
 function updateOnboardingNextLabel() {
   const next = $("#ob-next") as HTMLButtonElement | null;
   if (!next) return;
+  next.disabled =
+    (obStep === 1 && !onboardingMicVerified) ||
+    (obStep === 2 && !onboardingAccessibilityGranted);
   if (obStep === OB_STEP_COUNT - 1) {
     next.textContent = "开始使用";
-  } else if (obStep === 2 && !onboardingAccessibilityGranted) {
-    next.textContent = "暂时跳过";
   } else if (obStep === 4 && !currentState?.hasVolcApiKey) {
     next.textContent = "暂时跳过";
   } else {
@@ -1932,18 +1983,14 @@ function renderOnboardingCompletion(state: UiState) {
   const title = $("#ob-complete-title");
   const copy = $("#ob-complete-copy");
   const detail = $("#ob-complete-detail");
-  if (state.hasVolcApiKey && onboardingAccessibilityGranted) {
+  if (state.hasVolcApiKey) {
     if (title) title.textContent = "准备就绪";
     if (copy) copy.innerHTML = "现在按下 <kbd class=\"shortcut\">⌥ + Space</kbd> 开始语音输入；说完再按一次结束，文字会自动插入。";
     if (detail) detail.textContent = "麦克风、实时识别和自动插入均已配置。";
-  } else if (state.hasVolcApiKey) {
-    if (title) title.textContent = "语音识别已就绪";
-    if (copy) copy.textContent = "你现在可以录音并生成识别文字；结果会保留在剪贴板和本地历史中。";
-    if (detail) detail.textContent = "稍后可在设置中开启辅助功能，让文字自动插入当前应用。";
   } else {
     if (title) title.textContent = "本地录音已就绪";
     if (copy) copy.textContent = "你现在可以使用快捷键开始本地录音，录音会永久保存在本机。";
-    if (detail) detail.textContent = "稍后连接 App Key 可生成识别文字；开启辅助功能后可自动插入。";
+    if (detail) detail.textContent = "麦克风和辅助功能已配置；稍后连接 App Key 即可生成并自动插入识别文字。";
   }
 }
 
@@ -1995,9 +2042,9 @@ function renderAccessibilityStatus(granted: boolean) {
     status.className = "ob-status ok";
     status.textContent = "✓ 辅助功能已授权，识别结果可自动插入。";
   } else {
-    status.className = "ob-status";
+    status.className = "ob-status warn";
     status.textContent =
-      "尚未授权：请在系统设置中打开 JackVoice 的开关，然后点「我已开启，重新检测」。";
+      "尚未授权：辅助功能是必需权限。请在系统设置中打开 JackVoice 的开关，然后点「我已开启，重新检测」。";
   }
 }
 
@@ -2012,6 +2059,15 @@ function bindOnboarding() {
         return;
       }
       if (currentState?.micTesting) await stopMicTest();
+    }
+    if (obStep === 2 && !onboardingAccessibilityGranted) {
+      const status = $("#ob-access-status");
+      if (status) {
+        status.className = "ob-status warn";
+        status.textContent =
+          "请先开启辅助功能权限，并点击「我已开启，重新检测」；此权限是使用 JackVoice 的必要条件。";
+      }
+      return;
     }
     if (obStep === 3) {
       const confirmed = ($("#ob-privacy-confirm") as HTMLInputElement | null)?.checked ?? false;
@@ -2044,6 +2100,19 @@ function bindOnboarding() {
   $("#ob-back")?.addEventListener("click", () => goObStep(obStep - 1));
 
   $("#ob-mic-test-btn")?.addEventListener("click", () => void startMicTest());
+  $("#ob-mic-recheck-btn")?.addEventListener("click", () => void startMicTest());
+  $("#ob-mic-settings-btn")?.addEventListener("click", async () => {
+    try {
+      await invoke("open_permission_settings", { permission: "microphone" });
+      setOnboardingMicHint(
+        "已打开系统设置。请在「隐私与安全性 → 麦克风」中开启 JackVoice，然后回来点击「我已开启，重新检测」。",
+        "warn",
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setOnboardingMicHint(`无法打开麦克风设置：${message}`, "warn");
+    }
+  });
   $("#ob-mic-stop-btn")?.addEventListener("click", () => void stopMicTest());
   $("#ob-mic-select")?.addEventListener("change", () => {
     const deviceId = ($("#ob-mic-select") as HTMLSelectElement | null)?.value ?? "";
@@ -2058,12 +2127,17 @@ function bindOnboarding() {
       renderAccessibilityStatus(granted);
       const status = $("#ob-access-status");
       if (status && !granted) {
-        status.className = "ob-status";
+        status.className = "ob-status warn";
         status.textContent =
           "已打开系统设置。请找到 JackVoice 并打开开关，然后回来点「我已开启，重新检测」。";
       }
     } catch (error) {
       console.error("request accessibility failed", error);
+      const status = $("#ob-access-status");
+      if (status) {
+        status.className = "ob-status warn";
+        status.textContent = `无法打开辅助功能设置：${error instanceof Error ? error.message : String(error)}`;
+      }
     }
   });
 

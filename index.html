@@ -446,15 +446,19 @@
               <div class="segments" id="ob-level-segments" aria-hidden="true"></div>
             </div>
             <p id="ob-mic-hint" class="ob-hint warn">点击「测试麦克风」后，JackVoice 才会向系统申请权限。</p>
+            <div id="ob-mic-recovery" class="ob-action-row hidden">
+              <button id="ob-mic-settings-btn" class="btn dark" type="button">打开麦克风设置</button>
+              <button id="ob-mic-recheck-btn" class="btn ghost" type="button">我已开启，重新检测</button>
+            </div>
           </section>
 
           <!-- 2 · 辅助功能 -->
           <section class="ob-pane" data-pane="2">
-            <h2>辅助功能权限 <span class="ob-requirement optional">可跳过</span></h2>
+            <h2>辅助功能权限 <span class="ob-requirement required">必需</span></h2>
             <p>听写结束后，JackVoice 会把文字自动插入你当前使用的应用（相当于帮你按一下粘贴）。这一步需要「辅助功能」权限。</p>
-            <p class="ob-detail">不授权仍可录音和识别，结果会保留在剪贴板与历史中，但不会自动插入当前应用。</p>
+            <p class="ob-detail">为了确保全局快捷键和自动插入稳定可用，开启此权限后才能继续进入主界面。</p>
             <div class="ob-action-row">
-              <button id="ob-access-btn" class="btn dark">打开系统设置</button>
+              <button id="ob-access-btn" class="btn dark">打开辅助功能设置</button>
               <button id="ob-access-check" class="btn ghost">我已开启，重新检测</button>
             </div>
             <p id="ob-access-status" class="ob-status"></p>

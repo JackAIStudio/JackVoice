@@ -397,6 +397,23 @@ impl AppState {
             Err(_) => return Err("麦克风测试启动失败。".into()),
         }
 
+        // CoreAudio can successfully create and play an input stream even
+        // after the user chose “Don't Allow”. The TCC authorization state is
+        // the source of truth; never turn a successful stream start into a
+        // false-positive permission result.
+        let microphone_authorization = crate::onboarding::microphone_authorization();
+        if !microphone_authorization.is_authorized() {
+            let _ = stop_tx.send(());
+            let message = crate::onboarding::microphone_permission_error(microphone_authorization);
+            let ui = self.require_onboarding(&message)?;
+            let _ = app.emit("jackvoice://state", ui);
+            if let Some(main) = app.get_webview_window("main") {
+                let _ = main.show();
+                let _ = main.set_focus();
+            }
+            return Err(message);
+        }
+
         {
             let mut monitor = self.monitor.lock();
             *monitor = Some(MonitorSession {
@@ -880,6 +897,20 @@ impl AppState {
         Ok(ui.clone())
     }
 
+    /// Return the app to the permission walkthrough when a required system
+    /// permission has been revoked after onboarding was previously completed.
+    pub fn require_onboarding(&self, message: &str) -> Result<UiState, String> {
+        let mut settings = self.settings.lock();
+        if settings.onboarding_completed {
+            settings.onboarding_completed = false;
+            self.save_settings(&settings)?;
+        }
+        let mut ui = self.ui.lock();
+        ui.onboarding_completed = false;
+        ui.status = message.into();
+        Ok(ui.clone())
+    }
+
     pub async fn cancel(&self, app: AppHandle) -> Result<UiState, String> {
         // Silent cancel: stop capture/session and hide overlay.
         // Do NOT focus/show the settings window. Main UI is manual-only.
@@ -916,6 +947,24 @@ impl AppState {
         if is_active {
             self.stop(app).await
         } else {
+            if !self.snapshot().onboarding_completed {
+                if let Some(main) = app.get_webview_window("main") {
+                    let _ = main.show();
+                    let _ = main.set_focus();
+                }
+                return Err("请先完成必需权限设置，再开始使用 JackVoice。".into());
+            }
+            let permissions = crate::onboarding::current_status();
+            if !permissions.required_permissions_granted() {
+                let message = permissions.missing_permissions_message();
+                let ui = self.require_onboarding(&message)?;
+                let _ = app.emit("jackvoice://state", ui);
+                if let Some(main) = app.get_webview_window("main") {
+                    let _ = main.show();
+                    let _ = main.set_focus();
+                }
+                return Err(message);
+            }
             self.start(app).await
         }
     }

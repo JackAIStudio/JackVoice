@@ -271,6 +271,37 @@ fn get_permissions() -> onboarding::PermissionStatus {
     onboarding::current_status()
 }
 
+#[cfg(target_os = "macos")]
+fn open_macos_permission_settings(app: &AppHandle, permission: &str) -> Result<(), String> {
+    let (url, label) = match permission {
+        "microphone" => (
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+            "麦克风",
+        ),
+        "accessibility" => (
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            "辅助功能",
+        ),
+        _ => return Err("不支持的权限设置类型。".into()),
+    };
+    app.opener()
+        .open_url(url, None::<String>)
+        .map_err(|error| format!("无法打开系统设置的「{label}」页面：{error}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_macos_permission_settings(_app: &AppHandle, _permission: &str) -> Result<(), String> {
+    Err("当前平台不支持直接打开 macOS 权限设置。".into())
+}
+
+/// Open a narrowly allowlisted macOS privacy pane. This recovery path is
+/// essential after a denial because macOS normally does not show the original
+/// consent dialog again on later attempts.
+#[tauri::command]
+fn open_permission_settings(permission: String, app: AppHandle) -> Result<(), String> {
+    open_macos_permission_settings(&app, permission.trim())
+}
+
 /// Ask macOS to show the Accessibility trust prompt and open System Settings.
 /// Returns the (still likely unchanged) Accessibility status right after.
 #[tauri::command]
@@ -278,6 +309,8 @@ fn request_accessibility_permission(app: AppHandle) -> Result<bool, String> {
     let trusted = onboarding::request_accessibility_prompt();
     if trusted {
         shortcut::install_fn_shortcut_monitor(app);
+    } else {
+        open_macos_permission_settings(&app, "accessibility")?;
     }
     Ok(trusted)
 }
@@ -300,9 +333,14 @@ fn complete_onboarding(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<UiState, String> {
-    onboarding::validate_completion(onboarding::microphone_permission(), privacy_confirmed)?;
+    let permissions = onboarding::current_status();
+    onboarding::validate_completion(
+        permissions.microphone,
+        permissions.accessibility,
+        privacy_confirmed,
+    )?;
     let ui = state.complete_onboarding()?;
-    if onboarding::accessibility_is_trusted() {
+    if permissions.accessibility {
         shortcut::install_fn_shortcut_monitor(app);
     }
     Ok(ui)
@@ -498,10 +536,17 @@ pub fn run() {
             app.manage(instance_guard);
             app.manage(state);
             app.manage(shortcut::ShortcutCaptureState::default());
-            let initial_state = app.state::<AppState>().snapshot();
+            let state = app.state::<AppState>();
+            let mut initial_state = state.snapshot();
+            let accessibility_trusted = onboarding::accessibility_is_trusted();
+            if initial_state.onboarding_completed && !accessibility_trusted {
+                initial_state = state
+                    .require_onboarding("辅助功能权限已关闭，请重新开启后再继续使用 JackVoice。")
+                    .map_err(Box::<dyn std::error::Error>::from)?;
+            }
             if shortcut::should_install_fn_monitor_at_startup(
                 initial_state.onboarding_completed,
-                onboarding::accessibility_is_trusted(),
+                accessibility_trusted,
             ) {
                 shortcut::install_fn_shortcut_monitor(app.handle().clone());
             }
@@ -584,6 +629,7 @@ pub fn run() {
             set_input_gain,
             set_history_text_size,
             get_permissions,
+            open_permission_settings,
             request_accessibility_permission,
             check_accessibility_permission,
             complete_onboarding,

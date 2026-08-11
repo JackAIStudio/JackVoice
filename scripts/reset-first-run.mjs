@@ -5,12 +5,13 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   renameSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, platform } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import process from "node:process";
 
 const variants = {
@@ -154,14 +155,120 @@ function cargoTargetDirectory() {
   return JSON.parse(raw).target_directory;
 }
 
-function appBundlePath(variant) {
-  return join(cargoTargetDirectory(), "release", "bundle", "macos", `${variant.productName}.app`);
+function appBuildTargetDirectory() {
+  const explicit = process.env.CARGO_TARGET_DIR?.trim();
+  if (explicit) return resolve(process.cwd(), explicit);
+
+  // This repository may live in iCloud Drive's Desktop/Documents folders.
+  // File Provider immediately reattaches com.apple.FinderInfo to generated
+  // .app bundles there, which makes strict codesign verification fail before
+  // the QA script can open the app. Keep packaged QA artifacts in the local
+  // user cache, outside cloud-synced workspace metadata.
+  if (platform() === "darwin") {
+    return join(homedir(), "Library", "Caches", "JackVoice", "qa-cargo-target");
+  }
+  return cargoTargetDirectory();
 }
 
-function buildDesktopApp(variant) {
+function appBundlePath(variant, targetDirectory) {
+  return join(targetDirectory, "release", "bundle", "macos", `${variant.productName}.app`);
+}
+
+function launchServicesTool() {
+  return "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+}
+
+function normalizedPath(path) {
+  try {
+    return realpathSync(path).toLocaleLowerCase("en-US");
+  } catch {
+    return resolve(path).toLocaleLowerCase("en-US");
+  }
+}
+
+function registeredAppPaths(identifier) {
+  const dump = execFileSync(launchServicesTool(), ["-dump"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "inherit"],
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  const paths = [];
+  for (const record of dump.split(/\n-{20,}\n/)) {
+    const registeredIdentifier = record.match(/^identifier:\s+(.+?)\s*$/m)?.[1];
+    if (registeredIdentifier !== identifier) continue;
+    const path = record.match(/^path:\s+(.+?)\s+\(0x[0-9a-f]+\)\s*$/im)?.[1];
+    if (path) paths.push(path);
+  }
+  return [...new Set(paths)];
+}
+
+function indexedAppPaths(identifier) {
+  try {
+    const output = execFileSync(
+      "/usr/bin/mdfind",
+      [`kMDItemCFBundleIdentifier == '${identifier}'`],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    );
+    return output.split("\n").map((path) => path.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function isGeneratedAppBundle(path, productName) {
+  const normalized = normalizedPath(path);
+  const expectedSuffix = `/release/bundle/macos/${productName.toLocaleLowerCase("en-US")}.app`;
+  return (
+    normalized.endsWith(expectedSuffix) &&
+    (normalized.includes("/target/") || normalized.includes("/library/caches/"))
+  );
+}
+
+function quarantineGeneratedAppBundle(path) {
+  const suffix = `.qa-disabled-${timestamp()}`;
+  const quarantinedPath = path.toLocaleLowerCase("en-US").endsWith(".app")
+    ? `${path.slice(0, -4)}${suffix}`
+    : `${path}${suffix}`;
+  renameSync(path, quarantinedPath);
+  console.log(`[first-run] 已隔离旧开发包：${quarantinedPath}`);
+}
+
+function registerOnlyCurrentApp(identifier, productName, currentAppPath) {
+  const normalizedCurrent = normalizedPath(currentAppPath);
+  const stalePaths = [...new Set([
+    ...registeredAppPaths(identifier),
+    ...indexedAppPaths(identifier),
+  ])].filter((path) => normalizedPath(path) !== normalizedCurrent);
+  for (const stalePath of stalePaths) {
+    console.log(`[first-run] 注销旧开发包：${stalePath}`);
+    try {
+      execFileSync(launchServicesTool(), ["-u", stalePath], { stdio: "inherit" });
+    } catch {
+      // Spotlight can still index an app that LaunchServices has already
+      // forgotten. The final registry verification below remains authoritative.
+      console.log("[first-run] 该副本已不在 LaunchServices 注册表中，继续隔离文件。");
+    }
+    if (existsSync(stalePath) && isGeneratedAppBundle(stalePath, productName)) {
+      quarantineGeneratedAppBundle(stalePath);
+    }
+  }
+  execFileSync(launchServicesTool(), ["-f", currentAppPath], { stdio: "inherit" });
+  const remainingStalePaths = registeredAppPaths(identifier).filter(
+    (path) => normalizedPath(path) !== normalizedCurrent,
+  );
+  if (remainingStalePaths.length > 0) {
+    throw new Error(
+      `仍有同 Bundle ID 的 JackVoice 副本被系统注册，请先移走后重试：\n${remainingStalePaths.join("\n")}`,
+    );
+  }
+  console.log(`[first-run] 已注册本次测试包：${currentAppPath}`);
+}
+
+function buildDesktopApp(variant, targetDirectory) {
   const npmCommand = platform() === "win32" ? "npm.cmd" : "npm";
   execFileSync(npmCommand, ["run", variant.buildScript], {
     cwd: process.cwd(),
+    env: { ...process.env, CARGO_TARGET_DIR: targetDirectory },
     stdio: "inherit",
   });
 }
@@ -182,6 +289,8 @@ function writePrivateText(path, value) {
 
 function resetFirstRun(target, options) {
   const variant = variants[target];
+  const buildTargetDirectory =
+    options.build || options.open ? appBuildTargetDirectory() : undefined;
   if (options.forgetCredential && target !== "dev") {
     throw new Error(
       "--forget-credential 只支持开发版。正式版 App Key 位于系统凭据库，请在应用设置中主动移除。",
@@ -207,7 +316,8 @@ function resetFirstRun(target, options) {
 
   if (options.build) {
     console.log(`[first-run] 构建：npm run ${variant.buildScript}`);
-    if (!options.dryRun) buildDesktopApp(variant);
+    console.log(`[first-run] 构建缓存：${buildTargetDirectory}`);
+    if (!options.dryRun) buildDesktopApp(variant, buildTargetDirectory);
   }
 
   const variantDirectory = join(dataRoot(), variant.identifier);
@@ -272,11 +382,12 @@ function resetFirstRun(target, options) {
     if (platform() !== "darwin") {
       throw new Error("--open 目前只支持 macOS .app。");
     }
-    const appPath = appBundlePath(variant);
+    const appPath = appBundlePath(variant, buildTargetDirectory);
     if (!existsSync(appPath)) {
       throw new Error(`找不到 ${appPath}，请先执行：npm run ${variant.buildScript}`);
     }
-    execFileSync("/usr/bin/open", [appPath]);
+    registerOnlyCurrentApp(variant.identifier, variant.productName, appPath);
+    execFileSync("/usr/bin/open", ["-n", appPath]);
     console.log(`[first-run] 已打开：${appPath}`);
   }
 
