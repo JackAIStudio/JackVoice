@@ -1798,6 +1798,23 @@ input[type="range"]#gain-db {
   gap: 6px;
   justify-content: flex-end;
 }
+.replacement-match-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 0 10px;
+  padding: 9px 10px;
+  border-radius: 10px;
+  background: var(--card-soft);
+  color: rgba(15, 23, 42, 0.62);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.replacement-match-note strong {
+  flex: 0 0 auto;
+  color: rgba(15, 23, 42, 0.78);
+  font-weight: 650;
+}
 .dict-panel .dict-editor {
   margin-bottom: 12px;
 }

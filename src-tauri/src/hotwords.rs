@@ -1,5 +1,6 @@
 use crate::storage;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -87,6 +88,7 @@ pub fn sanitize(words: &[String]) -> Vec<String> {
 /// 清洗用户手写的替换规则。
 pub fn sanitize_replacements(rules: &[ReplacementRule]) -> Vec<ReplacementRule> {
     let mut out: Vec<ReplacementRule> = Vec::new();
+    let mut indexes_by_source: HashMap<String, usize> = HashMap::new();
     for rule in rules {
         let from = rule.from.trim().to_string();
         let to = rule.to.trim().to_string();
@@ -95,13 +97,14 @@ pub fn sanitize_replacements(rules: &[ReplacementRule]) -> Vec<ReplacementRule> 
         }
         // 允许 from == to 作为“短语锁”，避免短词规则误伤长短语。
         // 例如保留 “DaVinci Playground”，防止被 “DaVinci → 达芬奇” 拆坏。
-        if out.iter().any(|r| r.from == from) {
-            // 同 from 后写覆盖先写
-            if let Some(existing) = out.iter_mut().find(|r| r.from == from) {
-                existing.to = to;
-            }
+        // 实际替换忽略大小写，保存时也必须用同样的规则去重；保留首次录入的
+        // from 写法用于展示，同一来源后写的目标覆盖先写的目标。
+        let source_key = from.to_lowercase();
+        if let Some(index) = indexes_by_source.get(&source_key).copied() {
+            out[index].to = to;
             continue;
         }
+        indexes_by_source.insert(source_key, out.len());
         out.push(ReplacementRule { from, to });
     }
     // 长 from 优先，避免短词抢先。
@@ -241,6 +244,30 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_replacements_deduplicates_sources_case_insensitively() {
+        let rules = vec![
+            ReplacementRule {
+                from: "Chrome DevTools".into(),
+                to: "旧写法".into(),
+            },
+            ReplacementRule {
+                from: "chrome devtools".into(),
+                to: "Chrome DevTools".into(),
+            },
+            ReplacementRule {
+                from: "ChromeDevTools".into(),
+                to: "Chrome DevTools".into(),
+            },
+        ];
+
+        let cleaned = sanitize_replacements(&rules);
+        assert_eq!(cleaned.len(), 2);
+        assert_eq!(cleaned[0].from, "Chrome DevTools");
+        assert_eq!(cleaned[0].to, "Chrome DevTools");
+        assert_eq!(cleaned[1].from, "ChromeDevTools");
+    }
+
+    #[test]
     fn apply_replacements_uses_user_rules() {
         let rules = vec![
             ("ChromeDevTools".into(), "Chrome DevTools".into()),
@@ -248,6 +275,10 @@ mod tests {
         ];
         assert_eq!(
             apply_replacements("导出 Broll 到 ChromeDevTools", &rules),
+            "导出 B roll 到 Chrome DevTools"
+        );
+        assert_eq!(
+            apply_replacements("导出 bROLL 到 chromedevtools", &rules),
             "导出 B roll 到 Chrome DevTools"
         );
     }

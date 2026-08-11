@@ -1490,6 +1490,10 @@ function parseReplacementInput(): ReplacementRule[] {
   return out;
 }
 
+function replacementSourceKey(value: string): string {
+  return value.trim().toLowerCase();
+}
+
 function syncReplacementEditorButtons() {
   const textarea = $("#replacements-input") as HTMLTextAreaElement | null;
   const has = !!textarea && textarea.value.trim().length > 0;
@@ -1523,9 +1527,14 @@ async function saveReplacementsFromEditor() {
   }
   const merged = [...replacements];
   for (const rule of incoming) {
-    const idx = merged.findIndex((r) => r.from === rule.from);
-    if (idx >= 0) merged[idx] = rule;
-    else merged.push(rule);
+    const sourceKey = replacementSourceKey(rule.from);
+    const idx = merged.findIndex((r) => replacementSourceKey(r.from) === sourceKey);
+    if (idx >= 0) {
+      // 匹配本身忽略大小写：保留首次录入的展示写法，只更新替换目标。
+      merged[idx] = { from: merged[idx].from, to: rule.to };
+    } else {
+      merged.push(rule);
+    }
   }
   try {
     const result = await persistReplacements(merged);

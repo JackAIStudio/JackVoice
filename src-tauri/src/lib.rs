@@ -82,7 +82,7 @@ async fn save_hotwords(
 
 #[tauri::command]
 fn get_replacements(state: tauri::State<'_, AppState>) -> Vec<ReplacementRule> {
-    hotwords::load_replacements(&state.data_dir())
+    hotwords::sanitize_replacements(&hotwords::load_replacements(&state.data_dir()))
 }
 
 #[tauri::command]

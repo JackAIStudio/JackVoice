@@ -130,7 +130,7 @@
               <div class="dict-panel-head">
                 <div>
                   <h2 class="dict-panel-title">替换词</h2>
-                  <p class="dict-panel-desc">把识别结果里的 A 手动改成 B（本地后处理，不走云端）</p>
+                  <p class="dict-panel-desc">听写后在本地把识别结果里的 A 改成 B，替换规则不上传云端</p>
                 </div>
                 <div class="dict-panel-actions">
                   <button id="replacements-clear" class="btn ghost" disabled>清空</button>
@@ -138,8 +138,12 @@
                   <button id="replacements-add" class="btn ghost">添加规则</button>
                 </div>
               </div>
+              <div class="replacement-match-note" role="note">
+                <strong>匹配说明</strong>
+                <span>自动忽略英文字母大小写，大小写不同的重复规则会自动合并；空格、标点和拼写必须一致。例如“Chrome DevTools → Chrome DevTools”也能把“chrome devtools”统一为正确写法。</span>
+              </div>
               <div class="dict-editor">
-                <textarea id="replacements-input" placeholder="每行一条：识别结果|想要的写法&#10;例：Broll|B roll&#10;funasr|fun-asr&#10;ChromeDevTools|Chrome DevTools&#10;OpenCloud|OpenClaw"></textarea>
+                <textarea id="replacements-input" placeholder="每行一条：识别结果|想要的写法&#10;同一识别词仅大小写不同时，会自动合并&#10;例：Broll|B roll&#10;ChromeDevTools|Chrome DevTools&#10;OpenCloud|OpenClaw"></textarea>
                 <span id="replacements-count" class="dict-count">0 条替换</span>
               </div>
               <div class="dict-manage-head">
