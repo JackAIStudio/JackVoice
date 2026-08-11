@@ -1,11 +1,43 @@
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { platform } from "node:os";
+import { homedir, platform } from "node:os";
 import { join } from "node:path";
+
+import {
+  discoverProductionSigningIdentity,
+  productionAppPath,
+  productionSigningConfig,
+  verifyProductionApp,
+} from "./macos-signing.mjs";
+import {
+  RELEASE_BUILD_ID_ENV,
+  createDeliveryArtifact,
+  detachMountedJackVoiceBuildImages,
+  productionBundleDirectory,
+  productionDmgPath,
+  resolveReleaseBuildId,
+  validateReleaseVersions,
+} from "./release-artifacts.mjs";
 
 const cliArgs = new Set(process.argv.slice(2));
 const build = cliArgs.has("--build");
 const production = cliArgs.has("--production");
+const packageMetadata = JSON.parse(
+  readFileSync(join(process.cwd(), "package.json"), "utf8"),
+);
+const tauriMetadata = JSON.parse(
+  readFileSync(join(process.cwd(), "src-tauri", "tauri.conf.json"), "utf8"),
+);
+const cargoVersion = readFileSync(join(process.cwd(), "src-tauri", "Cargo.toml"), "utf8")
+  .match(/^version\s*=\s*"([^"]+)"$/m)?.[1];
+const releaseVersion = validateReleaseVersions({
+  package: packageMetadata.version,
+  tauri: tauriMetadata.version,
+  cargo: cargoVersion || "missing",
+});
+const releaseBuildId = build && production && platform() === "darwin"
+  ? resolveReleaseBuildId(process.env[RELEASE_BUILD_ID_ENV])
+  : null;
 const npmCommand = platform() === "win32" ? "npm.cmd" : "npm";
 const args = [
   "run",
@@ -25,6 +57,13 @@ if (build && !production && platform() === "darwin") {
 function resolveCargoTargetDir() {
   if (process.env.CARGO_TARGET_DIR?.trim()) {
     return process.env.CARGO_TARGET_DIR.trim();
+  }
+  // A signed .app cannot contain FinderInfo/resource-fork metadata. iCloud
+  // File Provider may attach it immediately when the repository lives in
+  // Desktop/Documents, before Tauri reaches codesign. Keep production bundle
+  // artifacts in a local, non-synced cache so signing is deterministic.
+  if (build && production && platform() === "darwin") {
+    return join(homedir(), "Library", "Caches", "JackVoice", "release-cargo-target");
   }
   const metadata = execFileSync(
     "cargo",
@@ -141,7 +180,33 @@ function repairIncompatibleWebRtcCache(cargoTargetDir, env) {
 const cargoTargetDir = resolveCargoTargetDir();
 console.log(`[JackVoice] Cargo 构建缓存: ${cargoTargetDir}`);
 const buildEnvironment = resolveBuildEnvironment(cargoTargetDir);
+buildEnvironment.VITE_JACKVOICE_VERSION = releaseVersion;
+buildEnvironment.VITE_JACKVOICE_BUILD_ID = releaseBuildId || "development";
+if (releaseBuildId) buildEnvironment[RELEASE_BUILD_ID_ENV] = releaseBuildId;
 repairIncompatibleWebRtcCache(cargoTargetDir, buildEnvironment);
+
+let productionSigning = null;
+if (build && production && platform() === "darwin") {
+  try {
+    const detachedImages = detachMountedJackVoiceBuildImages(
+      productionBundleDirectory(cargoTargetDir),
+    );
+    if (detachedImages.length > 0) {
+      console.log(
+        `[JackVoice] 构建前已弹出 ${detachedImages.length} 个旧产物挂载，防止 macOS 复用旧镜像。`,
+      );
+    }
+    productionSigning = discoverProductionSigningIdentity(buildEnvironment);
+    const signingConfig = productionSigningConfig(productionSigning);
+    if (signingConfig) args.push("--config", signingConfig);
+    console.log(
+      `[JackVoice] 生产签名预检通过：Team ID ${productionSigning.teamId ?? "由 CI 证书提供"}`,
+    );
+  } catch (error) {
+    console.error(`[JackVoice] 生产构建已阻止：${error.message}`);
+    process.exit(1);
+  }
+}
 
 const child = spawn(npmCommand, args, {
   cwd: process.cwd(),
@@ -155,7 +220,12 @@ child.on("error", (error) => {
 });
 
 child.on("exit", (code, signal) => {
-  if (!signal && code === 0 && build && !production && platform() === "darwin") {
+  if (signal || code !== 0) {
+    process.exitCode = 1;
+    return;
+  }
+
+  if (build && !production && platform() === "darwin") {
     const appPath = join(
       cargoTargetDir,
       "release",
@@ -188,5 +258,32 @@ child.on("exit", (code, signal) => {
       return;
     }
   }
-  process.exitCode = signal ? 1 : (code ?? 1);
+
+  if (build && production && platform() === "darwin") {
+    try {
+      const appPath = productionAppPath(cargoTargetDir);
+      const verified = verifyProductionApp(appPath, productionSigning?.teamId);
+      console.log(
+        `[JackVoice] 生产签名验收通过：${verified.bundleIdentifier} / Team ID ${verified.teamId}`,
+      );
+      const delivery = createDeliveryArtifact({
+        sourceDmgPath: productionDmgPath(cargoTargetDir, releaseVersion),
+        buildId: releaseBuildId,
+        version: releaseVersion,
+        bundleIdentifier: verified.bundleIdentifier,
+        teamId: verified.teamId,
+        appExecutablePath: join(appPath, "Contents", "MacOS", "jackvoice"),
+      });
+      console.log(`[JackVoice] 本次构建标识：${delivery.buildId}`);
+      console.log(`[JackVoice] 唯一交付包：${delivery.deliveryPath}`);
+      console.log(`[JackVoice] SHA-256：${delivery.dmgSha256}`);
+      console.log(`[JackVoice] 交付清单：${delivery.manifestPath}`);
+    } catch (error) {
+      console.error(`[JackVoice] 生产构建已拒绝：${error.message}`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  process.exitCode = 0;
 });

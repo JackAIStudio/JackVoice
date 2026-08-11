@@ -230,13 +230,15 @@ fn stop_mic_test(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<Ui
 }
 
 #[tauri::command]
-fn save_volc_settings(
+async fn save_volc_settings(
     api_key: String,
     resource_id: String,
     boosting_table_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<UiState, String> {
-    state.save_volc_settings(api_key, resource_id, boosting_table_id)
+    state
+        .save_volc_settings(api_key, resource_id, boosting_table_id)
+        .await
 }
 
 #[tauri::command]

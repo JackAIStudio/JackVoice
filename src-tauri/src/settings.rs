@@ -12,7 +12,7 @@ const VARIANT_SETTINGS_FILE: &str = "variant-settings.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
-    /// 豆包流式录音识别所需的 App Key（请求头为 X-Api-Key）。
+    /// 豆包流式录音识别所需的 API Key（请求头为 X-Api-Key）。
     #[serde(default)]
     pub volc_api_key: String,
     /// 豆包流式录音识别资源 ID，默认小时版 Seed-ASR 2.0。
@@ -262,7 +262,7 @@ fn default_semantic_punctuation_enabled() -> bool {
 }
 
 fn default_max_sentence_silence_ms() -> u32 {
-    1300
+    0
 }
 
 fn default_history_text_size() -> String {
@@ -371,6 +371,11 @@ mod tests {
         assert!(shared_raw.contains("\"historyTextSize\": \"standard\""));
         assert!(shared_raw.contains("\"semanticSmoothingEnabled\": false"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disables_pause_endpointing_by_default() {
+        assert_eq!(AppSettings::default().max_sentence_silence_ms, 0);
     }
 
     #[test]

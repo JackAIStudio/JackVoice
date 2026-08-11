@@ -332,23 +332,23 @@
               <input id="volc-table-id" type="hidden" />
               <div class="set-row credential-row">
                 <div>
-                  <div class="set-title">豆包语音</div>
+                  <div class="set-title">豆包语音 API Key</div>
                   <div class="set-desc" id="volc-credential-hint">连接后即可开始听写。</div>
                 </div>
                 <div class="credential-control">
                   <div class="credential-summary">
                     <span id="masked-volc-key" class="service-status disconnected"><i></i>未连接</span>
-                    <button id="test-volc-btn" class="btn ghost small hidden" type="button">测试连接</button>
-                    <button id="edit-volc-btn" class="btn ghost small" type="button">配置 App Key</button>
+                    <button id="test-volc-btn" class="btn ghost small hidden" type="button">验证</button>
+                    <button id="edit-volc-btn" class="btn ghost small hidden" type="button">更换 API Key</button>
                   </div>
                   <div id="volc-credential-editor" class="credential-editor hidden">
                     <div class="inline-fields">
-                      <input id="volc-api-key" class="text-input" type="password" placeholder="粘贴豆包语音 App Key" autocomplete="off" />
-                      <button id="save-volc-btn" class="btn dark small" type="button">保存并验证</button>
-                      <button id="cancel-volc-btn" class="btn ghost small" type="button">取消</button>
+                      <input id="volc-api-key" class="text-input" type="password" placeholder="粘贴豆包语音 API Key" autocomplete="off" />
+                      <button id="save-volc-btn" class="btn dark small" type="button">验证并保存</button>
+                      <button id="cancel-volc-btn" class="btn ghost small hidden" type="button">取消</button>
                     </div>
                     <div class="credential-editor-footer">
-                      <a class="external-help-link" data-external-link href="https://console.volcengine.com/speech/new/">前往豆包语音控制台获取 App Key ↗</a>
+                      <a class="external-help-link" data-external-link href="https://console.volcengine.com/speech/new/">前往豆包语音控制台获取 API Key ↗</a>
                       <button id="remove-volc-btn" class="text-button danger hidden" type="button">移除凭据</button>
                     </div>
                   </div>
@@ -378,14 +378,22 @@
               <div class="set-row">
                 <div>
                   <div class="set-title">停顿后自动断句</div>
-                  <div class="set-desc">说话停顿达到所选时间后，自动结束当前句。</div>
+                  <div class="set-desc">可按停顿结束当前句；关闭后在停止听写时统一定稿。</div>
                 </div>
                 <select id="silence-ms" aria-label="停顿后自动断句时间">
+                  <option value="0" selected>关闭 · 停止听写时定稿</option>
                   <option value="800">较快 · 0.8 秒</option>
-                  <option value="1300" selected>标准 · 1.3 秒</option>
+                  <option value="1300">标准 · 1.3 秒</option>
                   <option value="2000">较慢 · 2 秒</option>
                   <option value="3000">最长 · 3 秒</option>
                 </select>
+              </div>
+              <div class="set-row">
+                <div>
+                  <div class="set-title">单次听写时长保护</div>
+                  <div class="set-desc">达到上限后自动停止、定稿并保存，防止忘记结束时持续占用语音服务。</div>
+                </div>
+                <span class="set-value">30 分钟</span>
               </div>
             </section>
           </div>
@@ -393,7 +401,7 @@
           <div id="tab-about" class="tab">
             <h2>关于</h2>
             <div class="about-block">
-              <strong>JackVoice</strong> · v0.1.0<br />
+              <strong>JackVoice</strong> · <span id="app-build-version">v0.1.1 · build unknown</span><br />
               开源全局语音听写器：按快捷键说话，识别结果自动插入当前焦点或剪贴板。<br />
               识别核心：火山引擎豆包流式语音识别模型 2.0（Seed-ASR 2.0，双向流式优化版 + 二遍识别），支持自定义词库。
               <br />源代码采用 Apache-2.0 许可证；语音会发送至用户自行配置的火山引擎服务。
@@ -479,22 +487,23 @@
           <!-- 4 · 识别服务 -->
           <section class="ob-pane" data-pane="4">
             <h2>连接语音服务 <span class="ob-requirement optional">可跳过</span></h2>
-            <p>JackVoice 使用你自己的豆包语音服务。没有 App Key 也可以先使用本地录音，只是不会生成识别文字。</p>
+            <p>JackVoice 使用你自己的豆包语音服务。没有 API Key 也可以先使用本地录音，只是不会生成识别文字。</p>
             <div class="set-row ob-key-row">
               <div>
-                <div class="set-title">豆包语音 App Key</div>
+                <div class="set-title">豆包语音 API Key</div>
                 <div class="set-desc" id="ob-key-desc">可以跳过，稍后再到设置中配置。</div>
-                <a class="external-help-link" data-external-link href="https://console.volcengine.com/speech/new/">前往豆包语音控制台获取 App Key ↗</a>
+                <a class="external-help-link" data-external-link href="https://console.volcengine.com/speech/new/">前往豆包语音控制台获取 API Key ↗</a>
               </div>
               <div class="credential-control">
                 <div id="ob-key-summary" class="credential-summary hidden">
-                  <span class="service-status connected"><i></i>已连接</span>
-                  <button id="ob-edit-volc-key" class="btn ghost small" type="button">更换 App Key</button>
+                  <span id="ob-key-status" class="service-status configured"><i></i>已配置 · 待验证</span>
+                  <button id="ob-test-volc-key" class="btn ghost small" type="button">验证</button>
+                  <button id="ob-edit-volc-key" class="btn ghost small" type="button">更换 API Key</button>
                 </div>
                 <div id="ob-key-editor" class="credential-editor">
                   <div class="inline-fields">
-                    <input id="ob-volc-api-key" class="text-input" type="password" placeholder="粘贴豆包语音 App Key" autocomplete="off" />
-                    <button id="ob-save-volc-key" class="btn dark small" type="button">保存并验证</button>
+                    <input id="ob-volc-api-key" class="text-input" type="password" placeholder="粘贴豆包语音 API Key" autocomplete="off" />
+                    <button id="ob-save-volc-key" class="btn dark small" type="button">验证并保存</button>
                     <button id="ob-cancel-volc-key" class="btn ghost small hidden" type="button">取消</button>
                   </div>
                 </div>

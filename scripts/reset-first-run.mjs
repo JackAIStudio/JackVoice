@@ -35,10 +35,10 @@ function usage() {
   --quit               先退出正在运行的目标应用（QA 编排使用）
   --build              重置前构建对应的桌面应用
   --open               重置后打开已构建的 macOS .app
-  --forget-credential  同时移走开发版 App Key（会先备份；正式版不支持）
+  --forget-credential  同时移走开发版 API Key（会先备份；正式版不支持）
   --dry-run            只显示将执行的操作
 
-默认保留共享历史、录音、词库、识别设置和 App Key。`);
+默认保留共享历史、录音、词库、识别设置和 API Key。`);
 }
 
 const args = process.argv.slice(2);
@@ -293,12 +293,12 @@ function resetFirstRun(target, options) {
     options.build || options.open ? appBuildTargetDirectory() : undefined;
   if (options.forgetCredential && target !== "dev") {
     throw new Error(
-      "--forget-credential 只支持开发版。正式版 App Key 位于系统凭据库，请在应用设置中主动移除。",
+      "--forget-credential 只支持开发版。正式版 API Key 位于系统凭据库，请在应用设置中主动移除。",
     );
   }
   if (options.forgetCredential && process.env.JACKVOICE_VOLC_API_KEY?.trim()) {
     throw new Error(
-      "当前 shell 设置了 JACKVOICE_VOLC_API_KEY；请先 unset 该变量，否则应用仍会读取开发 App Key。",
+      "当前 shell 设置了 JACKVOICE_VOLC_API_KEY；请先 unset 该变量，否则应用仍会读取开发 API Key。",
     );
   }
 
@@ -341,7 +341,7 @@ function resetFirstRun(target, options) {
     console.log(`[first-run] macOS 权限：tccutil reset All ${variant.identifier}`);
   }
   if (options.forgetCredential) {
-    console.log(`[first-run] 开发版 App Key：移至 ${backupDirectory}`);
+    console.log(`[first-run] 开发版 API Key：移至 ${backupDirectory}`);
   }
   console.log("[first-run] 共享历史、录音、词库和识别设置：保留");
 

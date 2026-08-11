@@ -8,7 +8,7 @@ body:
     attributes:
       label: 隐私与安全确认
       options:
-        - label: 我已删除 App Key、Token、录音、私人转写文本、个人路径和其他敏感信息。
+        - label: 我已删除 API Key、Token、录音、私人转写文本、个人路径和其他敏感信息。
           required: true
         - label: 这不是尚未修复的安全漏洞；安全问题应使用私密漏洞报告入口。
           required: true

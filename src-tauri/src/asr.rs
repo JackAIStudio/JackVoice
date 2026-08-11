@@ -254,9 +254,13 @@ fn recognition_request(
         "ssd_version": "200",
         "show_utterances": true,
         "result_type": "full",
-        "end_window_size": max_sentence_silence_ms.max(200),
-        "force_to_speech_time": 1000,
     });
+    // 0 表示关闭 JackVoice 的强制停顿判停；此时不向服务端传入
+    // end_window_size 及其配套参数，只在用户停止听写后请求最终结果。
+    if max_sentence_silence_ms != 0 {
+        request["end_window_size"] = json!(max_sentence_silence_ms.max(200));
+        request["force_to_speech_time"] = json!(1000);
+    }
     if !corpus.as_object().map(|map| map.is_empty()).unwrap_or(true) {
         request["corpus"] = corpus;
     }
@@ -291,7 +295,7 @@ impl RealtimeSession {
         let api_key = config.api_key.trim().to_string();
         if api_key.is_empty() {
             return Err(AsrError::Message(
-                "尚未配置豆包语音 App Key，请先在设置里保存。".into(),
+                "尚未配置豆包语音 API Key，请先在设置里保存。".into(),
             ));
         }
         let resource_id = if config.resource_id.trim().is_empty() {
@@ -336,7 +340,7 @@ impl RealtimeSession {
             headers.insert(
                 "X-Api-Key",
                 HeaderValue::from_str(&api_key)
-                    .map_err(|e| AsrError::Message(format!("豆包语音 App Key 无效：{e}")))?,
+                    .map_err(|e| AsrError::Message(format!("豆包语音 API Key 无效：{e}")))?,
             );
             headers.insert(
                 "X-Api-Resource-Id",
@@ -657,11 +661,11 @@ impl RealtimeSession {
     }
 }
 
-/// 向真实识别服务发送会话初始化请求，验证 App Key 与资源 ID。
+/// 向真实识别服务发送会话初始化请求，验证 API Key 与资源 ID。
 ///
 /// 该测试不打开麦克风，也不发送音频；服务端接受初始化请求后立即关闭会话。
 pub async fn test_connection(config: VolcAsrConfig) -> Result<(), AsrError> {
-    let session = RealtimeSession::connect(config, false, false, 1300, Vec::new(), |_| {}).await?;
+    let session = RealtimeSession::connect(config, false, false, 0, Vec::new(), |_| {}).await?;
     session.cancel().await;
     Ok(())
 }
@@ -723,11 +727,16 @@ mod volc_protocol_tests {
         assert_eq!(enabled["enable_punc"], true);
         assert_eq!(enabled["enable_ddc"], true);
         assert_eq!(enabled["end_window_size"], 1300);
+        assert_eq!(enabled["force_to_speech_time"], 1000);
 
-        let disabled = recognition_request(false, false, 100, json!({}));
+        let disabled = recognition_request(false, false, 0, json!({}));
         assert_eq!(disabled["enable_punc"], false);
         assert_eq!(disabled["enable_ddc"], false);
-        assert_eq!(disabled["end_window_size"], 200);
+        assert!(disabled.get("end_window_size").is_none());
+        assert!(disabled.get("force_to_speech_time").is_none());
+
+        let clamped = recognition_request(false, false, 100, json!({}));
+        assert_eq!(clamped["end_window_size"], 200);
     }
 
     #[test]

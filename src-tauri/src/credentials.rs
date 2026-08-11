@@ -88,7 +88,7 @@ impl SecretStore for NativeSecretStore {
         with_noninteractive_system_store(|| match entry(service)?.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(Error::NoEntry) => Ok(None),
-            Err(error) => Err(format!("无法从系统凭据库读取豆包 App Key：{error}")),
+            Err(error) => Err(format!("无法从系统凭据库读取豆包 API Key：{error}")),
         })
     }
 
@@ -99,12 +99,12 @@ impl SecretStore for NativeSecretStore {
             if value.is_empty() {
                 return match entry.delete_credential() {
                     Ok(()) | Err(Error::NoEntry) => Ok(()),
-                    Err(error) => Err(format!("无法从系统凭据库删除豆包 App Key：{error}")),
+                    Err(error) => Err(format!("无法从系统凭据库删除豆包 API Key：{error}")),
                 };
             }
             entry
                 .set_password(value)
-                .map_err(|error| format!("无法把豆包 App Key 保存到系统凭据库：{error}"))
+                .map_err(|error| format!("无法把豆包 API Key 保存到系统凭据库：{error}"))
         })
     }
 }
@@ -208,7 +208,7 @@ fn load_development(
         Ok(None) => {}
         Err(error) => {
             return CredentialLoad::missing(format!(
-                "开发版本地凭据暂不可用，JackVoice 已继续启动。请重新填写 App Key。{error}"
+                "开发版本地凭据暂不可用，JackVoice 已继续启动。请重新填写 API Key。{error}"
             ));
         }
     }
@@ -219,7 +219,7 @@ fn load_development(
     // development credential file.
     if development_migration_marker_path(path).is_file() {
         return CredentialLoad::missing(
-            "开发版尚未连接豆包语音。请在设置中填写 App Key；保存后会写入开发版私有凭据文件。",
+            "开发版尚未连接豆包语音。请在设置中填写 API Key；保存后会写入开发版私有凭据文件。",
         );
     }
 
@@ -240,7 +240,7 @@ fn load_development(
     let _ = mark_development_migration_complete(path);
 
     CredentialLoad::missing(
-        "开发版尚未连接豆包语音。请在设置中填写 App Key；保存后会写入开发版私有凭据文件。",
+        "开发版尚未连接豆包语音。请在设置中填写 API Key；保存后会写入开发版私有凭据文件。",
     )
 }
 
@@ -252,9 +252,12 @@ fn load_production(store: &impl SecretStore) -> CredentialLoad {
             warning: String::new(),
         },
         Ok(_) => migrate_legacy_credential(store),
-        Err(error) => CredentialLoad::missing(format!(
-            "系统凭据库暂时不可用，JackVoice 已继续启动。请在设置中重新填写 App Key。{error}"
-        )),
+        Err(error) => {
+            eprintln!("[credentials] 正式版凭据读取失败：{error}");
+            CredentialLoad::missing(
+                "系统凭据库中的 API Key 当前不可用。请重新填写一次；保存后会绑定当前稳定的正式版身份。",
+            )
+        }
     }
 }
 
@@ -318,15 +321,18 @@ fn migrate_legacy_credential(store: &impl SecretStore) -> CredentialLoad {
                     value,
                     source: CredentialSource::LegacyMigration,
                     warning: format!(
-                        "旧版 App Key 本次可用，但迁移到新的正式版凭据条目失败：{error}"
+                        "旧版 API Key 本次可用，但迁移到新的正式版凭据条目失败：{error}"
                     ),
                 },
             }
         }
         Ok(_) => CredentialLoad::missing(String::new()),
-        Err(error) => CredentialLoad::missing(format!(
-            "检测旧版凭据时遇到问题，已跳过且不会弹出系统密码框。请在设置中重新填写 App Key。{error}"
-        )),
+        Err(error) => {
+            eprintln!("[credentials] 旧版凭据迁移读取失败：{error}");
+            CredentialLoad::missing(
+                "旧版 API Key 已无法由当前应用身份读取。请重新填写一次；保存后会绑定稳定的正式版身份，后续升级可继续使用。",
+            )
+        }
     }
 }
 
@@ -375,6 +381,7 @@ mod tests {
     struct FakeStore {
         values: RefCell<HashMap<String, String>>,
         load_error: RefCell<Option<String>>,
+        load_errors: RefCell<HashMap<String, String>>,
         calls: RefCell<Vec<String>>,
     }
 
@@ -382,6 +389,9 @@ mod tests {
         fn load(&self, service: &str) -> Result<Option<String>, String> {
             self.calls.borrow_mut().push(format!("load:{service}"));
             if let Some(error) = self.load_error.borrow().clone() {
+                return Err(error);
+            }
+            if let Some(error) = self.load_errors.borrow().get(service).cloned() {
                 return Err(error);
             }
             Ok(self.values.borrow().get(service).cloned())
@@ -536,7 +546,9 @@ mod tests {
         let loaded = load_production(&store);
         assert!(loaded.value.is_empty());
         assert_eq!(loaded.source, CredentialSource::Missing);
-        assert!(loaded.warning.contains("继续启动"));
+        assert!(loaded.warning.contains("当前不可用"));
+        assert!(loaded.warning.contains("稳定的正式版身份"));
+        assert!(!loaded.warning.contains("user canceled"));
     }
 
     #[test]
@@ -572,6 +584,30 @@ mod tests {
                 .get(PRODUCTION_SERVICE)
                 .map(String::as_str),
             Some("legacy-secret")
+        );
+    }
+
+    #[test]
+    fn production_inaccessible_legacy_value_requests_one_time_reentry() {
+        let store = FakeStore::default();
+        store.load_errors.borrow_mut().insert(
+            LEGACY_SHARED_SERVICE.into(),
+            "old signing identity denied".into(),
+        );
+
+        let loaded = load_production(&store);
+
+        assert!(loaded.value.is_empty());
+        assert_eq!(loaded.source, CredentialSource::Missing);
+        assert!(loaded.warning.contains("旧版 API Key"));
+        assert!(loaded.warning.contains("后续升级可继续使用"));
+        assert!(!loaded.warning.contains("old signing identity denied"));
+        assert_eq!(
+            store.calls.borrow().as_slice(),
+            [
+                format!("load:{PRODUCTION_SERVICE}"),
+                format!("load:{LEGACY_SHARED_SERVICE}")
+            ]
         );
     }
 }

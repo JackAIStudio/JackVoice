@@ -18,12 +18,24 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{mpsc, oneshot};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VolcCredentialStatus {
+    Missing,
+    Configured,
+    Verified,
+    Failed,
+    Unavailable,
+}
+
 /// Upper bound for the user-facing digital input gain (dB).
 pub const MAX_INPUT_GAIN_DB: f32 = 24.0;
 const LOCAL_AUDIO_QUEUE_CAPACITY: usize = 4_096;
 const ASR_AUDIO_QUEUE_CAPACITY: usize = 8_192;
 const MAX_CONNECT_BACKLOG_BYTES: usize = 2 * 1024 * 1024;
 const ASR_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_DICTATION_DURATION: Duration = Duration::from_secs(30 * 60);
+const MAX_DICTATION_DURATION_LABEL: &str = "30 分钟";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +58,9 @@ pub struct UiState {
     pub status: String,
     pub transcript: String,
     pub has_volc_api_key: bool,
+    /// 凭据与真实服务连接是两回事：configured 只表示已安全读取，
+    /// verified 必须来自本进程内成功的真实连接测试或听写连接。
+    pub volc_credential_status: VolcCredentialStatus,
     pub masked_volc_api_key: String,
     pub volc_credential_source: String,
     pub volc_credential_warning: String,
@@ -85,6 +100,7 @@ impl Default for UiState {
             status: "准备就绪。按 Option+Space 开始听写。".into(),
             transcript: String::new(),
             has_volc_api_key: false,
+            volc_credential_status: VolcCredentialStatus::Missing,
             masked_volc_api_key: String::new(),
             volc_credential_source: CredentialSource::Missing.as_str().into(),
             volc_credential_warning: String::new(),
@@ -92,7 +108,7 @@ impl Default for UiState {
             volc_boosting_table_id: String::new(),
             semantic_punctuation_enabled: true,
             semantic_smoothing_enabled: false,
-            max_sentence_silence_ms: 1300,
+            max_sentence_silence_ms: 0,
             input_gain_db: 0.0,
             selected_input_device_id: String::new(),
             input_devices: Vec::new(),
@@ -206,7 +222,7 @@ impl AppState {
                     settings.volc_api_key = legacy_api_key;
                     credential_source = CredentialSource::Session;
                     credential_warning =
-                        format!("旧版 App Key 本次仍可使用，但无法安全迁移：{error}");
+                        format!("旧版 API Key 本次仍可使用，但无法安全迁移：{error}");
                 }
             }
         } else {
@@ -231,6 +247,8 @@ impl AppState {
         apply_settings_to_ui(&mut ui, &settings);
         ui.volc_credential_source = credential_source.as_str().into();
         ui.volc_credential_warning = credential_warning;
+        ui.volc_credential_status =
+            initial_volc_credential_status(&settings.volc_api_key, &ui.volc_credential_warning);
         // NOTE: intentionally do NOT enumerate audio devices at startup. On
         // macOS, touching CoreAudio input devices (even just listing them)
         // triggers the system microphone permission prompt. The user should
@@ -494,7 +512,7 @@ impl AppState {
     }
 
     /// 保存当前唯一识别服务（豆包流式录音识别）的连接配置。
-    pub fn save_volc_settings(
+    pub async fn save_volc_settings(
         &self,
         api_key: String,
         resource_id: String,
@@ -503,37 +521,52 @@ impl AppState {
         if self.active.lock().is_some() {
             return Err("正在听写中，请先结束听写再修改豆包识别配置。".into());
         }
-        let mut settings = self.settings.lock();
         let api_key = api_key.trim().to_string();
         if api_key.is_empty() {
-            return Err("请输入豆包语音 App Key。".into());
+            return Err("请输入豆包语音 API Key。".into());
+        }
+        let resource_id = if resource_id.trim().is_empty() {
+            "volc.seedasr.sauc.duration".to_string()
+        } else {
+            resource_id.trim().to_string()
+        };
+
+        if let Err(error) = verify_volc_service(&api_key, &resource_id).await {
+            let is_saved_key = self.settings.lock().volc_api_key.trim() == api_key;
+            let mut ui = self.ui.lock();
+            if is_saved_key {
+                ui.volc_credential_status = VolcCredentialStatus::Failed;
+            }
+            ui.status = error.clone();
+            return Err(error);
+        }
+
+        if self.active.lock().is_some() {
+            return Err("正在听写中，请先结束听写再修改豆包识别配置。".into());
         }
         let credential_source = crate::credentials::save_volc_api_key(
             self.credential_mode,
             &self.variant_data_dir,
             &api_key,
         )?;
+        let mut settings = self.settings.lock();
         settings.volc_api_key = api_key;
-        let resource_id = resource_id.trim().to_string();
-        settings.volc_resource_id = if resource_id.is_empty() {
-            "volc.seedasr.sauc.duration".into()
-        } else {
-            resource_id
-        };
+        settings.volc_resource_id = resource_id;
         settings.volc_boosting_table_id = boosting_table_id.trim().to_string();
         self.save_settings(&settings)?;
         let mut ui = self.ui.lock();
         apply_settings_to_ui(&mut ui, &settings);
         ui.volc_credential_source = credential_source.as_str().into();
+        ui.volc_credential_status = VolcCredentialStatus::Verified;
         ui.volc_credential_warning.clear();
-        ui.status = "豆包语音 App Key 已保存。".into();
+        ui.status = "豆包语音 API Key 已验证并安全保存。".into();
         Ok(ui.clone())
     }
 
     /// 显式移除当前应用身份保存的凭据，避免空输入框被误当成删除操作。
     pub fn remove_volc_api_key(&self) -> Result<UiState, String> {
         if self.active.lock().is_some() {
-            return Err("正在听写中，请先结束听写再移除 App Key。".into());
+            return Err("正在听写中，请先结束听写再移除 API Key。".into());
         }
         let mut settings = self.settings.lock();
         let credential_source = crate::credentials::save_volc_api_key(
@@ -546,13 +579,14 @@ impl AppState {
         let mut ui = self.ui.lock();
         apply_settings_to_ui(&mut ui, &settings);
         ui.volc_credential_source = credential_source.as_str().into();
+        ui.volc_credential_status = VolcCredentialStatus::Missing;
         ui.volc_credential_warning.clear();
-        ui.status = "豆包语音 App Key 已移除。".into();
+        ui.status = "豆包语音 API Key 已移除。".into();
         Ok(ui.clone())
     }
 
-    /// 使用真实识别服务验证 App Key 与资源 ID，但不打开麦克风或发送音频。
-    /// 输入框为空时测试当前已保存的 App Key，便于用户随时重新验证。
+    /// 使用真实识别服务验证 API Key 与资源 ID，但不打开麦克风或发送音频。
+    /// 输入框为空时测试当前已保存的 API Key，便于用户随时重新验证。
     pub async fn test_volc_connection(
         &self,
         api_key: String,
@@ -563,37 +597,37 @@ impl AppState {
         }
 
         let settings = self.settings.lock().clone();
-        let api_key = if api_key.trim().is_empty() {
+        let supplied_api_key = api_key.trim().to_string();
+        let testing_saved_key =
+            supplied_api_key.is_empty() || supplied_api_key == settings.volc_api_key.trim();
+        let api_key = if supplied_api_key.is_empty() {
             settings.volc_api_key.trim().to_string()
         } else {
-            api_key.trim().to_string()
+            supplied_api_key
         };
         if api_key.is_empty() {
-            return Err("请先填写或保存豆包语音 App Key。".into());
+            return Err("请先填写或保存豆包语音 API Key。".into());
         }
         let resource_id = if resource_id.trim().is_empty() {
             settings.volc_resource_id.trim().to_string()
         } else {
             resource_id.trim().to_string()
         };
-        let config = VolcAsrConfig {
-            api_key,
-            resource_id,
-            // 连接测试只验证 Key 与识别资源，不让可选热词表影响结果。
-            boosting_table_id: String::new(),
-        };
-
-        match crate::asr::test_connection(config).await {
-            Ok(()) => {
-                let message = "豆包语音服务连接正常。".to_string();
-                self.ui.lock().status = message.clone();
+        match verify_volc_service(&api_key, &resource_id).await {
+            Ok(message) => {
+                let mut ui = self.ui.lock();
+                if testing_saved_key {
+                    ui.volc_credential_status = VolcCredentialStatus::Verified;
+                }
+                ui.status = message.clone();
                 Ok(message)
             }
-            Err(error) => {
-                let raw = error.to_string();
-                eprintln!("[volc-connection-test] {raw}");
-                let message = format_volc_connection_error(&raw);
-                self.ui.lock().status = message.clone();
+            Err(message) => {
+                let mut ui = self.ui.lock();
+                if testing_saved_key {
+                    ui.volc_credential_status = VolcCredentialStatus::Failed;
+                }
+                ui.status = message.clone();
                 Err(message)
             }
         }
@@ -732,7 +766,7 @@ impl AppState {
         }
         let settings = self.settings.lock().clone();
         if settings.volc_api_key.trim().is_empty() {
-            return Err("请先填写豆包语音 App Key。".into());
+            return Err("请先填写豆包语音 API Key。".into());
         }
 
         let local_words = crate::hotwords::load(&self.shared_data_dir);
@@ -812,7 +846,11 @@ impl AppState {
         let mut settings = self.settings.lock();
         settings.semantic_punctuation_enabled = semantic_punctuation_enabled;
         settings.semantic_smoothing_enabled = semantic_smoothing_enabled;
-        settings.max_sentence_silence_ms = max_sentence_silence_ms.max(200);
+        settings.max_sentence_silence_ms = if max_sentence_silence_ms == 0 {
+            0
+        } else {
+            max_sentence_silence_ms.max(200)
+        };
         self.save_settings(&settings)?;
         let mut ui = self.ui.lock();
         apply_settings_to_ui(&mut ui, &settings);
@@ -1313,6 +1351,9 @@ fn mark_recognition_unavailable(app: &AppHandle, session_id: u64, message: &str)
         }
         let mut ui = state.ui.lock();
         ui.recognition_phase = "error".into();
+        if ui.has_volc_api_key {
+            ui.volc_credential_status = VolcCredentialStatus::Failed;
+        }
         ui.status = format!("正在本地录音 · 实时识别不可用：{message}");
         let _ = app.emit("jackvoice://state", ui.clone());
     }
@@ -1350,7 +1391,7 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
     };
 
     let mut recognition_error = if settings.volc_api_key.trim().is_empty() {
-        Some("尚未配置豆包语音 App Key".to_string())
+        Some("尚未配置豆包语音 API Key".to_string())
     } else {
         None
     };
@@ -1414,9 +1455,43 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
     let mut asr_error_tx = Some(asr_error_tx);
     let mut local_error: Option<String> = None;
     let mut last_level_emit = Instant::now() - Duration::from_millis(100);
+    let mut reached_duration_limit = false;
+    let duration_limit = tokio::time::sleep(MAX_DICTATION_DURATION);
+    tokio::pin!(duration_limit);
 
     loop {
         tokio::select! {
+            _ = &mut duration_limit => {
+                reached_duration_limit = true;
+                let output_mute = app.try_state::<AppState>().and_then(|state| {
+                    let mut active = state.active.lock();
+                    active
+                        .as_mut()
+                        .filter(|active| active.id == session_id)
+                        .and_then(|active| {
+                            active.stopping = true;
+                            active.output_mute.take()
+                        })
+                });
+                let _ = audio_stop_tx.send(());
+                restore_output_mute(output_mute);
+                if connect_future.is_some() && recognition_error.is_none() {
+                    recognition_error = Some("达到时长上限前实时识别尚未连接完成".into());
+                }
+                drop(connect_future.take());
+                if let Some(state) = app.try_state::<AppState>() {
+                    let mut ui = state.ui.lock();
+                    ui.phase = "finalizing".into();
+                    ui.recognition_phase = "finalizing".into();
+                    ui.audio_level = 0.0;
+                    ui.status = format!(
+                        "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限，正在自动结束并整理文字…"
+                    );
+                    let _ = app.emit("jackvoice://level", 0.0_f32);
+                    let _ = app.emit("jackvoice://state", ui.clone());
+                }
+                break;
+            }
             control = control_rx.recv() => {
                 match control {
                     Some(SessionControl::Stop) | None => {}
@@ -1520,6 +1595,7 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
                                 if is_current {
                                     let mut ui = state.ui.lock();
                                     ui.recognition_phase = "streaming".into();
+                                    ui.volc_credential_status = VolcCredentialStatus::Verified;
                                     ui.status = "正在录音 · 实时识别已连接".into();
                                     let _ = app.emit("jackvoice://state", ui.clone());
                                 }
@@ -1577,7 +1653,13 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
             ui.phase = "finalizing".into();
             ui.recognition_phase = "finalizing".into();
             ui.audio_level = 0.0;
-            ui.status = "本地录音已完成，正在整理文字…".into();
+            ui.status = if reached_duration_limit {
+                format!(
+                    "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限，录音已停止，正在整理文字…"
+                )
+            } else {
+                "本地录音已完成，正在整理文字…".into()
+            };
             let _ = app.emit("jackvoice://level", 0.0_f32);
             let _ = app.emit("jackvoice://state", ui.clone());
         }
@@ -1701,9 +1783,25 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
             ui.status = if is_cancel {
                 "已取消文字处理，本地录音已保存。".into()
             } else if let Some(error) = recognition_error {
-                format!("本地录音已保存；实时识别未完成：{error}")
+                if reached_duration_limit {
+                    format!(
+                        "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束；本地录音已保存；实时识别未完成：{error}"
+                    )
+                } else {
+                    format!("本地录音已保存；实时识别未完成：{error}")
+                }
             } else if ui.transcript.trim().is_empty() {
-                "本地录音已保存，本次未识别到文字。".into()
+                if reached_duration_limit {
+                    format!(
+                        "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束；本地录音已保存，本次未识别到文字。"
+                    )
+                } else {
+                    "本地录音已保存，本次未识别到文字。".into()
+                }
+            } else if reached_duration_limit {
+                format!(
+                    "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束，本地录音已保存。"
+                )
             } else {
                 "听写结束，本地录音已保存。".into()
             };
@@ -1727,7 +1825,13 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
 }
 
 fn apply_settings_to_ui(ui: &mut UiState, settings: &AppSettings) {
+    let previously_had_key = ui.has_volc_api_key;
     ui.has_volc_api_key = !settings.volc_api_key.trim().is_empty();
+    if !ui.has_volc_api_key {
+        ui.volc_credential_status = VolcCredentialStatus::Missing;
+    } else if !previously_had_key {
+        ui.volc_credential_status = VolcCredentialStatus::Configured;
+    }
     ui.masked_volc_api_key = settings::mask_api_key(&settings.volc_api_key);
     ui.volc_resource_id = settings.volc_resource_id.clone();
     ui.volc_boosting_table_id = settings.volc_boosting_table_id.clone();
@@ -1742,6 +1846,33 @@ fn apply_settings_to_ui(ui: &mut UiState, settings: &AppSettings) {
     ui.system_audio_mute_supported = crate::output_mute::supported();
     ui.onboarding_completed = settings.onboarding_completed;
     ui.history_text_size = settings.history_text_size.clone();
+}
+
+fn initial_volc_credential_status(api_key: &str, warning: &str) -> VolcCredentialStatus {
+    if !api_key.trim().is_empty() {
+        VolcCredentialStatus::Configured
+    } else if !warning.trim().is_empty() {
+        VolcCredentialStatus::Unavailable
+    } else {
+        VolcCredentialStatus::Missing
+    }
+}
+
+async fn verify_volc_service(api_key: &str, resource_id: &str) -> Result<String, String> {
+    let config = VolcAsrConfig {
+        api_key: api_key.trim().to_string(),
+        resource_id: resource_id.trim().to_string(),
+        // 连接测试只验证 Key 与识别资源，不让可选热词表影响结果。
+        boosting_table_id: String::new(),
+    };
+    match crate::asr::test_connection(config).await {
+        Ok(()) => Ok("豆包语音服务验证通过。".into()),
+        Err(error) => {
+            let raw = error.to_string();
+            eprintln!("[volc-connection-test] {raw}");
+            Err(format_volc_connection_error(&raw))
+        }
+    }
 }
 
 fn restore_output_mute(mut guard: Option<OutputMuteGuard>) {
@@ -1782,7 +1913,7 @@ fn format_volc_connection_error(raw: &str) -> String {
         || raw.contains("鉴权失败")
     {
         return format!(
-            "App Key 未通过认证。请确认填写的是豆包语音控制台中的 App Key，而不是 Access Key、Secret Key 或其他产品的凭据。服务端错误：{raw}"
+            "API Key 未通过认证。请确认填写的是豆包语音控制台“API Key 管理”中的 API Key，而不是 Access Key、Secret Key 或其他产品的凭据。服务端错误：{raw}"
         );
     }
     if lower.contains("403")
@@ -1826,12 +1957,37 @@ pub type SharedDelivery = DeliveryResult;
 
 #[cfg(test)]
 mod volc_connection_error_tests {
-    use super::format_volc_connection_error;
+    use super::{
+        format_volc_connection_error, initial_volc_credential_status, VolcCredentialStatus,
+        MAX_DICTATION_DURATION,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn limits_each_dictation_to_thirty_minutes() {
+        assert_eq!(MAX_DICTATION_DURATION, Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn credential_status_distinguishes_missing_unavailable_and_configured() {
+        assert_eq!(
+            initial_volc_credential_status("", ""),
+            VolcCredentialStatus::Missing
+        );
+        assert_eq!(
+            initial_volc_credential_status("", "keychain unavailable"),
+            VolcCredentialStatus::Unavailable
+        );
+        assert_eq!(
+            initial_volc_credential_status("stored-key", "migration warning"),
+            VolcCredentialStatus::Configured
+        );
+    }
 
     #[test]
     fn explains_unauthenticated_key() {
         let message = format_volc_connection_error("HTTP error: 401 Unauthorized");
-        assert!(message.contains("App Key 未通过认证"));
+        assert!(message.contains("API Key 未通过认证"));
         assert!(message.contains("豆包语音控制台"));
     }
 

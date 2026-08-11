@@ -1288,6 +1288,16 @@ kbd.shortcut {
   color: var(--warning);
 }
 
+.set-value {
+  flex-shrink: 0;
+  padding: 7px 11px;
+  border-radius: 9px;
+  background: var(--hover);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+}
+
 .external-help-link {
   display: inline-block;
   margin-top: 5px;
@@ -1486,6 +1496,16 @@ select:focus,
 .service-status.connected {
   background: #eaf8f3;
   color: #147b65;
+}
+
+.service-status.configured {
+  background: #fff6df;
+  color: #9a6712;
+}
+
+.service-status.failed {
+  background: #fff0ee;
+  color: var(--danger);
 }
 
 .service-status.disconnected {

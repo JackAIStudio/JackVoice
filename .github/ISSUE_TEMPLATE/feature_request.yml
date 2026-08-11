@@ -8,7 +8,7 @@ body:
     attributes:
       label: 隐私确认
       options:
-        - label: 我没有提交 App Key、录音、私人转写文本或其他敏感信息。
+        - label: 我没有提交 API Key、录音、私人转写文本或其他敏感信息。
           required: true
   - type: textarea
     id: problem

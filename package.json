@@ -1,7 +1,7 @@
 {
   "name": "jackvoice",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "开源桌面全局语音听写工具",
   "license": "Apache-2.0",
   "repository": {
@@ -24,6 +24,7 @@
     "qa:first-run:dev": "node scripts/reset-first-run.mjs dev --quit --build --open",
     "qa:first-run:dev:fresh": "node scripts/reset-first-run.mjs dev --quit --build --forget-credential --open",
     "icons": "node scripts/generate-icons.mjs",
+    "test": "node --test scripts/*.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

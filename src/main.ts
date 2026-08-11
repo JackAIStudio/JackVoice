@@ -16,6 +16,7 @@ type UiState = {
   status: string;
   transcript: string;
   hasVolcApiKey: boolean;
+  volcCredentialStatus: "missing" | "configured" | "verified" | "failed" | "unavailable";
   maskedVolcApiKey: string;
   volcCredentialSource: string;
   volcCredentialWarning: string;
@@ -418,14 +419,41 @@ function applyState(state: UiState) {
     if (scBtn) scBtn.textContent = formatShortcut(state.shortcut || "Alt+Space");
   }
 
+  const credentialStatus = state.volcCredentialStatus ||
+    (state.hasVolcApiKey ? "configured" : "missing");
+  const credentialPresentation = {
+    missing: {
+      className: "disconnected",
+      label: "未配置",
+      description: "首次使用需要配置你自己的豆包语音 API Key。",
+    },
+    configured: {
+      className: "configured",
+      label: "已配置 · 待验证",
+      description: "API Key 已安全读取；请验证当前仍可使用。",
+    },
+    verified: {
+      className: "connected",
+      label: "验证通过",
+      description: "最近一次豆包语音服务连接验证通过。",
+    },
+    failed: {
+      className: "failed",
+      label: "验证失败",
+      description: "最近一次连接失败；请重新验证或更换 API Key。",
+    },
+    unavailable: {
+      className: "failed",
+      label: "凭据不可用",
+      description: "无法读取已保存的 API Key，请重新配置。",
+    },
+  }[credentialStatus];
   const volcMasked = $("#masked-volc-key");
   if (volcMasked) {
-    volcMasked.className = `service-status ${state.hasVolcApiKey ? "connected" : "disconnected"}`;
-    volcMasked.innerHTML = `<i></i>${state.hasVolcApiKey ? "已连接" : "未连接"}`;
+    volcMasked.className = `service-status ${credentialPresentation.className}`;
+    volcMasked.innerHTML = `<i></i>${credentialPresentation.label}`;
   }
-  const credentialDescription = state.volcCredentialWarning || (state.hasVolcApiKey
-    ? "已连接，可以开始听写。"
-    : "首次使用需要连接你自己的豆包语音服务。");
+  const credentialDescription = state.volcCredentialWarning || credentialPresentation.description;
   const credentialHint = $("#volc-credential-hint");
   if (credentialHint) {
     credentialHint.textContent = credentialDescription;
@@ -436,10 +464,9 @@ function applyState(state: UiState) {
   if (editVolcButton) {
     editVolcButton.textContent = environmentManaged
       ? "由开发环境管理"
-      : state.hasVolcApiKey
-        ? "更换 App Key"
-        : "配置 App Key";
+      : "更换 API Key";
     editVolcButton.disabled = environmentManaged;
+    editVolcButton.classList.toggle("hidden", !state.hasVolcApiKey);
   }
   $("#test-volc-btn")?.classList.toggle("hidden", !state.hasVolcApiKey);
   $("#remove-volc-btn")?.classList.toggle(
@@ -450,17 +477,29 @@ function applyState(state: UiState) {
     "hidden",
     environmentManaged || (state.hasVolcApiKey && !credentialEditorOpen),
   );
+  $("#cancel-volc-btn")?.classList.toggle(
+    "hidden",
+    !state.hasVolcApiKey || !credentialEditorOpen,
+  );
 
   const onboardingHint = $("#ob-key-desc");
   if (onboardingHint) {
-    onboardingHint.textContent = state.volcCredentialWarning || (state.hasVolcApiKey
-      ? "已连接，可以直接继续。"
-      : "可以跳过，稍后再到设置中配置；本地录音不受影响。");
-    onboardingHint.classList.toggle("warn", !!state.volcCredentialWarning);
+    onboardingHint.textContent = state.volcCredentialWarning || (credentialStatus === "missing"
+      ? "可以跳过，稍后再到设置中配置；本地录音不受影响。"
+      : credentialPresentation.description);
+    onboardingHint.classList.toggle(
+      "warn",
+      !!state.volcCredentialWarning || ["failed", "unavailable"].includes(credentialStatus),
+    );
+  }
+  const onboardingStatus = $("#ob-key-status");
+  if (onboardingStatus) {
+    onboardingStatus.className = `service-status ${credentialPresentation.className}`;
+    onboardingStatus.innerHTML = `<i></i>${credentialPresentation.label}`;
   }
   const onboardingEditButton = $("#ob-edit-volc-key") as HTMLButtonElement | null;
   if (onboardingEditButton) {
-    onboardingEditButton.textContent = environmentManaged ? "由开发环境管理" : "更换 App Key";
+    onboardingEditButton.textContent = environmentManaged ? "由开发环境管理" : "更换 API Key";
     onboardingEditButton.disabled = environmentManaged;
   }
   if (environmentManaged) onboardingCredentialEditorOpen = false;
@@ -472,7 +511,10 @@ function applyState(state: UiState) {
     "hidden",
     state.hasVolcApiKey && !onboardingCredentialEditorOpen,
   );
-  $("#ob-cancel-volc-key")?.classList.toggle("hidden", !state.hasVolcApiKey);
+  $("#ob-cancel-volc-key")?.classList.toggle(
+    "hidden",
+    !state.hasVolcApiKey || !onboardingCredentialEditorOpen,
+  );
 
   renderOnboardingCompletion(state);
   updateOnboardingNextLabel();
@@ -506,7 +548,7 @@ function applyState(state: UiState) {
   const silence = $("#silence-ms") as HTMLSelectElement | null;
   if (silence && document.activeElement !== silence) {
     silence.querySelector("option[data-current-value]")?.remove();
-    const value = String(state.maxSentenceSilenceMs || 1300);
+    const value = String(state.maxSentenceSilenceMs ?? 0);
     if (!Array.from(silence.options).some((option) => option.value === value)) {
       const seconds = (Number(value) / 1000).toLocaleString("zh-CN", {
         maximumFractionDigits: 1,
@@ -1685,16 +1727,20 @@ async function saveVolcSettings() {
   const resourceId = (($("#volc-resource-id") as HTMLInputElement | null)?.value ?? "").trim();
   const boostingTableId = (($("#volc-table-id") as HTMLInputElement | null)?.value ?? "").trim();
   if (!apiKey) {
-    setVolcConnectionStatus("#volc-connection-status", "请先粘贴豆包语音 App Key。", "warn");
+    setVolcConnectionStatus("#volc-connection-status", "请先粘贴豆包语音 API Key。", "warn");
     return;
   }
-  const verified = await testVolcConnection({
-    inputSelector: "#volc-api-key",
-    resourceSelector: "#volc-resource-id",
-    statusSelector: "#volc-connection-status",
-    buttonSelector: "#save-volc-btn",
-  });
-  if (!verified) return;
+  const button = $("#save-volc-btn") as HTMLButtonElement | null;
+  const originalLabel = button?.textContent || "验证并保存";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "验证中…";
+  }
+  setVolcConnectionStatus(
+    "#volc-connection-status",
+    "正在验证服务并安全保存 API Key…",
+    "testing",
+  );
   try {
     const state = await invoke<UiState>("save_volc_settings", {
       apiKey,
@@ -1705,16 +1751,24 @@ async function saveVolcSettings() {
     applyState(state);
     const input = $("#volc-api-key") as HTMLInputElement | null;
     if (input) input.value = "";
-    setVolcConnectionStatus("#volc-connection-status", "✓ 已连接，可以开始听写。", "ok");
+    setVolcConnectionStatus("#volc-connection-status", "✓ 验证通过并已安全保存。", "ok");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    await refreshState().catch((stateError) =>
+      console.error("refresh failed saved credential status failed", stateError),
+    );
     setVolcConnectionStatus("#volc-connection-status", message, "warn");
-    if (currentState) applyState(currentState);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalLabel;
+    }
   }
 }
 
 function setVolcCredentialEditor(open: boolean) {
   credentialEditorOpen = open;
+  clearVolcConnectionStatus("#volc-connection-status");
   if (!open) {
     const input = $("#volc-api-key") as HTMLInputElement | null;
     if (input) input.value = "";
@@ -1726,14 +1780,14 @@ function setVolcCredentialEditor(open: boolean) {
 }
 
 async function removeVolcApiKey() {
-  if (!window.confirm("移除豆包语音 App Key 后将无法继续听写。确定移除吗？")) return;
+  if (!window.confirm("移除豆包语音 API Key 后将无法继续听写。确定移除吗？")) return;
   try {
     const state = await invoke<UiState>("remove_volc_api_key");
     credentialEditorOpen = true;
     applyState(state);
     setVolcConnectionStatus(
       "#volc-connection-status",
-      "App Key 已移除，请重新配置后再开始听写。",
+      "API Key 已移除，请重新配置后再开始听写。",
       "warn",
     );
   } catch (error) {
@@ -1763,6 +1817,13 @@ function setVolcConnectionStatus(
   status.textContent = message;
 }
 
+function clearVolcConnectionStatus(selector: string) {
+  const status = $(selector);
+  if (!status) return;
+  status.className = "connection-test-status";
+  status.textContent = "";
+}
+
 async function testVolcConnection(options: VolcConnectionTestOptions): Promise<boolean> {
   const input = $(options.inputSelector) as HTMLInputElement | null;
   const resourceInput = options.resourceSelector
@@ -1771,11 +1832,11 @@ async function testVolcConnection(options: VolcConnectionTestOptions): Promise<b
   const button = $(options.buttonSelector) as HTMLButtonElement | null;
   const apiKey = (input?.value ?? "").trim();
   const resourceId = (resourceInput?.value || currentState?.volcResourceId || "").trim();
-  const originalLabel = button?.textContent || "测试连接";
+  const originalLabel = button?.textContent || "验证";
 
   if (button) {
     button.disabled = true;
-    button.textContent = "测试中…";
+    button.textContent = "验证中…";
   }
   setVolcConnectionStatus(
     options.statusSelector,
@@ -1785,10 +1846,14 @@ async function testVolcConnection(options: VolcConnectionTestOptions): Promise<b
 
   try {
     const message = await invoke<string>("test_volc_connection", { apiKey, resourceId });
+    await refreshState().catch((error) => console.error("refresh credential status failed", error));
     setVolcConnectionStatus(options.statusSelector, `✓ ${message}`, "ok");
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    await refreshState().catch((stateError) =>
+      console.error("refresh failed credential status failed", stateError),
+    );
     setVolcConnectionStatus(options.statusSelector, message, "warn");
     return false;
   } finally {
@@ -1829,7 +1894,7 @@ async function saveRecognitionOptions() {
   const semanticSmoothingEnabled =
     ($("#semantic-smoothing") as HTMLInputElement | null)?.checked ?? false;
   const maxSentenceSilenceMs = Number(
-    ($("#silence-ms") as HTMLSelectElement | null)?.value || 1300,
+    ($("#silence-ms") as HTMLSelectElement | null)?.value || 0,
   );
   try {
     const state = await invoke<UiState>("update_recognition_options", {
@@ -1972,7 +2037,10 @@ function updateOnboardingNextLabel() {
     (obStep === 2 && !onboardingAccessibilityGranted);
   if (obStep === OB_STEP_COUNT - 1) {
     next.textContent = "开始使用";
-  } else if (obStep === 4 && !currentState?.hasVolcApiKey) {
+  } else if (
+    obStep === 4 &&
+    (currentState?.volcCredentialStatus !== "verified" || !!currentState.volcCredentialWarning)
+  ) {
     next.textContent = "暂时跳过";
   } else {
     next.textContent = "下一步";
@@ -1983,14 +2051,16 @@ function renderOnboardingCompletion(state: UiState) {
   const title = $("#ob-complete-title");
   const copy = $("#ob-complete-copy");
   const detail = $("#ob-complete-detail");
-  if (state.hasVolcApiKey) {
+  if (state.volcCredentialStatus === "verified" && !state.volcCredentialWarning) {
     if (title) title.textContent = "准备就绪";
     if (copy) copy.innerHTML = "现在按下 <kbd class=\"shortcut\">⌥ + Space</kbd> 开始语音输入；说完再按一次结束，文字会自动插入。";
     if (detail) detail.textContent = "麦克风、实时识别和自动插入均已配置。";
   } else {
     if (title) title.textContent = "本地录音已就绪";
     if (copy) copy.textContent = "你现在可以使用快捷键开始本地录音，录音会永久保存在本机。";
-    if (detail) detail.textContent = "麦克风和辅助功能已配置；稍后连接 App Key 即可生成并自动插入识别文字。";
+    if (detail) detail.textContent = state.hasVolcApiKey
+      ? "API Key 已配置但尚未验证可用；验证通过后即可生成并自动插入识别文字。"
+      : "麦克风和辅助功能已配置；稍后连接 API Key 即可生成并自动插入识别文字。";
   }
 }
 
@@ -2151,15 +2221,20 @@ function bindOnboarding() {
     const input = $("#ob-volc-api-key") as HTMLInputElement | null;
     const value = (input?.value ?? "").trim();
     if (!value) {
-      setVolcConnectionStatus("#ob-key-test-status", "请先粘贴豆包语音 App Key。", "warn");
+      setVolcConnectionStatus("#ob-key-test-status", "请先粘贴豆包语音 API Key。", "warn");
       return;
     }
-    const verified = await testVolcConnection({
-      inputSelector: "#ob-volc-api-key",
-      statusSelector: "#ob-key-test-status",
-      buttonSelector: "#ob-save-volc-key",
-    });
-    if (!verified) return;
+    const button = $("#ob-save-volc-key") as HTMLButtonElement | null;
+    const originalLabel = button?.textContent || "验证并保存";
+    if (button) {
+      button.disabled = true;
+      button.textContent = "验证中…";
+    }
+    setVolcConnectionStatus(
+      "#ob-key-test-status",
+      "正在验证服务并安全保存 API Key…",
+      "testing",
+    );
     try {
       const state = await invoke<UiState>("save_volc_settings", {
         apiKey: value,
@@ -2169,9 +2244,12 @@ function bindOnboarding() {
       onboardingCredentialEditorOpen = false;
       applyState(state);
       if (input) input.value = "";
-      setVolcConnectionStatus("#ob-key-test-status", "✓ 已连接，可以继续。", "ok");
+      setVolcConnectionStatus("#ob-key-test-status", "✓ 验证通过并已安全保存。", "ok");
     } catch (error) {
       console.error("save onboarding volc key failed", error);
+      await refreshState().catch((stateError) =>
+        console.error("refresh onboarding credential status failed", stateError),
+      );
       const desc = $("#ob-key-desc");
       if (desc) {
         desc.textContent = error instanceof Error ? error.message : String(error);
@@ -2182,16 +2260,31 @@ function bindOnboarding() {
         error instanceof Error ? error.message : String(error),
         "warn",
       );
+    } finally {
+      if (button) {
+        button.disabled = false;
+        button.textContent = originalLabel;
+      }
     }
+  });
+
+  $("#ob-test-volc-key")?.addEventListener("click", () => {
+    void testVolcConnection({
+      inputSelector: "#ob-volc-api-key",
+      statusSelector: "#ob-key-test-status",
+      buttonSelector: "#ob-test-volc-key",
+    });
   });
 
   $("#ob-edit-volc-key")?.addEventListener("click", () => {
     onboardingCredentialEditorOpen = true;
+    clearVolcConnectionStatus("#ob-key-test-status");
     if (currentState) applyState(currentState);
     window.setTimeout(() => ($("#ob-volc-api-key") as HTMLInputElement | null)?.focus(), 0);
   });
   $("#ob-cancel-volc-key")?.addEventListener("click", () => {
     onboardingCredentialEditorOpen = false;
+    clearVolcConnectionStatus("#ob-key-test-status");
     const input = $("#ob-volc-api-key") as HTMLInputElement | null;
     if (input) input.value = "";
     if (currentState) applyState(currentState);
@@ -2378,6 +2471,11 @@ function bindDict() {
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
+  const version = import.meta.env.VITE_JACKVOICE_VERSION || "0.1.1";
+  const buildId = import.meta.env.VITE_JACKVOICE_BUILD_ID || "development";
+  const buildVersion = $("#app-build-version");
+  if (buildVersion) buildVersion.textContent = `v${version} · build ${buildId}`;
+
   await listen<ShortcutCaptureEvent>("jackvoice://shortcut-captured", (event) =>
     onNativeShortcutCaptured(event.payload),
   );

@@ -90,7 +90,7 @@ pub async fn update_boosting_table(
     let api_key = api_key.trim();
     let table_id = table_id.trim();
     if api_key.is_empty() {
-        return Err("请先配置豆包语音 App Key。".into());
+        return Err("请先配置豆包语音 API Key。".into());
     }
     if table_id.is_empty() {
         return Err("请先在设置里填写热词表 ID。".into());
@@ -227,7 +227,7 @@ pub async fn update_correct_table(
     let api_key = api_key.trim();
     let table_id = table_id.trim();
     if api_key.is_empty() {
-        return Err("请先配置豆包语音 App Key。".into());
+        return Err("请先配置豆包语音 API Key。".into());
     }
     if table_id.is_empty() {
         return Err("请先在设置里填写替换词表 ID。".into());
@@ -309,7 +309,7 @@ pub async fn create_correct_table(
     let api_key = api_key.trim();
     let table_name = table_name.trim();
     if api_key.is_empty() {
-        return Err("请先配置豆包语音 App Key。".into());
+        return Err("请先配置豆包语音 API Key。".into());
     }
     if table_name.is_empty() {
         return Err("替换词表名称不能为空。".into());

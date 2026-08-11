@@ -1,0 +1,117 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import {
+  createDeliveryArtifact,
+  createReleaseBuildId,
+  deliveryDmgFileName,
+  findMountedJackVoiceBuildImages,
+  parseMountedDiskImages,
+  productionDmgPath,
+  resolveReleaseBuildId,
+  validateReleaseVersions,
+} from "./release-artifacts.mjs";
+
+test("生产构建拒绝 package、Tauri 与 Cargo 版本号漂移", () => {
+  assert.equal(
+    validateReleaseVersions({ package: "0.1.1", tauri: "0.1.1", cargo: "0.1.1" }),
+    "0.1.1",
+  );
+  assert.throws(
+    () => validateReleaseVersions({ package: "0.1.1", tauri: "0.1.0", cargo: "0.1.1" }),
+    /版本号不一致/,
+  );
+});
+
+test("正式构建标识包含毫秒，连续交付不会复用同一文件名", () => {
+  assert.equal(
+    createReleaseBuildId(new Date("2026-08-11T07:30:45.123Z")),
+    "20260811T073045123Z",
+  );
+  assert.throws(() => resolveReleaseBuildId("../../旧包"), /只能包含/);
+});
+
+test("解析 hdiutil 输出并定位当前构建目录中的旧 JackVoice 镜像", () => {
+  const output = `
+================================================
+image-path      : /Users/test/Library/Caches/jackvoice/release-cargo-target/release/bundle/dmg/JackVoice_0.1.0_aarch64.dmg
+/dev/disk12\tGUID_partition_scheme
+/dev/disk12s1\tUUID\t/Volumes/JackVoice 1
+================================================
+image-path      : /Users/test/Downloads/JackVoice_0.1.0_aarch64.dmg
+/dev/disk13\tGUID_partition_scheme
+/dev/disk13s1\tUUID\t/Volumes/JackVoice 2
+================================================
+image-path      : /Users/test/Library/Caches/JackVoice/release-cargo-target/release/bundle/macos/rw.123.JackVoice_0.1.1_aarch64.dmg
+/dev/disk14\tGUID_partition_scheme
+/dev/disk14s1\tUUID\t/Volumes/dmg.temp
+`;
+  const images = parseMountedDiskImages(output);
+  assert.deepEqual(images[0], {
+    imagePath:
+      "/Users/test/Library/Caches/jackvoice/release-cargo-target/release/bundle/dmg/JackVoice_0.1.0_aarch64.dmg",
+    device: "/dev/disk12",
+    mountPoints: ["/Volumes/JackVoice 1"],
+  });
+  assert.deepEqual(
+    findMountedJackVoiceBuildImages(
+      images,
+      "/Users/test/Library/Caches/JackVoice/release-cargo-target/release/bundle",
+    ).map((image) => image.device),
+    ["/dev/disk12", "/dev/disk14"],
+  );
+});
+
+test("交付文件名同时绑定版本、构建标识和内容哈希", () => {
+  assert.equal(
+    deliveryDmgFileName(
+      "JackVoice_0.1.1_aarch64.dmg",
+      "20260811T073045123Z",
+      "a".repeat(64),
+    ),
+    "JackVoice_0.1.1_aarch64_build-20260811T073045123Z_aaaaaaaaaaaaaaaa.dmg",
+  );
+  assert.equal(
+    productionDmgPath("/tmp/target", "0.1.1", "arm64"),
+    "/tmp/target/release/bundle/dmg/JackVoice_0.1.1_aarch64.dmg",
+  );
+});
+
+test("交付产物包含可独立核验的 DMG、SHA-256 和清单", () => {
+  const testRoot = mkdtempSync(join(tmpdir(), "jackvoice-release-artifact-"));
+  try {
+    const sourceDmgPath = join(testRoot, "JackVoice_0.1.1_aarch64.dmg");
+    const appExecutablePath = join(testRoot, "jackvoice");
+    writeFileSync(sourceDmgPath, "signed dmg fixture");
+    writeFileSync(appExecutablePath, "signed app fixture");
+    const expectedDmgSha = createHash("sha256").update("signed dmg fixture").digest("hex");
+
+    const artifact = createDeliveryArtifact({
+      sourceDmgPath,
+      buildId: "20260811T073045123Z",
+      version: "0.1.1",
+      bundleIdentifier: "com.jackvoice.app",
+      teamId: "ABCDEFGHIJ",
+      appExecutablePath,
+      createdAt: new Date("2026-08-11T07:30:45.123Z"),
+    });
+
+    assert.equal(artifact.dmgSha256, expectedDmgSha);
+    assert.ok(existsSync(artifact.deliveryPath));
+    assert.equal(
+      readFileSync(artifact.checksumPath, "utf8"),
+      `${expectedDmgSha}  ${artifact.deliveryPath.split("/").at(-1)}\n`,
+    );
+    const manifest = JSON.parse(readFileSync(artifact.manifestPath, "utf8"));
+    assert.equal(manifest.version, "0.1.1");
+    assert.equal(manifest.buildId, "20260811T073045123Z");
+    assert.equal(manifest.dmg.sha256, expectedDmgSha);
+    assert.equal(manifest.bundleIdentifier, "com.jackvoice.app");
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});

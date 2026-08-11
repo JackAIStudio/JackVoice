@@ -11,6 +11,7 @@
 
 ```bash
 npm ci
+npm test
 npm run build
 cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
 cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
@@ -22,7 +23,9 @@ cargo test --locked --manifest-path src-tauri/Cargo.toml
 ## 代码与产品约束
 
 - 默认使用简体中文编写界面文案和面向用户的错误提示。
-- 不在日志、测试夹具或截图中放入真实 App Key、录音或转写内容。
+- 不在日志、测试夹具或截图中放入真实 API Key、录音或转写内容。
+- 正式包只从 `bundle/dmg/delivery` 目录交付；固定名称的 Tauri 中间 DMG 不得直接发给用户。
+- 发布前确认应用“关于”页构建标识与交付清单中的 `buildId` 一致，并校验 `.sha256`。
 - 新增网络请求、数据持久化、系统权限或第三方 SDK 时，必须同步更新 `PRIVACY.md`、首次启动披露和第三方许可说明。
 - 新的 Tauri 命令应遵循最小权限原则，不要恢复全局 `window.__TAURI__` 注入或宽泛 capability。
 - 视觉改动应基于 JackVoice 自己的任务模型与品牌语言，不复刻其他产品的页面结构、插画或文案。
