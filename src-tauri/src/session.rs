@@ -222,7 +222,7 @@ impl AppState {
                     settings.volc_api_key = legacy_api_key;
                     credential_source = CredentialSource::Session;
                     credential_warning =
-                        format!("旧版 API Key 本次仍可使用，但无法安全迁移：{error}");
+                        format!("API Key 本次仍可使用，但暂时无法保存到系统凭据库：{error}");
                 }
             }
         } else {

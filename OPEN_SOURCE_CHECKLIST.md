@@ -14,6 +14,7 @@
 - [x] Tauri 已启用 CSP、关闭全局 API 注入并缩小前端 capability
 - [x] 移除仓库中的个人 Developer ID 和过宽 macOS entitlement
 - [x] 正式版构建强制使用 Developer ID，并拒绝 ad-hoc、缺失 Team ID 或不完整的应用包签名
+- [x] 正式交付目录拒绝未公证、未 staple 或未通过 Gatekeeper 验收的 DMG
 - [x] 添加许可证、隐私、安全、贡献、行为准则和第三方说明
 
 ## 所有者必须确认

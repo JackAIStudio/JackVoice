@@ -119,10 +119,20 @@ export function createDeliveryArtifact({
   bundleIdentifier,
   teamId,
   appExecutablePath,
+  notarization,
   createdAt = new Date(),
 }) {
   if (!existsSync(sourceDmgPath)) throw new Error(`找不到正式 DMG：${sourceDmgPath}`);
   if (!existsSync(appExecutablePath)) throw new Error(`找不到正式应用可执行文件：${appExecutablePath}`);
+  if (
+    notarization?.status !== "accepted" ||
+    notarization?.stapled !== true ||
+    notarization?.gatekeeperAssessment !== "accepted" ||
+    typeof notarization?.submissionId !== "string" ||
+    !notarization.submissionId.trim()
+  ) {
+    throw new Error("正式交付 DMG 必须先通过 Apple 公证、票据 stapling 和 Gatekeeper 验收。");
+  }
 
   const normalizedBuildId = resolveReleaseBuildId(buildId);
   const dmgSha256 = sha256File(sourceDmgPath);
@@ -153,13 +163,14 @@ export function createDeliveryArtifact({
 
   const manifestPath = `${deliveryPath}.json`;
   const manifest = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     product: "JackVoice",
     version,
     buildId: normalizedBuildId,
     createdAt: createdAt.toISOString(),
     bundleIdentifier,
     teamId,
+    notarization,
     dmg: { fileName, bytes, sha256: dmgSha256 },
     appExecutable: { sha256: appSha256 },
   };

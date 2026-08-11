@@ -27,9 +27,8 @@ JackVoice 不托管转写服务。听写时，麦克风音频会通过加密连�
 - 转写文本、词库和偏好设置保存在本机应用数据目录
 - 本地录音永久保存在应用数据目录，JackVoice 不执行自动清理
 - 历史中的单条删除只清理应用内索引；录音文件由用户在听写详情中定位后自行管理
-- 旧版本若曾把 API Key 写入设置文件，新版首次启动会迁移到系统凭据库并重写设置文件
 
-完整说明见 [PRIVACY.md](PRIVACY.md)。若你使用过早期开发版，仍建议在开源或提交日志前自行检查历史文件和旧备份中是否存在真实凭据。
+完整说明见 [PRIVACY.md](PRIVACY.md)。参与开发时，仍建议在开源或提交日志前自行检查历史文件和旧备份中是否存在真实凭据。
 
 ## 快速开始
 
@@ -60,8 +59,11 @@ npm run dev
 # 构建开发版 .app（本地临时签名）
 npm run build:desktop:dev
 
-# 构建正式安装包；macOS 强制要求稳定的 Developer ID Application 签名
+# 构建本地签名 DMG；使用 Developer ID，但不提交 Apple 公证
 npm run build:desktop
+
+# 构建 GitHub Release 正式 DMG；强制 Developer ID 签名、Apple 公证和 Gatekeeper 验收
+npm run build:desktop:release
 
 # 运行构建脚本回归测试
 npm test
@@ -74,27 +76,27 @@ cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
 cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
 ```
 
-`npm run dev` 和桌面构建命令会固定使用项目内置的 Abseil；若检测到 WebRTC 曾使用 Homebrew Abseil 生成的不兼容缓存，启动脚本会只清理并重建该依赖。一般不再需要手动清理整个 Cargo target 目录。macOS 正式构建产物默认放在 `~/Library/Caches/JackVoice/release-cargo-target`，避免仓库位于 iCloud 的“桌面”或“文稿”目录时，File Provider 元数据破坏 Developer ID 签名。
+`npm run dev` 和桌面构建命令会固定使用项目内置的 Abseil；若检测到 WebRTC 曾使用 Homebrew Abseil 生成的不兼容缓存，启动脚本会只清理并重建该依赖。一般不再需要手动清理整个 Cargo target 目录。macOS Developer ID 构建产物默认放在 `~/Library/Caches/JackVoice/release-cargo-target`，避免仓库位于 iCloud 的“桌面”或“文稿”目录时，File Provider 元数据破坏 Developer ID 签名。
 
-macOS 正式版不允许使用 ad-hoc 临时签名。`npm run build:desktop` 会自动选择钥匙串中唯一的 `Developer ID Application`；如果存在多个发布身份，必须显式指定完整证书名称：
+macOS Developer ID 构建不允许使用 ad-hoc 临时签名。`npm run build:desktop` 会自动选择钥匙串中唯一的 `Developer ID Application`；如果存在多个发布身份，必须显式指定完整证书名称：
 
 ```bash
 export JACKVOICE_MACOS_SIGNING_IDENTITY="Developer ID Application: Example Studio (ABCDEFGHIJ)"
 npm run build:desktop
 ```
 
-CI 可以按 Tauri 2 的约定提供 `APPLE_CERTIFICATE` 和证书密码；建议同时设置 `JACKVOICE_APPLE_TEAM_ID` 作为签名团队验收值。构建结束后会强制执行严格代码签名验证，并检查 `com.jackvoice.app`、Team ID、Developer ID 签名链、CodeResources 和 Designated Requirement。任一项不满足都会让构建失败，不能生成可误装的正式包。
+`npm run build:desktop` 只生成 Developer ID 签名、尚未公证的本地 QA 包，并会主动忽略环境中可能残留的 Apple 公证凭据。构建结束后会检查 `com.jackvoice.app`、Team ID、Developer ID 签名链、CodeResources 和 Designated Requirement；该包不能作为 GitHub Release 正式分发。
 
-正式构建还会执行交付防混淆检查：`package.json`、Cargo 与 Tauri 的版本号必须完全一致；构建前自动弹出当前产物目录中仍挂载的旧 JackVoice 镜像；构建后在 `bundle/dmg/delivery` 生成带毫秒级构建标识和 DMG 内容哈希的唯一文件名，并同时生成 `.sha256` 与 `.json` 清单。只应分发 `delivery` 目录中的 DMG，不应分发 Tauri 生成的固定名称中间文件。应用“关于”页会显示同一构建标识，便于核对实际安装版本。
+`npm run build:desktop:release` 才是正式交付命令。它要求完整的 Apple 公证凭据，在 Tauri 生成并签名最终 DMG 后，通过 `notarytool` 提交该 DMG 并等待 Apple 返回 `Accepted`，再执行 ticket stapling、`stapler validate` 与 Gatekeeper 验收；任一步失败都不会生成 `delivery`。验收通过后，脚本才会在 `bundle/dmg/delivery` 生成带构建标识和最终 DMG 内容哈希的唯一文件名，并同时生成 `.sha256` 与包含公证 Submission ID 的 `.json` 清单。只应分发 `delivery` 目录中的 DMG。
 
 如需让 CI 使用自己的可追溯构建号，可显式设置 `JACKVOICE_BUILD_ID`；该值会同时进入交付文件名、清单和应用“关于”页：
 
 ```bash
 export JACKVOICE_BUILD_ID="20260811T073045123Z"
-npm run build:desktop
+npm run build:desktop:release
 ```
 
-稳定的 Developer ID 与固定 Bundle ID 共同构成 macOS TCC 权限身份，因此正常升级后麦克风和辅助功能授权可以继续沿用。由旧 ad-hoc 版本首次迁移到稳定签名版时，需要删除系统设置中的旧 JackVoice 权限记录并重新授权一次；此后同一开发团队签名的升级不再需要重复授权。
+稳定的 Developer ID 与固定 Bundle ID 共同构成 macOS TCC 权限身份，因此首发后的正常升级可以继续沿用麦克风和辅助功能授权。
 
 若绕过 npm 脚本直接执行 Cargo 并再次混入了系统 Abseil，可手动只清理对应依赖后重试：
 
@@ -119,7 +121,7 @@ npm run dev
 
 早期开发版若曾把密钥保存在 Keychain，新版会尽力自动迁移；旧条目无法读取时，在设置中重新填写一次即可。凭据读取失败只会显示可恢复提示，不会阻止应用启动。
 
-界面会区分“未配置”“已配置、待验证”“验证通过”“验证失败”和“凭据不可用”。从旧 ad-hoc 正式版迁移到稳定 Developer ID 正式版时，旧钥匙串条目可能因历史签名访问控制而无法读取；此时必须在新的稳定签名版中重新填写一次 API Key。保存操作会先连接真实服务验证，再写入系统凭据库，只有两步都成功才显示“验证通过”；后续同一团队签名的升级可继续读取该凭据。
+界面会区分“未配置”“已配置、待验证”“验证通过”“验证失败”和“凭据不可用”。首次使用且尚未填写 API Key 时只显示“未配置”，不会提示迁移或升级。保存操作会先连接真实服务验证，再写入系统凭据库，只有两步都成功才显示“验证通过”。
 
 端到端探针同样只读取该环境变量，不会访问正式版凭据或数据。开发期可使用 16 kHz、单声道、16 bit PCM：
 
@@ -184,6 +186,10 @@ macOS 权限测试必须使用 `qa:first-run:dev` 打开的构建后 `.app`，�
 ## 发布与签名
 
 仓库不包含个人 Developer ID。开发构建使用本地临时签名；正式发布时，请通过开发机钥匙串或 CI 密钥配置 Tauri/macOS 签名与公证，不要把证书、私钥、Apple 密码或 API Token 提交到仓库。
+
+本机正式发布优先使用 App Store Connect API Key：设置 `JACKVOICE_APPLE_TEAM_ID`、`APPLE_API_ISSUER`、`APPLE_API_KEY` 和 `APPLE_API_KEY_PATH` 后运行 `npm run build:desktop:release`。也可以改用 `APPLE_ID`、应用专用的 `APPLE_PASSWORD` 和 `APPLE_TEAM_ID`；此时 `APPLE_TEAM_ID` 必须与 `JACKVOICE_APPLE_TEAM_ID` 一致。两套公证凭据不能同时设置。
+
+GitHub Actions 的 `Release macOS` 工作流只接受 `v0.1.1` 形式且与 `package.json` 一致的现有标签，使用受保护的 `release` Environment 构建 Apple Silicon DMG，并创建草稿 GitHub Release。该 Environment 需要配置变量 `JACKVOICE_APPLE_TEAM_ID`，以及 Secrets：`APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_API_ISSUER`、`APPLE_API_KEY`、`APPLE_API_PRIVATE_KEY`。建议限制可部署标签并启用人工批准；正式发布凭据不得提供给 Pull Request 工作流。
 
 开发版仍使用独立的 `com.jackvoice.app.dev` 和本地临时签名，不得作为正式版分发。正式安装包发布时必须使用 `bundle/dmg/delivery` 中的唯一命名产物，附带生成的校验和、交付清单、完整第三方许可清单与对应源码版本，并完成 Developer ID 签名、公证和干净机器安装验证。
 

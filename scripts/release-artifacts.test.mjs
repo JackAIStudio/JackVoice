@@ -97,6 +97,12 @@ test("交付产物包含可独立核验的 DMG、SHA-256 和清单", () => {
       bundleIdentifier: "com.jackvoice.app",
       teamId: "ABCDEFGHIJ",
       appExecutablePath,
+      notarization: {
+        status: "accepted",
+        stapled: true,
+        gatekeeperAssessment: "accepted",
+        submissionId: "00000000-0000-0000-0000-000000000000",
+      },
       createdAt: new Date("2026-08-11T07:30:45.123Z"),
     });
 
@@ -111,6 +117,38 @@ test("交付产物包含可独立核验的 DMG、SHA-256 和清单", () => {
     assert.equal(manifest.buildId, "20260811T073045123Z");
     assert.equal(manifest.dmg.sha256, expectedDmgSha);
     assert.equal(manifest.bundleIdentifier, "com.jackvoice.app");
+    assert.equal(manifest.schemaVersion, 2);
+    assert.deepEqual(manifest.notarization, {
+      status: "accepted",
+      stapled: true,
+      gatekeeperAssessment: "accepted",
+      submissionId: "00000000-0000-0000-0000-000000000000",
+    });
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("没有公证、staple 或 Gatekeeper 证据时拒绝生成交付目录", () => {
+  const testRoot = mkdtempSync(join(tmpdir(), "jackvoice-unnotarized-artifact-"));
+  try {
+    const sourceDmgPath = join(testRoot, "JackVoice_0.1.1_aarch64.dmg");
+    const appExecutablePath = join(testRoot, "jackvoice");
+    writeFileSync(sourceDmgPath, "signed only dmg fixture");
+    writeFileSync(appExecutablePath, "signed app fixture");
+
+    assert.throws(
+      () =>
+        createDeliveryArtifact({
+          sourceDmgPath,
+          buildId: "20260811T073045123Z",
+          version: "0.1.1",
+          bundleIdentifier: "com.jackvoice.app",
+          teamId: "ABCDEFGHIJ",
+          appExecutablePath,
+        }),
+      /必须先通过 Apple 公证/,
+    );
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }

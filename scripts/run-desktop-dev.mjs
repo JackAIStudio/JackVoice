@@ -10,6 +10,12 @@ import {
   verifyProductionApp,
 } from "./macos-signing.mjs";
 import {
+  notarizeDmg,
+  stapleAndVerifyNotarizedDmg,
+  validateNotarizationCredentials,
+  withoutNotarizationCredentials,
+} from "./macos-notarization.mjs";
+import {
   RELEASE_BUILD_ID_ENV,
   createDeliveryArtifact,
   detachMountedJackVoiceBuildImages,
@@ -22,6 +28,11 @@ import {
 const cliArgs = new Set(process.argv.slice(2));
 const build = cliArgs.has("--build");
 const production = cliArgs.has("--production");
+const notarize = cliArgs.has("--notarize");
+if (notarize && (!build || !production || platform() !== "darwin")) {
+  console.error("[JackVoice] Apple 公证只能用于 macOS 正式桌面构建。");
+  process.exit(1);
+}
 const packageMetadata = JSON.parse(
   readFileSync(join(process.cwd(), "package.json"), "utf8"),
 );
@@ -179,10 +190,25 @@ function repairIncompatibleWebRtcCache(cargoTargetDir, env) {
 
 const cargoTargetDir = resolveCargoTargetDir();
 console.log(`[JackVoice] Cargo 构建缓存: ${cargoTargetDir}`);
-const buildEnvironment = resolveBuildEnvironment(cargoTargetDir);
+let buildEnvironment = resolveBuildEnvironment(cargoTargetDir);
 buildEnvironment.VITE_JACKVOICE_VERSION = releaseVersion;
 buildEnvironment.VITE_JACKVOICE_BUILD_ID = releaseBuildId || "development";
 if (releaseBuildId) buildEnvironment[RELEASE_BUILD_ID_ENV] = releaseBuildId;
+let notarizationCredentials = null;
+if (build && production && platform() === "darwin") {
+  if (notarize) {
+    try {
+      notarizationCredentials = validateNotarizationCredentials(buildEnvironment);
+    } catch (error) {
+      console.error(`[JackVoice] 正式发布已阻止：${error.message}`);
+      process.exit(1);
+    }
+  } else {
+    // A normal desktop build is intentionally Developer ID signed only. Strip
+    // ambient credentials so Tauri cannot notarize it by accident.
+    buildEnvironment = withoutNotarizationCredentials(buildEnvironment);
+  }
+}
 repairIncompatibleWebRtcCache(cargoTargetDir, buildEnvironment);
 
 let productionSigning = null;
@@ -202,6 +228,9 @@ if (build && production && platform() === "darwin") {
     console.log(
       `[JackVoice] 生产签名预检通过：Team ID ${productionSigning.teamId ?? "由 CI 证书提供"}`,
     );
+    if (notarizationCredentials) {
+      console.log(`[JackVoice] Apple 公证预检通过：${notarizationCredentials.method}`);
+    }
   } catch (error) {
     console.error(`[JackVoice] 生产构建已阻止：${error.message}`);
     process.exit(1);
@@ -266,13 +295,29 @@ child.on("exit", (code, signal) => {
       console.log(
         `[JackVoice] 生产签名验收通过：${verified.bundleIdentifier} / Team ID ${verified.teamId}`,
       );
+      const sourceDmgPath = productionDmgPath(cargoTargetDir, releaseVersion);
+      if (!notarize) {
+        console.log(`[JackVoice] Developer ID 签名包（未公证，仅供本地 QA）：${sourceDmgPath}`);
+        process.exitCode = 0;
+        return;
+      }
+
+      const submission = notarizeDmg(
+        sourceDmgPath,
+        notarizationCredentials,
+        buildEnvironment,
+      );
+      console.log(`[JackVoice] Apple DMG 公证已接受：${submission.submissionId}`);
+      const notarization = stapleAndVerifyNotarizedDmg(sourceDmgPath, submission);
+      console.log("[JackVoice] Apple DMG 公证验收通过：ticket 已 staple，Gatekeeper 已接受");
       const delivery = createDeliveryArtifact({
-        sourceDmgPath: productionDmgPath(cargoTargetDir, releaseVersion),
+        sourceDmgPath,
         buildId: releaseBuildId,
         version: releaseVersion,
         bundleIdentifier: verified.bundleIdentifier,
         teamId: verified.teamId,
         appExecutablePath: join(appPath, "Contents", "MacOS", "jackvoice"),
+        notarization,
       });
       console.log(`[JackVoice] 本次构建标识：${delivery.buildId}`);
       console.log(`[JackVoice] 唯一交付包：${delivery.deliveryPath}`);

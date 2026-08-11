@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 
 const PRODUCTION_SERVICE: &str = "com.jackvoice.app";
 const DEVELOPMENT_SERVICE: &str = "com.jackvoice.app.dev";
-const LEGACY_SHARED_SERVICE: &str = "com.jackvoice.shared";
 const VOLC_API_KEY_ACCOUNT: &str = "volc-api-key";
 const DEVELOPMENT_CREDENTIAL_FILE: &str = "dev-credentials.json";
 const DEVELOPMENT_MIGRATION_MARKER_FILE: &str = ".dev-credential-migration-complete";
@@ -41,7 +40,6 @@ pub enum CredentialSource {
     DevelopmentFile,
     Environment,
     Session,
-    LegacyMigration,
 }
 
 impl CredentialSource {
@@ -52,7 +50,6 @@ impl CredentialSource {
             Self::DevelopmentFile => "developmentFile",
             Self::Environment => "environment",
             Self::Session => "session",
-            Self::LegacyMigration => "legacyMigration",
         }
     }
 }
@@ -251,11 +248,11 @@ fn load_production(store: &impl SecretStore) -> CredentialLoad {
             source: CredentialSource::SystemStore,
             warning: String::new(),
         },
-        Ok(_) => migrate_legacy_credential(store),
+        Ok(_) => CredentialLoad::missing(String::new()),
         Err(error) => {
             eprintln!("[credentials] 正式版凭据读取失败：{error}");
             CredentialLoad::missing(
-                "系统凭据库中的 API Key 当前不可用。请重新填写一次；保存后会绑定当前稳定的正式版身份。",
+                "暂时无法访问系统凭据库。请稍后重试，或重新填写豆包语音 API Key。",
             )
         }
     }
@@ -307,35 +304,6 @@ fn save_development_file(path: &Path, value: &str) -> Result<(), String> {
     mark_development_migration_complete(path)
 }
 
-fn migrate_legacy_credential(store: &impl SecretStore) -> CredentialLoad {
-    match store.load(LEGACY_SHARED_SERVICE) {
-        Ok(Some(value)) if !value.trim().is_empty() => {
-            let value = value.trim().to_string();
-            match store.save(PRODUCTION_SERVICE, &value) {
-                Ok(()) => CredentialLoad {
-                    value,
-                    source: CredentialSource::LegacyMigration,
-                    warning: String::new(),
-                },
-                Err(error) => CredentialLoad {
-                    value,
-                    source: CredentialSource::LegacyMigration,
-                    warning: format!(
-                        "旧版 API Key 本次可用，但迁移到新的正式版凭据条目失败：{error}"
-                    ),
-                },
-            }
-        }
-        Ok(_) => CredentialLoad::missing(String::new()),
-        Err(error) => {
-            eprintln!("[credentials] 旧版凭据迁移读取失败：{error}");
-            CredentialLoad::missing(
-                "旧版 API Key 已无法由当前应用身份读取。请重新填写一次；保存后会绑定稳定的正式版身份，后续升级可继续使用。",
-            )
-        }
-    }
-}
-
 /// Save a user-entered credential for the current build identity.
 pub fn save_volc_api_key(
     mode: CredentialMode,
@@ -381,7 +349,6 @@ mod tests {
     struct FakeStore {
         values: RefCell<HashMap<String, String>>,
         load_error: RefCell<Option<String>>,
-        load_errors: RefCell<HashMap<String, String>>,
         calls: RefCell<Vec<String>>,
     }
 
@@ -389,9 +356,6 @@ mod tests {
         fn load(&self, service: &str) -> Result<Option<String>, String> {
             self.calls.borrow_mut().push(format!("load:{service}"));
             if let Some(error) = self.load_error.borrow().clone() {
-                return Err(error);
-            }
-            if let Some(error) = self.load_errors.borrow().get(service).cloned() {
                 return Err(error);
             }
             Ok(self.values.borrow().get(service).cloned())
@@ -546,8 +510,7 @@ mod tests {
         let loaded = load_production(&store);
         assert!(loaded.value.is_empty());
         assert_eq!(loaded.source, CredentialSource::Missing);
-        assert!(loaded.warning.contains("当前不可用"));
-        assert!(loaded.warning.contains("稳定的正式版身份"));
+        assert!(loaded.warning.contains("暂时无法访问系统凭据库"));
         assert!(!loaded.warning.contains("user canceled"));
     }
 
@@ -568,46 +531,15 @@ mod tests {
     }
 
     #[test]
-    fn production_migrates_accessible_legacy_value() {
+    fn production_missing_key_is_normal_first_run_state() {
         let store = FakeStore::default();
-        store
-            .values
-            .borrow_mut()
-            .insert(LEGACY_SHARED_SERVICE.into(), "legacy-secret".into());
         let loaded = load_production(&store);
-        assert_eq!(loaded.value, "legacy-secret");
-        assert_eq!(loaded.source, CredentialSource::LegacyMigration);
-        assert_eq!(
-            store
-                .values
-                .borrow()
-                .get(PRODUCTION_SERVICE)
-                .map(String::as_str),
-            Some("legacy-secret")
-        );
-    }
-
-    #[test]
-    fn production_inaccessible_legacy_value_requests_one_time_reentry() {
-        let store = FakeStore::default();
-        store.load_errors.borrow_mut().insert(
-            LEGACY_SHARED_SERVICE.into(),
-            "old signing identity denied".into(),
-        );
-
-        let loaded = load_production(&store);
-
         assert!(loaded.value.is_empty());
         assert_eq!(loaded.source, CredentialSource::Missing);
-        assert!(loaded.warning.contains("旧版 API Key"));
-        assert!(loaded.warning.contains("后续升级可继续使用"));
-        assert!(!loaded.warning.contains("old signing identity denied"));
+        assert!(loaded.warning.is_empty());
         assert_eq!(
             store.calls.borrow().as_slice(),
-            [
-                format!("load:{PRODUCTION_SERVICE}"),
-                format!("load:{LEGACY_SHARED_SERVICE}")
-            ]
+            [format!("load:{PRODUCTION_SERVICE}")]
         );
     }
 }

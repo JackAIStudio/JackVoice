@@ -18,6 +18,7 @@
     "dev:web": "vite",
     "build": "tsc && vite build",
     "build:desktop": "node scripts/run-desktop-dev.mjs --build --production",
+    "build:desktop:release": "node scripts/run-desktop-dev.mjs --build --production --notarize",
     "build:desktop:dev": "node scripts/run-desktop-dev.mjs --build",
     "reset:first-run:dev": "node scripts/reset-first-run.mjs dev",
     "reset:first-run:production": "node scripts/reset-first-run.mjs production",
