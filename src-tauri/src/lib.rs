@@ -45,12 +45,6 @@ fn delete_history_record(
     Ok(history::load(&state.data_dir()))
 }
 
-#[tauri::command]
-fn clear_history(state: tauri::State<'_, AppState>) -> Result<history::HistoryData, String> {
-    history::clear(&state.data_dir())?;
-    Ok(history::load(&state.data_dir()))
-}
-
 /// 以二进制 IPC 返回 WAV，前端只在用户点击播放时按需读取。
 #[tauri::command]
 fn get_history_audio(
@@ -71,14 +65,6 @@ fn reveal_history_audio(
     app.opener()
         .reveal_item_in_dir(path)
         .map_err(|e| format!("无法在文件夹中显示音频：{e}"))
-}
-
-#[tauri::command]
-fn open_audio_folder(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let path = history::ensure_audio_dir(&state.data_dir())?;
-    app.opener()
-        .open_path(path.to_string_lossy().into_owned(), None::<String>)
-        .map_err(|e| format!("无法打开录音文件夹：{e}"))
 }
 
 #[tauri::command]
@@ -607,10 +593,8 @@ pub fn run() {
             get_state,
             get_history,
             delete_history_record,
-            clear_history,
             get_history_audio,
             reveal_history_audio,
-            open_audio_folder,
             get_hotwords,
             save_hotwords,
             get_replacements,

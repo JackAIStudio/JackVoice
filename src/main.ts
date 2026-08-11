@@ -739,9 +739,6 @@ function renderHistory(records: HistoryRecord[]) {
   if (count) {
     count.textContent = query ? `${visibleRecords.length} / ${records.length} 条` : `${records.length} 条`;
   }
-  const clear = $("#clear-history") as HTMLButtonElement | null;
-  if (clear) clear.disabled = records.length === 0;
-
   if (visibleRecords.length === 0) {
     const empty = document.createElement("div");
     empty.className = "history-empty";
@@ -1051,26 +1048,6 @@ async function deleteHistoryRecord(recordId: string) {
   } catch (error) {
     await refreshHistory();
     showToast(`删除失败：${String(error)}`, "error");
-  }
-}
-
-async function clearAllHistory() {
-  if (historyRecords.length === 0) return;
-  if (!window.confirm("清空所有应用内听写记录？本地录音文件会继续保留。")) return;
-  stopHistoryPlayback();
-  try {
-    const data = await invoke<HistoryData>("clear_history");
-    const detail = $("#history-detail") as HTMLDialogElement | null;
-    if (detail?.open) detail.close();
-    const menu = document.querySelector<HTMLDetailsElement>(".history-menu");
-    if (menu) menu.open = false;
-    selectedHistoryId = null;
-    renderStats(data.stats);
-    renderHistory(data.records);
-    showToast("听写记录已清空，录音文件仍保留", "success");
-  } catch (error) {
-    await refreshHistory();
-    showToast(`清空失败：${String(error)}`, "error");
   }
 }
 
@@ -2344,8 +2321,6 @@ function bindSettingsModal() {
   $("#history-text-size")?.addEventListener("change", (e) => {
     void setHistoryTextSize((e.target as HTMLSelectElement).value);
   });
-  $("#settings-clear-history")?.addEventListener("click", () => void clearAllHistory());
-
   $("#mic-select")?.addEventListener("change", () => void onMicChanged());
   $("#mic-test-btn")?.addEventListener("click", () => void startMicTest());
   $("#mic-test-stop-btn")?.addEventListener("click", () => void stopMicTest());
@@ -2389,13 +2364,7 @@ function bindHome() {
   $("#toggle-btn")?.addEventListener("click", () => {
     void toggleDictation();
   });
-  $("#open-audio-folder")?.addEventListener("click", () => {
-    void invoke("open_audio_folder").catch((error) => {
-      showToast(`无法打开录音文件夹：${String(error)}`, "error");
-    });
-  });
   $("#dictation-notice-settings")?.addEventListener("click", openSettings);
-  $("#clear-history")?.addEventListener("click", () => void clearAllHistory());
   $("#history-search")?.addEventListener("input", (event) => {
     historyQuery = (event.target as HTMLInputElement).value;
     renderHistory(historyRecords);

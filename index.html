@@ -56,14 +56,6 @@
             <button id="dictation-notice-settings" class="dictation-notice-action" type="button">打开设置</button>
           </section>
 
-          <section class="recording-storage" aria-label="本地录音">
-            <div class="recording-storage-copy">
-              <strong>本地录音</strong>
-              <span>每次听写都会完整保存在本机，JackVoice 不会自动删除。</span>
-            </div>
-            <button id="open-audio-folder" class="btn ghost small" type="button">打开录音文件夹</button>
-          </section>
-
           <div class="history-workbench">
             <header class="workbench-head">
               <div class="workbench-title">
@@ -87,14 +79,6 @@
                   </svg>
                   <input id="history-search" type="search" placeholder="搜索听写内容" autocomplete="off" />
                 </label>
-                <details class="history-menu">
-                  <summary title="更多操作" aria-label="更多历史操作">
-                    <span></span><span></span><span></span>
-                  </summary>
-                  <div class="history-menu-popover">
-                    <button id="clear-history" class="text-button danger" type="button">清空全部记录</button>
-                  </div>
-                </details>
               </div>
             </header>
             <div id="history"></div>
@@ -233,23 +217,6 @@
                   <option value="standard" selected>标准</option>
                   <option value="large">大号</option>
                 </select>
-              </div>
-            </section>
-
-            <section class="set-group">
-              <h3>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-                  <path d="M9 12l2 2 4-4" />
-                </svg>
-                数据与隐私
-              </h3>
-              <div class="set-row">
-                <div>
-                  <div class="set-title">清空听写记录</div>
-                  <div class="set-desc">只清空应用内的文字记录；录音文件仍保留在本地录音文件夹。</div>
-                </div>
-                <button id="settings-clear-history" class="btn danger small" type="button">清空记录</button>
               </div>
             </section>
 
@@ -476,7 +443,7 @@
           <section class="ob-pane" data-pane="3">
             <h2>数据与隐私 <span class="ob-requirement required">必需确认</span></h2>
             <p>听写时，麦克风音频会通过加密连接实时发送至你自行配置的火山引擎账号进行识别。</p>
-            <p>每次听写的本地录音都会永久保存在本机，不会自动到期或删除。你可以随时从首页打开录音文件夹自行管理。</p>
+            <p>每次听写的本地录音都会永久保存在本机，不会自动到期或删除。你可以在听写详情中显示对应录音文件并自行管理。</p>
             <label class="privacy-confirm">
               <input id="ob-privacy-confirm" type="checkbox" />
               <span>我已了解音频的云端处理和本地保存方式</span>

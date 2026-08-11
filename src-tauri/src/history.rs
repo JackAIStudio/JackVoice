@@ -212,11 +212,6 @@ pub fn delete_record(dir: &Path, record_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn clear(dir: &Path) -> Result<(), String> {
-    persist_records(dir, &[])?;
-    remove_history_backup(dir)
-}
-
 pub fn ensure_audio_dir(dir: &Path) -> Result<PathBuf, String> {
     let path = audio_dir(dir);
     fs::create_dir_all(&path).map_err(|e| format!("创建录音文件夹失败：{e}"))?;
@@ -675,35 +670,6 @@ mod tests {
         let records = load(&dir).records;
         assert_eq!(records.len(), 1);
         assert!(records[0].audio_missing);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn clearing_history_keeps_all_audio() {
-        let dir = temp_dir();
-        let id = uuid::Uuid::new_v4().to_string();
-        let mut recorder = AudioRecorder::create(&dir, &id).unwrap();
-        recorder.write_pcm(&[0, 0, 1, 0]).unwrap();
-        let artifact = recorder.finish().unwrap();
-        let audio_path = audio_file_path(&dir, &artifact.file_name).unwrap();
-        append(
-            &dir,
-            HistoryAppend {
-                id,
-                text: "清空",
-                duration_ms: 1,
-                audio: Some(artifact),
-                recognition: None,
-                recording_error: None,
-                recognition_error: None,
-            },
-        )
-        .unwrap();
-
-        clear(&dir).unwrap();
-
-        assert!(load(&dir).records.is_empty());
-        assert!(audio_path.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

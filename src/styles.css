@@ -395,39 +395,6 @@ kbd.shortcut {
   border-color: #d9adad;
 }
 
-.recording-storage {
-  display: flex;
-  min-height: 54px;
-  align-items: center;
-  justify-content: space-between;
-  gap: 18px;
-  margin-bottom: 12px;
-  padding: 10px 14px;
-  border: 1px solid #dce9e4;
-  border-radius: 14px;
-  background: #f5faf8;
-}
-
-.recording-storage-copy {
-  display: flex;
-  min-width: 0;
-  align-items: baseline;
-  gap: 10px;
-}
-
-.recording-storage-copy strong {
-  flex: none;
-  font-size: 12px;
-}
-
-.recording-storage-copy span {
-  overflow: hidden;
-  color: #66716c;
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .usage-summary {
   display: flex;
   align-items: center;
@@ -521,56 +488,6 @@ kbd.shortcut {
 }
 
 .history-search input::placeholder { color: #9b9e98; }
-
-.history-menu {
-  position: relative;
-}
-
-.history-menu summary {
-  display: flex;
-  width: 36px;
-  height: 36px;
-  align-items: center;
-  justify-content: center;
-  gap: 3px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  color: var(--text-2);
-  cursor: pointer;
-  list-style: none;
-}
-
-.history-menu summary::-webkit-details-marker { display: none; }
-.history-menu summary:hover { background: var(--hover); color: var(--text); }
-
-.history-menu summary span {
-  width: 3px;
-  height: 3px;
-  border-radius: 50%;
-  background: currentColor;
-}
-
-.history-menu-popover {
-  position: absolute;
-  z-index: 20;
-  top: 42px;
-  right: 0;
-  min-width: 142px;
-  padding: 6px;
-  border: 1px solid var(--border);
-  border-radius: 11px;
-  background: #fff;
-  box-shadow: 0 10px 28px rgba(23, 23, 26, 0.13);
-}
-
-.history-menu-popover .text-button {
-  width: 100%;
-  padding: 8px 9px;
-  border-radius: 7px;
-  text-align: left;
-}
-
-.history-menu-popover .text-button:hover { background: #fff2f2; }
 
 .text-button {
   padding: 5px 7px;
