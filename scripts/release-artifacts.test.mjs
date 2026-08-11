@@ -18,11 +18,11 @@ import {
 
 test("生产构建拒绝 package、Tauri 与 Cargo 版本号漂移", () => {
   assert.equal(
-    validateReleaseVersions({ package: "0.1.1", tauri: "0.1.1", cargo: "0.1.1" }),
-    "0.1.1",
+    validateReleaseVersions({ package: "8.12.5", tauri: "8.12.5", cargo: "8.12.5" }),
+    "8.12.5",
   );
   assert.throws(
-    () => validateReleaseVersions({ package: "0.1.1", tauri: "0.1.0", cargo: "0.1.1" }),
+    () => validateReleaseVersions({ package: "8.12.5", tauri: "8.12.4", cargo: "8.12.5" }),
     /版本号不一致/,
   );
 });
@@ -46,7 +46,7 @@ image-path      : /Users/test/Downloads/JackVoice_0.1.0_aarch64.dmg
 /dev/disk13\tGUID_partition_scheme
 /dev/disk13s1\tUUID\t/Volumes/JackVoice 2
 ================================================
-image-path      : /Users/test/Library/Caches/JackVoice/release-cargo-target/release/bundle/macos/rw.123.JackVoice_0.1.1_aarch64.dmg
+image-path      : /Users/test/Library/Caches/JackVoice/release-cargo-target/release/bundle/macos/rw.123.JackVoice_8.12.5_aarch64.dmg
 /dev/disk14\tGUID_partition_scheme
 /dev/disk14s1\tUUID\t/Volumes/dmg.temp
 `;
@@ -69,22 +69,22 @@ image-path      : /Users/test/Library/Caches/JackVoice/release-cargo-target/rele
 test("交付文件名同时绑定版本、构建标识和内容哈希", () => {
   assert.equal(
     deliveryDmgFileName(
-      "JackVoice_0.1.1_aarch64.dmg",
+      "JackVoice_8.12.5_aarch64.dmg",
       "20260811T073045123Z",
       "a".repeat(64),
     ),
-    "JackVoice_0.1.1_aarch64_build-20260811T073045123Z_aaaaaaaaaaaaaaaa.dmg",
+    "JackVoice_8.12.5_aarch64_build-20260811T073045123Z_aaaaaaaaaaaaaaaa.dmg",
   );
   assert.equal(
-    productionDmgPath("/tmp/target", "0.1.1", "arm64"),
-    "/tmp/target/release/bundle/dmg/JackVoice_0.1.1_aarch64.dmg",
+    productionDmgPath("/tmp/target", "8.12.5", "arm64"),
+    "/tmp/target/release/bundle/dmg/JackVoice_8.12.5_aarch64.dmg",
   );
 });
 
 test("交付产物包含可独立核验的 DMG、SHA-256 和清单", () => {
   const testRoot = mkdtempSync(join(tmpdir(), "jackvoice-release-artifact-"));
   try {
-    const sourceDmgPath = join(testRoot, "JackVoice_0.1.1_aarch64.dmg");
+    const sourceDmgPath = join(testRoot, "JackVoice_8.12.5_aarch64.dmg");
     const appExecutablePath = join(testRoot, "jackvoice");
     writeFileSync(sourceDmgPath, "signed dmg fixture");
     writeFileSync(appExecutablePath, "signed app fixture");
@@ -93,7 +93,7 @@ test("交付产物包含可独立核验的 DMG、SHA-256 和清单", () => {
     const artifact = createDeliveryArtifact({
       sourceDmgPath,
       buildId: "20260811T073045123Z",
-      version: "0.1.1",
+      version: "8.12.5",
       bundleIdentifier: "com.jackvoice.app",
       teamId: "ABCDEFGHIJ",
       appExecutablePath,
@@ -113,7 +113,7 @@ test("交付产物包含可独立核验的 DMG、SHA-256 和清单", () => {
       `${expectedDmgSha}  ${artifact.deliveryPath.split("/").at(-1)}\n`,
     );
     const manifest = JSON.parse(readFileSync(artifact.manifestPath, "utf8"));
-    assert.equal(manifest.version, "0.1.1");
+    assert.equal(manifest.version, "8.12.5");
     assert.equal(manifest.buildId, "20260811T073045123Z");
     assert.equal(manifest.dmg.sha256, expectedDmgSha);
     assert.equal(manifest.bundleIdentifier, "com.jackvoice.app");
@@ -132,7 +132,7 @@ test("交付产物包含可独立核验的 DMG、SHA-256 和清单", () => {
 test("没有公证、staple 或 Gatekeeper 证据时拒绝生成交付目录", () => {
   const testRoot = mkdtempSync(join(tmpdir(), "jackvoice-unnotarized-artifact-"));
   try {
-    const sourceDmgPath = join(testRoot, "JackVoice_0.1.1_aarch64.dmg");
+    const sourceDmgPath = join(testRoot, "JackVoice_8.12.5_aarch64.dmg");
     const appExecutablePath = join(testRoot, "jackvoice");
     writeFileSync(sourceDmgPath, "signed only dmg fixture");
     writeFileSync(appExecutablePath, "signed app fixture");
@@ -142,7 +142,7 @@ test("没有公证、staple 或 Gatekeeper 证据时拒绝生成交付目录", (
         createDeliveryArtifact({
           sourceDmgPath,
           buildId: "20260811T073045123Z",
-          version: "0.1.1",
+          version: "8.12.5",
           bundleIdentifier: "com.jackvoice.app",
           teamId: "ABCDEFGHIJ",
           appExecutablePath,

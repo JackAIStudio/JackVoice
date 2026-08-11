@@ -1,7 +1,7 @@
 {
   "name": "jackvoice",
   "private": true,
-  "version": "0.1.1",
+  "version": "8.12.5",
   "description": "开源桌面全局语音听写工具",
   "license": "Apache-2.0",
   "repository": {

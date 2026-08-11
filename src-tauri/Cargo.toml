@@ -1,6 +1,6 @@
 [package]
 name = "jackvoice"
-version = "0.1.1"
+version = "8.12.5"
 description = "Cross-platform global dictation powered by Volcengine Doubao streaming ASR"
 authors = ["JackVoice contributors"]
 license = "Apache-2.0"

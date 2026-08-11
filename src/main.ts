@@ -2449,10 +2449,12 @@ function bindDict() {
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
-  const version = import.meta.env.VITE_JACKVOICE_VERSION || "0.1.1";
+  const version = import.meta.env.VITE_JACKVOICE_VERSION || "8.12.5";
   const buildId = import.meta.env.VITE_JACKVOICE_BUILD_ID || "development";
   const buildVersion = $("#app-build-version");
   if (buildVersion) buildVersion.textContent = `v${version} · build ${buildId}`;
+  const settingsVersion = $("#settings-app-version");
+  if (settingsVersion) settingsVersion.textContent = `v${version}`;
 
   await listen<ShortcutCaptureEvent>("jackvoice://shortcut-captured", (event) =>
     onNativeShortcutCaptured(event.payload),

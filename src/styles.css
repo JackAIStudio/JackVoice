@@ -1118,6 +1118,23 @@ kbd.shortcut {
   color: var(--text);
 }
 
+.settings-version {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-top: auto;
+  padding: 10px 14px 2px;
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.settings-version strong {
+  color: var(--text-2);
+  font-size: inherit;
+  font-weight: 600;
+}
+
 .modal-body {
   position: relative;
   flex: 1;
