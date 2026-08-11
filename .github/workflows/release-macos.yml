@@ -28,7 +28,7 @@ jobs:
       contents: write
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-      CARGO_TARGET_DIR: ${{ runner.temp }}/jackvoice-release-target
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.release-cargo-target
       JACKVOICE_BUILD_ID: gh-${{ github.run_id }}-${{ github.run_attempt }}
       JACKVOICE_APPLE_TEAM_ID: ${{ vars.JACKVOICE_APPLE_TEAM_ID }}
       APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
