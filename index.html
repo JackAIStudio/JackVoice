@@ -132,22 +132,41 @@
                   <h2 class="dict-panel-title">替换词</h2>
                   <p class="dict-panel-desc">听写后在本地把识别结果里的 A 改成 B，替换规则不上传云端</p>
                 </div>
-                <div class="dict-panel-actions">
-                  <button id="replacements-clear" class="btn ghost" disabled>清空</button>
-                  <button id="replacements-save" class="btn ghost" disabled>保存</button>
-                  <button id="replacements-add" class="btn ghost">添加规则</button>
-                </div>
               </div>
               <div class="replacement-match-note" role="note">
                 <strong>匹配说明</strong>
                 <span>自动忽略英文字母大小写，大小写不同的重复规则会自动合并；空格、标点和拼写必须一致。例如“Chrome DevTools → Chrome DevTools”也能把“chrome devtools”统一为正确写法。</span>
               </div>
-              <div class="dict-editor">
-                <textarea id="replacements-input" placeholder="每行一条：识别结果|想要的写法&#10;同一识别词仅大小写不同时，会自动合并&#10;例：Broll|B roll&#10;ChromeDevTools|Chrome DevTools&#10;OpenCloud|OpenClaw"></textarea>
-                <span id="replacements-count" class="dict-count">0 条替换</span>
-              </div>
+              <form id="replacement-form" class="replacement-form" novalidate>
+                <div class="replacement-form-head">
+                  <strong id="replacement-form-title">添加替换词</strong>
+                  <button id="replacement-cancel" class="replacement-cancel hidden" type="button">取消编辑</button>
+                </div>
+                <div class="replacement-fields">
+                  <label class="replacement-field" for="replacement-from">
+                    <span>识别结果</span>
+                    <input id="replacement-from" type="text" placeholder="例如：Broll" autocomplete="off" />
+                    <small>听写里实际出现的内容</small>
+                  </label>
+                  <div class="replacement-arrow" aria-hidden="true">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M5 12h14" /><path d="m13 6 6 6-6 6" />
+                    </svg>
+                  </div>
+                  <label class="replacement-field" for="replacement-to">
+                    <span>替换为</span>
+                    <input id="replacement-to" type="text" placeholder="例如：B roll" autocomplete="off" />
+                    <small>你希望最终显示的写法</small>
+                  </label>
+                </div>
+                <p id="replacement-form-error" class="replacement-form-error hidden" role="alert"></p>
+                <div class="replacement-form-foot">
+                  <span>直接填写两边即可，无需输入分隔符</span>
+                  <button id="replacements-save" class="btn dark" type="submit" disabled>添加替换词</button>
+                </div>
+              </form>
               <div class="dict-manage-head">
-                <strong>已添加替换词</strong>
+                <strong>已添加替换词 <span id="replacements-count" class="dict-total">0 条</span></strong>
                 <input id="replacements-search" class="search" placeholder="搜索替换词" />
               </div>
               <div id="replacements-grid" class="words-grid replacements-grid"></div>

@@ -103,6 +103,7 @@ let hotwords: string[] = [];
 let hotwordFilter = "";
 let replacements: ReplacementRule[] = [];
 let replacementFilter = "";
+let editingReplacementSource: string | null = null;
 let recordingShortcut = false;
 let historyRecords: HistoryRecord[] = [];
 let selectedHistoryId: string | null = null;
@@ -1429,7 +1430,7 @@ async function refreshReplacements() {
 function renderReplacements() {
   const grid = $("#replacements-grid");
   const count = $("#replacements-count");
-  if (count) count.textContent = `${replacements.length} 条替换`;
+  if (count) count.textContent = `${replacements.length} 条`;
   if (!grid) return;
   grid.innerHTML = "";
   const query = replacementFilter.trim().toLowerCase();
@@ -1446,7 +1447,7 @@ function renderReplacements() {
     empty.style.gridColumn = "1 / -1";
     empty.textContent = query
       ? "没有匹配的替换词"
-      : "还没有替换词。右侧输入：识别结果|想要的写法";
+      : "还没有替换词，在上方填写识别结果和正确写法吧。";
     grid.appendChild(empty);
     return;
   }
@@ -1461,46 +1462,85 @@ function renderReplacements() {
     to.className = "rep-to";
     to.textContent = rule.to;
     body.append(from, to);
+    const actions = document.createElement("div");
+    actions.className = "word-actions";
+    const edit = document.createElement("button");
+    edit.className = "word-edit";
+    edit.type = "button";
+    edit.title = "编辑";
+    edit.setAttribute("aria-label", `编辑替换词：${rule.from}`);
+    edit.textContent = "编辑";
+    edit.addEventListener("click", () => startReplacementEdit(rule));
     const del = document.createElement("button");
     del.className = "word-del";
+    del.type = "button";
     del.title = "删除";
+    del.setAttribute("aria-label", `删除替换词：${rule.from}`);
     del.textContent = "×";
     del.addEventListener("click", () => void removeReplacement(rule.from));
-    card.append(body, del);
+    actions.append(edit, del);
+    card.append(body, actions);
     grid.appendChild(card);
   }
-}
-
-function parseReplacementInput(): ReplacementRule[] {
-  const textarea = $("#replacements-input") as HTMLTextAreaElement | null;
-  if (!textarea) return [];
-  const out: ReplacementRule[] = [];
-  for (const raw of textarea.value.split("\n")) {
-    const line = raw.trim();
-    if (!line) continue;
-    const sep = line.includes("|") ? "|" : line.includes("→") ? "→" : line.includes("->") ? "->" : "";
-    if (!sep) continue;
-    const idx = line.indexOf(sep);
-    const from = line.slice(0, idx).trim();
-    const to = line.slice(idx + sep.length).trim();
-    // 允许 from === to：用作长短语锁，避免短词替换误伤。
-    if (!from || !to) continue;
-    out.push({ from, to });
-  }
-  return out;
 }
 
 function replacementSourceKey(value: string): string {
   return value.trim().toLowerCase();
 }
 
+function replacementInputs() {
+  return {
+    from: $("#replacement-from") as HTMLInputElement | null,
+    to: $("#replacement-to") as HTMLInputElement | null,
+  };
+}
+
+function setReplacementFormError(message = "") {
+  const error = $("#replacement-form-error");
+  if (!error) return;
+  error.textContent = message;
+  error.classList.toggle("hidden", !message);
+}
+
 function syncReplacementEditorButtons() {
-  const textarea = $("#replacements-input") as HTMLTextAreaElement | null;
-  const has = !!textarea && textarea.value.trim().length > 0;
+  const inputs = replacementInputs();
+  const complete = !!inputs.from?.value.trim() && !!inputs.to?.value.trim();
   const save = $("#replacements-save") as HTMLButtonElement | null;
-  const clear = $("#replacements-clear") as HTMLButtonElement | null;
-  if (save) save.disabled = !has;
-  if (clear) clear.disabled = !has;
+  if (save) save.disabled = !complete;
+  if (complete) setReplacementFormError();
+}
+
+function resetReplacementEditor() {
+  const inputs = replacementInputs();
+  if (inputs.from) inputs.from.value = "";
+  if (inputs.to) inputs.to.value = "";
+  editingReplacementSource = null;
+  const title = $("#replacement-form-title");
+  const save = $("#replacements-save") as HTMLButtonElement | null;
+  const cancel = $("#replacement-cancel");
+  if (title) title.textContent = "添加替换词";
+  if (save) save.textContent = "添加替换词";
+  cancel?.classList.add("hidden");
+  setReplacementFormError();
+  syncReplacementEditorButtons();
+}
+
+function startReplacementEdit(rule: ReplacementRule) {
+  const inputs = replacementInputs();
+  if (!inputs.from || !inputs.to) return;
+  editingReplacementSource = rule.from;
+  inputs.from.value = rule.from;
+  inputs.to.value = rule.to;
+  const title = $("#replacement-form-title");
+  const save = $("#replacements-save") as HTMLButtonElement | null;
+  if (title) title.textContent = "编辑替换词";
+  if (save) save.textContent = "保存修改";
+  $("#replacement-cancel")?.classList.remove("hidden");
+  setReplacementFormError();
+  syncReplacementEditorButtons();
+  $("#replacement-form")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  inputs.from.focus();
+  inputs.from.select();
 }
 
 async function persistReplacements(rules: ReplacementRule[]) {
@@ -1519,34 +1559,44 @@ async function persistReplacements(rules: ReplacementRule[]) {
   return result;
 }
 
-async function saveReplacementsFromEditor() {
-  const incoming = parseReplacementInput();
-  if (incoming.length === 0) {
-    window.alert("请按「识别结果|想要的写法」格式输入，例如：Broll|B roll");
+async function saveReplacementFromEditor() {
+  const inputs = replacementInputs();
+  const from = inputs.from?.value.trim() ?? "";
+  const to = inputs.to?.value.trim() ?? "";
+  if (!from || !to) {
+    setReplacementFormError("请把“识别结果”和“替换为”都填写完整。");
+    (from ? inputs.to : inputs.from)?.focus();
     return;
   }
+
+  const wasEditing = editingReplacementSource !== null;
   const merged = [...replacements];
-  for (const rule of incoming) {
-    const sourceKey = replacementSourceKey(rule.from);
-    const idx = merged.findIndex((r) => replacementSourceKey(r.from) === sourceKey);
-    if (idx >= 0) {
-      // 匹配本身忽略大小写：保留首次录入的展示写法，只更新替换目标。
-      merged[idx] = { from: merged[idx].from, to: rule.to };
-    } else {
-      merged.push(rule);
-    }
+  if (editingReplacementSource !== null) {
+    const originalKey = replacementSourceKey(editingReplacementSource);
+    const originalIndex = merged.findIndex(
+      (rule) => replacementSourceKey(rule.from) === originalKey,
+    );
+    if (originalIndex >= 0) merged.splice(originalIndex, 1);
   }
+
+  const sourceKey = replacementSourceKey(from);
+  const existingIndex = merged.findIndex(
+    (rule) => replacementSourceKey(rule.from) === sourceKey,
+  );
+  if (existingIndex >= 0) {
+    // 匹配本身忽略大小写：保留首次录入的展示写法，只更新替换目标。
+    merged[existingIndex] = { from: merged[existingIndex].from, to };
+  } else {
+    merged.push({ from, to });
+  }
+
   try {
-    const result = await persistReplacements(merged);
-    const textarea = $("#replacements-input") as HTMLTextAreaElement | null;
-    if (textarea) textarea.value = "";
-    syncReplacementEditorButtons();
-    if (result.message) {
-      // 状态栏已更新；不弹窗打扰
-    }
+    await persistReplacements(merged);
+    resetReplacementEditor();
+    showToast(wasEditing || existingIndex >= 0 ? "替换词已更新" : "替换词已添加", "success");
   } catch (error) {
     console.error("save replacements failed", error);
-    window.alert(`保存替换词失败：${error}`);
+    setReplacementFormError(`保存失败：${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -2399,23 +2449,12 @@ function bindDict() {
   $("#hotwords-input")?.addEventListener("input", syncEditorButtons);
   $("#hotwords-save")?.addEventListener("click", () => void saveHotwordsFromEditor());
   $("#hotwords-sync-volc")?.addEventListener("click", () => void syncVolcHotwordTable());
-  $("#replacements-input")?.addEventListener("input", syncReplacementEditorButtons);
-  $("#replacements-save")?.addEventListener("click", () => void saveReplacementsFromEditor());
-  $("#replacements-clear")?.addEventListener("click", () => {
-    const textarea = $("#replacements-input") as HTMLTextAreaElement | null;
-    if (textarea) textarea.value = "";
-    syncReplacementEditorButtons();
-  });
-  $("#replacements-add")?.addEventListener("click", () => {
-    const textarea = $("#replacements-input") as HTMLTextAreaElement | null;
-    if (!textarea) return;
-    textarea.focus();
-    if (textarea.value && !textarea.value.endsWith("\n")) textarea.value += "\n";
-    textarea.value += "|";
-    // 光标移到 | 前，方便先写识别结果
-    const pos = textarea.value.lastIndexOf("|");
-    textarea.setSelectionRange(pos, pos);
-    syncReplacementEditorButtons();
+  $("#replacement-from")?.addEventListener("input", syncReplacementEditorButtons);
+  $("#replacement-to")?.addEventListener("input", syncReplacementEditorButtons);
+  $("#replacement-cancel")?.addEventListener("click", resetReplacementEditor);
+  $("#replacement-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void saveReplacementFromEditor();
   });
   $("#replacements-search")?.addEventListener("input", (e) => {
     replacementFilter = (e.target as HTMLInputElement).value;
