@@ -27,7 +27,12 @@ type UiState = {
   maxSentenceSilenceMs: number;
   inputGainDb: number;
   selectedInputDeviceId: string;
+  selectedInputDeviceName: string;
+  selectedInputDeviceAvailable: boolean;
   inputDevices: InputDeviceInfo[];
+  activeInputDeviceId: string;
+  activeInputDeviceName: string;
+  usingInputDeviceFallback: boolean;
   audioLevel: number;
   micTesting: boolean;
   lastDeliveryMessage: string;
@@ -118,6 +123,8 @@ let historyPlayback: {
 } | null = null;
 let toastTimer: number | undefined;
 let dictationElapsedTimer: number | undefined;
+let micDeviceRefreshTimer: number | undefined;
+let micDeviceRefreshInFlight = false;
 let dictationRecordingStartedAt: number | null = null;
 let lastDictationPhase = "idle";
 let credentialEditorOpen = false;
@@ -583,28 +590,61 @@ function applyState(state: UiState) {
 }
 
 function applyMicUi(state: UiState) {
+  const dictationActive = !["idle", "error"].includes(state.phase);
+  const selectionLocked = dictationActive || state.micTesting;
   const select = $("#mic-select") as HTMLSelectElement | null;
+  if (select) select.disabled = selectionLocked;
   if (select && document.activeElement !== select) {
     const devices = state.inputDevices || [];
     select.innerHTML = "";
-    if (devices.length === 0) {
-      const opt = document.createElement("option");
-      opt.value = "";
-      opt.textContent = "未检测到麦克风";
-      select.appendChild(opt);
-      select.disabled = true;
-    } else {
-      select.disabled = false;
-      for (const device of devices) {
-        const opt = document.createElement("option");
-        opt.value = device.id;
-        opt.textContent = device.isDefault ? `${device.name}（默认）` : device.name;
-        select.appendChild(opt);
-      }
-      const exists = devices.some((d) => d.id === state.selectedInputDeviceId);
-      const fallback = devices.find((d) => d.isDefault) || devices[0];
-      select.value = exists ? state.selectedInputDeviceId : fallback.id;
+    const automatic = document.createElement("option");
+    automatic.value = "";
+    automatic.textContent = "自动选择（跟随系统默认）";
+    select.appendChild(automatic);
+
+    const selectedExists = devices.some((device) => device.id === state.selectedInputDeviceId);
+    if (state.selectedInputDeviceId && !selectedExists) {
+      const offline = document.createElement("option");
+      offline.value = state.selectedInputDeviceId;
+      offline.textContent = `${state.selectedInputDeviceName || "已选麦克风"}（未连接）`;
+      offline.disabled = true;
+      select.appendChild(offline);
     }
+    for (const device of devices) {
+      const opt = document.createElement("option");
+      opt.value = device.id;
+      opt.textContent = device.isDefault ? `${device.name}（系统默认）` : device.name;
+      select.appendChild(opt);
+    }
+    select.value = state.selectedInputDeviceId || "";
+  }
+
+  const deviceStatus = $("#mic-device-status");
+  if (deviceStatus) {
+    const actualName = state.activeInputDeviceName;
+    const actualLabel = dictationActive || state.micTesting ? "当前使用" : "当前将使用";
+    let message = "自动选择会跟随 macOS 当前的系统默认麦克风。";
+    let warning = false;
+    if (state.selectedInputDeviceId) {
+      const preferredName = state.selectedInputDeviceName || "首选麦克风";
+      if (!state.selectedInputDeviceAvailable || state.usingInputDeviceFallback) {
+        warning = true;
+        message = actualName
+          ? `首选「${preferredName}」未连接，${actualLabel}「${actualName}」；恢复后下次听写会自动优先使用。`
+          : `首选「${preferredName}」未连接，暂未检测到可用的备用麦克风。`;
+      } else {
+        message = actualName
+          ? `首选「${preferredName}」已连接，${actualLabel}「${actualName}」。`
+          : `已优先选择「${preferredName}」。`;
+      }
+    } else if (actualName) {
+      message = `自动选择，${actualLabel}「${actualName}」。`;
+    } else {
+      warning = true;
+      message = "未检测到可用麦克风；连接设备后会自动更新。";
+    }
+    deviceStatus.textContent = message;
+    deviceStatus.classList.toggle("warn", warning);
   }
 
   const meter = $("#mic-meter");
@@ -613,7 +653,10 @@ function applyMicUi(state: UiState) {
   const testBtn = $("#mic-test-btn") as HTMLButtonElement | null;
   if (testBtn) {
     testBtn.textContent = state.micTesting ? "测试中" : "测试";
-    testBtn.disabled = state.micTesting;
+    testBtn.disabled = state.micTesting || dictationActive || !state.activeInputDeviceName;
+    testBtn.title = state.activeInputDeviceName
+      ? `测试当前设备：${state.activeInputDeviceName}`
+      : "当前没有可测试的麦克风";
   }
   const stopBtn = $("#mic-test-stop-btn");
   if (stopBtn) stopBtn.classList.toggle("hidden", !state.micTesting);
@@ -622,6 +665,7 @@ function applyMicUi(state: UiState) {
 
   // Onboarding 麦克风控件与主设置保持一致
   const obSelect = $("#ob-mic-select") as HTMLSelectElement | null;
+  if (obSelect && state.inputDevices.length > 0) obSelect.disabled = selectionLocked;
   if (obSelect && document.activeElement !== obSelect) {
     const devices = state.inputDevices || [];
     obSelect.innerHTML = "";
@@ -634,16 +678,25 @@ function applyMicUi(state: UiState) {
       obSelect.appendChild(opt);
       obSelect.disabled = true;
     } else {
-      obSelect.disabled = false;
+      const automatic = document.createElement("option");
+      automatic.value = "";
+      automatic.textContent = "自动选择（跟随系统默认）";
+      obSelect.appendChild(automatic);
+      const selectedExists = devices.some((device) => device.id === state.selectedInputDeviceId);
+      if (state.selectedInputDeviceId && !selectedExists) {
+        const offline = document.createElement("option");
+        offline.value = state.selectedInputDeviceId;
+        offline.textContent = `${state.selectedInputDeviceName || "已选麦克风"}（未连接）`;
+        offline.disabled = true;
+        obSelect.appendChild(offline);
+      }
       for (const device of devices) {
         const opt = document.createElement("option");
         opt.value = device.id;
-        opt.textContent = device.isDefault ? `${device.name}（默认）` : device.name;
+        opt.textContent = device.isDefault ? `${device.name}（系统默认）` : device.name;
         obSelect.appendChild(opt);
       }
-      const exists = devices.some((d) => d.id === state.selectedInputDeviceId);
-      const fallback = devices.find((d) => d.isDefault) || devices[0];
-      obSelect.value = exists ? state.selectedInputDeviceId : fallback.id;
+      obSelect.value = state.selectedInputDeviceId || "";
     }
   }
 
@@ -1615,9 +1668,19 @@ function openSettings() {
   if (currentState) applyState(currentState);
   $("#settings-modal")?.classList.remove("hidden");
   void refreshMicDevices();
+  if (micDeviceRefreshTimer) window.clearInterval(micDeviceRefreshTimer);
+  micDeviceRefreshTimer = window.setInterval(() => {
+    if (!currentState?.micTesting && ["idle", "error"].includes(currentState?.phase || "")) {
+      void refreshMicDevices();
+    }
+  }, 2000);
 }
 
 function closeSettings() {
+  if (micDeviceRefreshTimer) {
+    window.clearInterval(micDeviceRefreshTimer);
+    micDeviceRefreshTimer = undefined;
+  }
   if (recordingShortcut) stopRecording();
   credentialEditorOpen = false;
   const input = $("#volc-api-key") as HTMLInputElement | null;
@@ -1952,6 +2015,9 @@ async function onMicChanged() {
     applyState(state);
   } catch (error) {
     console.error("set mic failed", error);
+    showToast(`切换麦克风失败：${error instanceof Error ? error.message : String(error)}`, "error");
+    ($("#mic-select") as HTMLSelectElement | null)?.blur();
+    if (currentState) applyState(currentState);
   }
 }
 
@@ -2122,11 +2188,15 @@ function goObStep(n: number) {
 /** Lazily populate the microphone dropdown in the regular settings view.
  *  Onboarding deliberately waits for the explicit "测试麦克风" action. */
 async function refreshMicDevices() {
+  if (micDeviceRefreshInFlight) return;
+  micDeviceRefreshInFlight = true;
   try {
     const state = await invoke<UiState>("list_input_devices");
     applyState(state);
   } catch (error) {
     console.error("list input devices failed", error);
+  } finally {
+    micDeviceRefreshInFlight = false;
   }
 }
 

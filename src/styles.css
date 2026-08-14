@@ -1326,6 +1326,18 @@ kbd.shortcut {
   flex-shrink: 0;
 }
 
+.mic-device-status {
+  margin-top: 4px;
+  max-width: 560px;
+  color: var(--mint-dark);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.mic-device-status.warn {
+  color: var(--warning);
+}
+
 select,
 .text-input {
   padding: 8px 12px;

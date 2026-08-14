@@ -1,5 +1,5 @@
 use crate::asr::{RealtimeSession, TranscriptUpdate, VolcAsrConfig, ASR_ENGINE_NAME};
-use crate::audio::{self, AudioCapture, InputDeviceInfo};
+use crate::audio::{self, AudioCapture, InputDeviceInfo, InputDevicePreference};
 use crate::credentials::{CredentialMode, CredentialSource};
 use crate::delivery::{self, DeliveryResult};
 use crate::history::{AudioRecorder, HistoryAppend, RecognitionContext};
@@ -71,7 +71,14 @@ pub struct UiState {
     pub max_sentence_silence_ms: u32,
     pub input_gain_db: f32,
     pub selected_input_device_id: String,
+    pub selected_input_device_name: String,
+    pub selected_input_device_available: bool,
     pub input_devices: Vec<InputDeviceInfo>,
+    /// The device currently capturing, or the device that would be selected
+    /// if capture started now after the latest device refresh.
+    pub active_input_device_id: String,
+    pub active_input_device_name: String,
+    pub using_input_device_fallback: bool,
     pub audio_level: f32,
     pub mic_testing: bool,
     pub last_delivery_message: String,
@@ -111,7 +118,12 @@ impl Default for UiState {
             max_sentence_silence_ms: 0,
             input_gain_db: 0.0,
             selected_input_device_id: String::new(),
+            selected_input_device_name: String::new(),
+            selected_input_device_available: true,
             input_devices: Vec::new(),
+            active_input_device_id: String::new(),
+            active_input_device_name: String::new(),
+            using_input_device_fallback: false,
             audio_level: 0.0,
             mic_testing: false,
             last_delivery_message: String::new(),
@@ -147,6 +159,7 @@ struct RecordingSession {
     control_rx: mpsc::Receiver<SessionControl>,
     audio_stop_tx: std::sync::mpsc::Sender<()>,
     settings: AppSettings,
+    actual_input_device_id: String,
 }
 
 enum SessionControl {
@@ -165,6 +178,14 @@ struct MonitorSession {
     stop_tx: Option<std::sync::mpsc::Sender<()>>,
 }
 
+#[derive(Default)]
+struct MicFallbackState {
+    /// Set for one continuous offline episode. Repeated dictations while the
+    /// same preferred device is absent must not repeat the same toast.
+    unavailable_preference_id: Option<String>,
+    lost_active_device_id: Option<String>,
+}
+
 pub struct AppState {
     shared_data_dir: PathBuf,
     variant_data_dir: PathBuf,
@@ -173,6 +194,7 @@ pub struct AppState {
     ui: Mutex<UiState>,
     active: Mutex<Option<ActiveSession>>,
     monitor: Mutex<Option<MonitorSession>>,
+    mic_fallback_state: Mutex<MicFallbackState>,
     cancel_requested: Mutex<bool>,
     /// Bumped whenever a dictation session starts, so a scheduled
     /// "hide the error capsule" task never hides a newer session's capsule.
@@ -263,6 +285,7 @@ impl AppState {
             ui: Mutex::new(ui),
             active: Mutex::new(None),
             monitor: Mutex::new(None),
+            mic_fallback_state: Mutex::new(MicFallbackState::default()),
             cancel_requested: Mutex::new(false),
             session_epoch: AtomicU64::new(0),
         })
@@ -291,59 +314,107 @@ impl AppState {
         settings::save_settings(&self.shared_data_dir, &self.variant_data_dir, settings)
     }
 
+    /// Update runtime device state without mutating the saved preference.
+    /// `show_overlay_notice` is false for the settings mic test, where the
+    /// same information belongs in the settings status instead of the capsule.
+    fn apply_audio_notice(
+        &self,
+        notice: &audio::AudioNotice,
+        show_overlay_notice: bool,
+    ) -> UiState {
+        let settings = self.settings.lock().clone();
+        let preference = input_device_preference(&settings);
+        let mut ui = self.ui.lock();
+        let mut fallback_state = self.mic_fallback_state.lock();
+        let message =
+            update_audio_device_state(&mut ui, &mut fallback_state, preference.as_ref(), notice);
+        if show_overlay_notice {
+            if let Some(message) = message {
+                ui.mic_notice = message;
+                ui.mic_notice_seq = ui.mic_notice_seq.wrapping_add(1);
+            }
+        } else if let Some(message) = message {
+            ui.status = message;
+        }
+        ui.clone()
+    }
+
     pub fn refresh_input_devices(&self) -> Result<UiState, String> {
         let devices = AudioCapture::list_input_devices().map_err(|e| e.to_string())?;
         let mut settings = self.settings.lock();
         let mut ui = self.ui.lock();
         ui.input_devices = devices;
 
-        let selected_still_exists = ui
-            .input_devices
-            .iter()
-            .any(|d| d.id == settings.selected_input_device_id);
-        if !selected_still_exists {
-            if let Some(default_device) = ui.input_devices.iter().find(|d| d.is_default) {
-                settings.selected_input_device_id = default_device.id.clone();
-            } else if let Some(first) = ui.input_devices.first() {
-                settings.selected_input_device_id = first.id.clone();
-            } else {
-                settings.selected_input_device_id.clear();
+        // Upgrade legacy name-based selections to a stable platform ID as
+        // soon as that device is online. If it is offline, preserve the old
+        // value; a temporary disconnect must never rewrite user intent.
+        let selected = find_selected_input_device(&ui.input_devices, &settings);
+        let mut settings_changed = false;
+        if let Some(device) = selected {
+            if settings.selected_input_device_id != device.id {
+                settings.selected_input_device_id = device.id.clone();
+                settings_changed = true;
             }
+            if settings.selected_input_device_name != device.name {
+                settings.selected_input_device_name = device.name.clone();
+                settings_changed = true;
+            }
+        } else if !settings.selected_input_device_id.is_empty()
+            && settings.selected_input_device_name.is_empty()
+        {
+            // Older settings stored only a device name. Keep it available for
+            // the offline option and for a later stable-ID migration.
+            settings.selected_input_device_name = settings.selected_input_device_id.clone();
+            settings_changed = true;
+        }
+        if settings_changed {
             self.save_settings(&settings)?;
         }
 
         apply_settings_to_ui(&mut ui, &settings);
-        ui.status = format!("已刷新麦克风列表（{} 个）", ui.input_devices.len());
+        sync_resolved_input_device(&mut ui, &settings);
         Ok(ui.clone())
     }
 
     pub fn set_input_device(&self, device_id: String) -> Result<UiState, String> {
+        if self.active.lock().is_some() {
+            return Err("正在听写中，请结束本次听写后再切换麦克风。".into());
+        }
         // Switching mic should release any temporary test capture.
         self.stop_mic_test_internal();
 
-        let devices = {
+        let mut devices = {
             let ui = self.ui.lock();
             ui.input_devices.clone()
         };
-        if !device_id.trim().is_empty() && !devices.iter().any(|d| d.id == device_id) {
+        let device_id = device_id.trim().to_string();
+        if !device_id.is_empty() && !devices.iter().any(|d| d.id == device_id) {
             // Refresh once in case wireless mic just appeared.
             let refreshed = AudioCapture::list_input_devices().map_err(|e| e.to_string())?;
             if !refreshed.iter().any(|d| d.id == device_id) {
                 return Err(format!("找不到麦克风：{device_id}"));
             }
-            let mut ui = self.ui.lock();
-            ui.input_devices = refreshed;
+            devices = refreshed;
         }
 
+        let selected_name = devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .map(|device| device.name.clone())
+            .unwrap_or_default();
         let mut settings = self.settings.lock();
-        settings.selected_input_device_id = device_id.trim().to_string();
+        settings.selected_input_device_id = device_id;
+        settings.selected_input_device_name = selected_name;
         self.save_settings(&settings)?;
         let mut ui = self.ui.lock();
+        ui.input_devices = devices;
         apply_settings_to_ui(&mut ui, &settings);
+        sync_resolved_input_device(&mut ui, &settings);
+        self.mic_fallback_state.lock().unavailable_preference_id = None;
         ui.status = if settings.selected_input_device_id.is_empty() {
-            "已切换到默认麦克风。".into()
+            "已设为自动选择，将跟随系统默认麦克风。".into()
         } else {
-            format!("已选择麦克风：{}", settings.selected_input_device_id)
+            format!("已优先选择麦克风：{}", settings.selected_input_device_name)
         };
         Ok(ui.clone())
     }
@@ -365,10 +436,7 @@ impl AppState {
 
         let (selected_device, mic_test_gain_db) = {
             let settings = self.settings.lock();
-            (
-                settings.selected_input_device_id.clone(),
-                settings.input_gain_db,
-            )
+            (input_device_preference(&settings), settings.input_gain_db)
         };
 
         let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(32);
@@ -378,12 +446,8 @@ impl AppState {
         let app_for_notice = app.clone();
         let on_notice = move |notice: audio::AudioNotice| {
             if let Some(state) = app_for_notice.try_state::<AppState>() {
-                let message = mic_notice_message(&notice);
-                let mut ui = state.ui.lock();
-                if ui.mic_testing {
-                    ui.status = message;
-                    let _ = app_for_notice.emit("jackvoice://state", ui.clone());
-                }
+                let ui = state.apply_audio_notice(&notice, false);
+                let _ = app_for_notice.emit("jackvoice://state", ui);
             }
         };
 
@@ -391,11 +455,7 @@ impl AppState {
             .name("jackvoice-mic-test".into())
             .spawn(move || {
                 let capture = match AudioCapture::start_with_device(
-                    if selected_device.trim().is_empty() {
-                        None
-                    } else {
-                        Some(selected_device)
-                    },
+                    selected_device,
                     mic_test_gain_db,
                     move |pcm| {
                         let _ = audio_tx.try_send(pcm);
@@ -450,7 +510,19 @@ impl AppState {
             let mut ui = self.ui.lock();
             ui.mic_testing = true;
             ui.audio_level = 0.0;
-            ui.status = "麦克风测试中。对着麦说话，确认波形是否跳动。".into();
+            ui.status = if ui.active_input_device_name.is_empty() {
+                "麦克风测试中。对着麦说话，确认波形是否跳动。".into()
+            } else if ui.using_input_device_fallback {
+                format!(
+                    "正在测试备用麦克风「{}」。首选设备恢复后会自动优先使用。",
+                    ui.active_input_device_name
+                )
+            } else {
+                format!(
+                    "正在测试「{}」。对着麦说话确认音量条会跳动。",
+                    ui.active_input_device_name
+                )
+            };
             let _ = app.emit("jackvoice://state", ui.clone());
             let _ = app.emit("jackvoice://level", 0.0_f32);
         }
@@ -1083,7 +1155,7 @@ impl AppState {
 
         let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(LOCAL_AUDIO_QUEUE_CAPACITY);
         let (audio_ready_tx, audio_ready_rx) = oneshot::channel::<Result<(), String>>();
-        let selected_device = settings.selected_input_device_id.clone();
+        let selected_device = input_device_preference(&settings);
         let dictation_gain_db = settings.input_gain_db;
 
         // Microphone fault notices become a transient toast on the capsule.
@@ -1098,11 +1170,8 @@ impl AppState {
                 if !is_current {
                     return;
                 }
-                let message = mic_notice_message(&notice);
-                let mut ui = state.ui.lock();
-                ui.mic_notice = message;
-                ui.mic_notice_seq = ui.mic_notice_seq.wrapping_add(1);
-                let _ = app_for_notice.emit("jackvoice://state", ui.clone());
+                let ui = state.apply_audio_notice(&notice, true);
+                let _ = app_for_notice.emit("jackvoice://state", ui);
             }
         };
 
@@ -1115,11 +1184,7 @@ impl AppState {
             .name("jackvoice-audio-owner".into())
             .spawn(move || {
                 let capture = match AudioCapture::start_with_device(
-                    if selected_device.trim().is_empty() {
-                        None
-                    } else {
-                        Some(selected_device)
-                    },
+                    selected_device,
                     dictation_gain_db,
                     move |pcm| {
                         if let Err(error) = audio_tx.try_send(pcm) {
@@ -1202,6 +1267,8 @@ impl AppState {
             let _ = app.emit("jackvoice://state", ui.clone());
         }
 
+        let actual_input_device_id = self.ui.lock().active_input_device_id.clone();
+
         let app_for_task = app.clone();
         tokio::spawn(run_recording_session(
             app_for_task,
@@ -1213,6 +1280,7 @@ impl AppState {
                 control_rx: stop_rx,
                 audio_stop_tx: audio_stop_tx.clone(),
                 settings: settings.clone(),
+                actual_input_device_id,
             },
         ));
 
@@ -1375,6 +1443,7 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
         mut control_rx,
         audio_stop_tx,
         settings,
+        actual_input_device_id,
     } = session;
     let punctuation = settings.semantic_punctuation_enabled;
     let smoothing = settings.semantic_smoothing_enabled;
@@ -1394,7 +1463,7 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
         semantic_smoothing_enabled: smoothing,
         max_sentence_silence_ms: silence,
         input_gain_db: settings.input_gain_db,
-        input_device_id: settings.selected_input_device_id.clone(),
+        input_device_id: actual_input_device_id,
     };
 
     let mut recognition_error = if settings.volc_api_key.trim().is_empty() {
@@ -1868,12 +1937,185 @@ fn apply_settings_to_ui(ui: &mut UiState, settings: &AppSettings) {
     ui.max_sentence_silence_ms = settings.max_sentence_silence_ms;
     ui.input_gain_db = settings.input_gain_db;
     ui.selected_input_device_id = settings.selected_input_device_id.clone();
+    ui.selected_input_device_name = selected_input_device_display_name(settings).to_string();
     ui.shortcut = settings.shortcut.clone();
     ui.launch_at_login = settings.launch_at_login;
     ui.mute_system_audio_during_dictation = settings.mute_system_audio_during_dictation;
     ui.system_audio_mute_supported = crate::output_mute::supported();
     ui.onboarding_completed = settings.onboarding_completed;
     ui.history_text_size = settings.history_text_size.clone();
+}
+
+fn input_device_preference(settings: &AppSettings) -> Option<InputDevicePreference> {
+    let id = settings.selected_input_device_id.trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(InputDevicePreference {
+            id: id.to_string(),
+            name: selected_input_device_display_name(settings).to_string(),
+        })
+    }
+}
+
+fn selected_input_device_display_name(settings: &AppSettings) -> &str {
+    if settings.selected_input_device_name.trim().is_empty() {
+        settings.selected_input_device_id.trim()
+    } else {
+        settings.selected_input_device_name.trim()
+    }
+}
+
+fn find_selected_input_device<'a>(
+    devices: &'a [InputDeviceInfo],
+    settings: &AppSettings,
+) -> Option<&'a InputDeviceInfo> {
+    let selected_id = settings.selected_input_device_id.trim();
+    if selected_id.is_empty() {
+        return None;
+    }
+    devices
+        .iter()
+        .find(|device| device.id == selected_id)
+        .or_else(|| {
+            // Pre-stable-ID releases persisted the display name as the ID.
+            (!selected_id.starts_with("coreaudio:"))
+                .then(|| devices.iter().find(|device| device.name == selected_id))
+                .flatten()
+        })
+}
+
+fn sync_resolved_input_device(ui: &mut UiState, settings: &AppSettings) {
+    let selected = find_selected_input_device(&ui.input_devices, settings);
+    ui.selected_input_device_available =
+        settings.selected_input_device_id.is_empty() || selected.is_some();
+    let resolved = selected.or_else(|| {
+        ui.input_devices
+            .iter()
+            .find(|device| device.is_default)
+            .or_else(|| ui.input_devices.first())
+    });
+    if let Some(device) = resolved {
+        ui.active_input_device_id = device.id.clone();
+        ui.active_input_device_name = device.name.clone();
+    } else {
+        ui.active_input_device_id.clear();
+        ui.active_input_device_name.clear();
+    }
+    ui.using_input_device_fallback =
+        !settings.selected_input_device_id.is_empty() && selected.is_none() && resolved.is_some();
+}
+
+fn active_matches_preference(
+    preference: &InputDevicePreference,
+    device: &audio::ActiveInputDevice,
+) -> bool {
+    device.id == preference.id
+        || (!preference.id.starts_with("coreaudio:") && device.name == preference.id)
+}
+
+fn fallback_notice(
+    preference: &InputDevicePreference,
+    actual: &audio::ActiveInputDevice,
+) -> String {
+    let preferred_name = if preference.name.trim().is_empty() {
+        &preference.id
+    } else {
+        &preference.name
+    };
+    format!(
+        "首选麦克风「{preferred_name}」未连接，本次使用「{}」",
+        actual.name
+    )
+}
+
+fn update_audio_device_state(
+    ui: &mut UiState,
+    fallback_state: &mut MicFallbackState,
+    preference: Option<&InputDevicePreference>,
+    notice: &audio::AudioNotice,
+) -> Option<String> {
+    match notice {
+        audio::AudioNotice::CaptureStarted {
+            actual,
+            using_fallback,
+        } => {
+            ui.active_input_device_id = actual.id.clone();
+            ui.active_input_device_name = actual.name.clone();
+            ui.using_input_device_fallback = *using_fallback;
+            ui.selected_input_device_available = preference.is_none() || !using_fallback;
+            fallback_state.lost_active_device_id = None;
+            if *using_fallback {
+                let preference = preference?;
+                if fallback_state.unavailable_preference_id.as_deref()
+                    == Some(preference.id.as_str())
+                {
+                    None
+                } else {
+                    fallback_state.unavailable_preference_id = Some(preference.id.clone());
+                    Some(fallback_notice(preference, actual))
+                }
+            } else {
+                fallback_state.unavailable_preference_id = None;
+                None
+            }
+        }
+        audio::AudioNotice::DeviceLost { previous } => {
+            ui.active_input_device_id.clear();
+            ui.active_input_device_name.clear();
+            ui.using_input_device_fallback = false;
+            if preference.is_some_and(|preferred| active_matches_preference(preferred, previous)) {
+                ui.selected_input_device_available = false;
+            }
+            fallback_state.lost_active_device_id = Some(previous.id.clone());
+            Some(format!(
+                "麦克风「{}」已断开，正在寻找可用麦克风…",
+                previous.name
+            ))
+        }
+        audio::AudioNotice::DeviceChanged {
+            previous,
+            actual,
+            using_fallback,
+        } => {
+            let recovering_from_loss = fallback_state.lost_active_device_id.take().is_some();
+            let preference_was_unavailable = fallback_state.unavailable_preference_id.is_some();
+            ui.active_input_device_id = actual.id.clone();
+            ui.active_input_device_name = actual.name.clone();
+            ui.using_input_device_fallback = *using_fallback;
+            ui.selected_input_device_available = preference.is_none() || !using_fallback;
+
+            if *using_fallback {
+                let preference = preference?;
+                let first_fallback_notice = fallback_state.unavailable_preference_id.as_deref()
+                    != Some(preference.id.as_str());
+                fallback_state.unavailable_preference_id = Some(preference.id.clone());
+                if first_fallback_notice {
+                    Some(fallback_notice(preference, actual))
+                } else if recovering_from_loss || previous != actual {
+                    Some(if previous == actual {
+                        format!("备用麦克风「{}」已恢复", actual.name)
+                    } else {
+                        format!("已继续使用备用麦克风「{}」", actual.name)
+                    })
+                } else {
+                    None
+                }
+            } else {
+                fallback_state.unavailable_preference_id = None;
+                if previous == actual {
+                    recovering_from_loss.then(|| format!("麦克风「{}」已恢复", actual.name))
+                } else if preference_was_unavailable
+                    && preference
+                        .is_some_and(|preferred| active_matches_preference(preferred, actual))
+                {
+                    Some(format!("首选麦克风「{}」已恢复", actual.name))
+                } else {
+                    Some(format!("已切换到麦克风「{}」", actual.name))
+                }
+            }
+        }
+    }
 }
 
 fn initial_volc_credential_status(api_key: &str, warning: &str) -> VolcCredentialStatus {
@@ -1907,25 +2149,6 @@ fn restore_output_mute(mut guard: Option<OutputMuteGuard>) {
     if let Some(guard) = guard.as_mut() {
         if let Err(error) = guard.restore() {
             eprintln!("[output-mute] 恢复系统音频失败：{error}");
-        }
-    }
-}
-
-/// Human-readable text for microphone fault notices.
-fn mic_notice_message(notice: &audio::AudioNotice) -> String {
-    match notice {
-        audio::AudioNotice::FallbackAtStart { requested, actual } => {
-            format!("麦克风「{requested}」不可用，已切换到「{actual}」")
-        }
-        audio::AudioNotice::DeviceLost { previous } => {
-            format!("麦克风「{previous}」已断开，正在尝试重新连接…")
-        }
-        audio::AudioNotice::DeviceRestored { previous, actual } => {
-            if previous == actual {
-                format!("麦克风「{actual}」已恢复")
-            } else {
-                format!("麦克风「{previous}」已断开，已切换到「{actual}」")
-            }
         }
     }
 }
@@ -1986,9 +2209,11 @@ pub type SharedDelivery = DeliveryResult;
 #[cfg(test)]
 mod volc_connection_error_tests {
     use super::{
-        format_volc_connection_error, initial_volc_credential_status, VolcCredentialStatus,
+        format_volc_connection_error, initial_volc_credential_status, sync_resolved_input_device,
+        update_audio_device_state, AppSettings, MicFallbackState, UiState, VolcCredentialStatus,
         MAX_DICTATION_DURATION,
     };
+    use crate::audio::{ActiveInputDevice, AudioNotice, InputDeviceInfo, InputDevicePreference};
     use std::time::Duration;
 
     #[test]
@@ -2030,5 +2255,85 @@ mod volc_connection_error_tests {
     fn preserves_unknown_service_error() {
         let message = format_volc_connection_error("remote closed the connection");
         assert!(message.contains("remote closed the connection"));
+    }
+
+    #[test]
+    fn offline_preference_is_preserved_while_default_becomes_runtime_fallback() {
+        let settings = AppSettings {
+            selected_input_device_id: "coreaudio:wireless".into(),
+            selected_input_device_name: "Wireless Mic".into(),
+            ..AppSettings::default()
+        };
+        let mut ui = UiState {
+            input_devices: vec![InputDeviceInfo {
+                id: "coreaudio:macbook".into(),
+                name: "MacBook Pro 麦克风".into(),
+                is_default: true,
+            }],
+            ..UiState::default()
+        };
+
+        sync_resolved_input_device(&mut ui, &settings);
+
+        assert_eq!(settings.selected_input_device_id, "coreaudio:wireless");
+        assert!(!ui.selected_input_device_available);
+        assert!(ui.using_input_device_fallback);
+        assert_eq!(ui.active_input_device_id, "coreaudio:macbook");
+    }
+
+    #[test]
+    fn fallback_notice_is_emitted_once_per_offline_episode() {
+        let preference = InputDevicePreference {
+            id: "coreaudio:wireless".into(),
+            name: "Wireless Mic".into(),
+        };
+        let fallback = ActiveInputDevice {
+            id: "coreaudio:macbook".into(),
+            name: "MacBook Pro 麦克风".into(),
+        };
+        let preferred = ActiveInputDevice {
+            id: preference.id.clone(),
+            name: preference.name.clone(),
+        };
+        let notice = AudioNotice::CaptureStarted {
+            actual: fallback.clone(),
+            using_fallback: true,
+        };
+        let mut ui = UiState::default();
+        let mut state = MicFallbackState::default();
+
+        assert!(
+            update_audio_device_state(&mut ui, &mut state, Some(&preference), &notice).is_some()
+        );
+        assert!(
+            update_audio_device_state(&mut ui, &mut state, Some(&preference), &notice).is_none()
+        );
+
+        let alternate_fallback = AudioNotice::DeviceChanged {
+            previous: fallback,
+            actual: ActiveInputDevice {
+                id: "coreaudio:usb-backup".into(),
+                name: "USB 备用麦克风".into(),
+            },
+            using_fallback: true,
+        };
+        assert!(update_audio_device_state(
+            &mut ui,
+            &mut state,
+            Some(&preference),
+            &alternate_fallback
+        )
+        .is_some());
+
+        let restored = AudioNotice::CaptureStarted {
+            actual: preferred,
+            using_fallback: false,
+        };
+        assert!(
+            update_audio_device_state(&mut ui, &mut state, Some(&preference), &restored).is_none()
+        );
+        assert!(
+            update_audio_device_state(&mut ui, &mut state, Some(&preference), &notice).is_some()
+        );
     }
 }

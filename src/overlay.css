@@ -114,13 +114,9 @@ body {
   border-color: rgba(255, 120, 120, 0.35);
 }
 
-/* Transient mic notice (fallback / disconnect / restore). */
+/* Transient mic notice highlights the capsule while the live transcript stays visible. */
 .capsule.notice {
   border-color: rgba(255, 177, 74, 0.45);
-}
-
-.text.notice {
-  color: rgba(255, 177, 74, 0.95);
 }
 
 /* Result mode: insertion was not detected, offer safe retry and explicit copy. */

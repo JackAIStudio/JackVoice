@@ -22,16 +22,40 @@ pub struct InputDeviceInfo {
     pub is_default: bool,
 }
 
+/// The device the user wants JackVoice to prefer. An empty preference means
+/// "follow the operating-system default". `name` is retained separately so
+/// settings can still explain an offline device whose stable ID cannot be
+/// resolved at the moment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputDevicePreference {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveInputDevice {
+    pub id: String,
+    pub name: String,
+}
+
 /// How capture deviated from the user's chosen device. The UI turns these
 /// into visible notices instead of failing (or switching) silently.
 #[derive(Debug, Clone)]
 pub enum AudioNotice {
-    /// The preferred device was not present when capture started; using `actual` instead.
-    FallbackAtStart { requested: String, actual: String },
+    /// Every successful capture reports its actual device. This is runtime
+    /// state, not a request to overwrite the user's saved preference.
+    CaptureStarted {
+        actual: ActiveInputDevice,
+        using_fallback: bool,
+    },
     /// The active device failed mid-session and no replacement could be started yet.
-    DeviceLost { previous: String },
+    DeviceLost { previous: ActiveInputDevice },
     /// Capture resumed on `actual` after a mid-session failure.
-    DeviceRestored { previous: String, actual: String },
+    DeviceChanged {
+        previous: ActiveInputDevice,
+        actual: ActiveInputDevice,
+        using_fallback: bool,
+    },
 }
 
 type PcmSink = Arc<Mutex<Box<dyn FnMut(Vec<u8>) + Send>>>;
@@ -54,31 +78,14 @@ pub struct AudioCapture {
 impl AudioCapture {
     pub fn list_input_devices() -> Result<Vec<InputDeviceInfo>, AudioError> {
         let host = cpal::default_host();
-        let default_name = host
-            .default_input_device()
-            .and_then(|d| d.name().ok())
-            .unwrap_or_default();
-
-        let devices = host
-            .input_devices()
-            .map_err(|e| AudioError::Message(format!("读取麦克风列表失败：{e}")))?;
-
-        let mut items = Vec::new();
-        for device in devices {
-            let name = device
-                .name()
-                .map_err(|e| AudioError::Message(format!("读取麦克风名称失败：{e}")))?;
-            let is_default = name == default_name;
-            items.push(InputDeviceInfo {
-                id: name.clone(),
-                name,
-                is_default,
-            });
-        }
-
-        if items.is_empty() {
-            return Err(AudioError::Message("未找到可用麦克风。".into()));
-        }
+        let mut items = enumerate_input_devices(&host)?
+            .into_iter()
+            .map(|candidate| InputDeviceInfo {
+                id: candidate.info.id,
+                name: candidate.info.name,
+                is_default: candidate.is_default,
+            })
+            .collect::<Vec<_>>();
 
         // Keep default first for easier selection.
         items.sort_by(|a, b| b.is_default.cmp(&a.is_default).then(a.name.cmp(&b.name)));
@@ -97,7 +104,7 @@ impl AudioCapture {
     ///
     /// Only when *no* input device exists at all does this return an error.
     pub fn start_with_device<F, N>(
-        preferred_device_id: Option<String>,
+        preferred_device: Option<InputDevicePreference>,
         input_gain_db: f32,
         on_pcm: F,
         on_notice: N,
@@ -108,9 +115,7 @@ impl AudioCapture {
     {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
         let (control_tx, control_rx) = mpsc::channel::<ControlMsg>();
-        let preferred = preferred_device_id
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let preferred = preferred_device.filter(|device| !device.id.trim().is_empty());
         let pcm_sink: PcmSink = Arc::new(Mutex::new(Box::new(on_pcm)));
         let notice_sink: NoticeSink = Arc::new(Mutex::new(Box::new(on_notice)));
 
@@ -161,7 +166,7 @@ impl AudioCapture {
 /// Capture thread: start the stream, then keep it alive across device
 /// disconnects until asked to stop.
 fn audio_thread(
-    preferred: Option<String>,
+    preferred: Option<InputDevicePreference>,
     input_gain_db: f32,
     pcm_sink: PcmSink,
     notice_sink: NoticeSink,
@@ -172,39 +177,26 @@ fn audio_thread(
     let host = cpal::default_host();
 
     // First start: prefer the user's chosen device, otherwise the system default.
-    let mut resolved = match resolve_input_device(&host, preferred.as_deref()) {
-        Ok(resolved) => resolved,
-        Err(err) => {
-            let _ = ready_tx.send(Err(err));
-            return;
-        }
-    };
-    if let Some(requested) = resolved.fallback_from.clone() {
-        emit_notice(
-            &notice_sink,
-            AudioNotice::FallbackAtStart {
-                requested,
-                actual: resolved.name.clone(),
-            },
-        );
-    }
-
-    let first_stream = match build_input_stream(
-        &resolved.device,
-        pcm_sink.clone(),
-        err_tx.clone(),
+    let (first_stream, mut resolved) = match start_first_available_stream(
+        &host,
+        preferred.as_ref(),
+        &pcm_sink,
+        &err_tx,
         input_gain_db,
     ) {
-        Ok(stream) => stream,
+        Ok(started) => started,
         Err(err) => {
             let _ = ready_tx.send(Err(err));
             return;
         }
     };
-    if let Err(err) = first_stream.play() {
-        let _ = ready_tx.send(Err(format!("启动麦克风失败：{err}")));
-        return;
-    }
+    emit_notice(
+        &notice_sink,
+        AudioNotice::CaptureStarted {
+            actual: resolved.info.clone(),
+            using_fallback: resolved.using_fallback,
+        },
+    );
     let _ = ready_tx.send(Ok(()));
     let mut stream: Option<Stream> = Some(first_stream);
 
@@ -218,10 +210,10 @@ fn audio_thread(
                     break;
                 }
 
-                let previous = resolved.name.clone();
+                let previous = resolved.info.clone();
                 let mut rebuilt = try_rebuild_stream(
                     &host,
-                    preferred.as_deref(),
+                    preferred.as_ref(),
                     &pcm_sink,
                     &err_tx,
                     input_gain_db,
@@ -242,7 +234,7 @@ fn audio_thread(
                     }
                     rebuilt = try_rebuild_stream(
                         &host,
-                        preferred.as_deref(),
+                        preferred.as_ref(),
                         &pcm_sink,
                         &err_tx,
                         input_gain_db,
@@ -251,9 +243,10 @@ fn audio_thread(
                 let (new_stream, new_resolved) = rebuilt.unwrap();
                 emit_notice(
                     &notice_sink,
-                    AudioNotice::DeviceRestored {
+                    AudioNotice::DeviceChanged {
                         previous,
-                        actual: new_resolved.name.clone(),
+                        actual: new_resolved.info.clone(),
+                        using_fallback: new_resolved.using_fallback,
                     },
                 );
                 stream = Some(new_stream);
@@ -278,21 +271,12 @@ fn drain_stop(control_rx: &Receiver<ControlMsg>) -> bool {
 
 fn try_rebuild_stream(
     host: &cpal::Host,
-    preferred: Option<&str>,
+    preferred: Option<&InputDevicePreference>,
     pcm_sink: &PcmSink,
     err_tx: &Sender<ControlMsg>,
     input_gain_db: f32,
 ) -> Option<(Stream, ResolvedInput)> {
-    let resolved = resolve_input_device(host, preferred).ok()?;
-    let stream = build_input_stream(
-        &resolved.device,
-        pcm_sink.clone(),
-        err_tx.clone(),
-        input_gain_db,
-    )
-    .ok()?;
-    stream.play().ok()?;
-    Some((stream, resolved))
+    start_first_available_stream(host, preferred, pcm_sink, err_tx, input_gain_db).ok()
 }
 
 fn emit_notice(sink: &NoticeSink, notice: AudioNotice) {
@@ -390,67 +374,316 @@ fn build_input_stream(
 
 struct ResolvedInput {
     device: Device,
-    name: String,
-    /// Set when the requested device was missing and we fell back to another one.
-    fallback_from: Option<String>,
+    info: ActiveInputDevice,
+    using_fallback: bool,
 }
 
-fn resolve_input_device(
+fn ordered_input_candidates(
     host: &cpal::Host,
-    preferred: Option<&str>,
-) -> Result<ResolvedInput, String> {
-    let preferred = preferred.map(str::trim).filter(|s| !s.is_empty());
+    preferred: Option<&InputDevicePreference>,
+) -> Result<Vec<ResolvedInput>, String> {
+    let mut candidates = enumerate_input_devices(host).map_err(|error| error.to_string())?;
+    let mut ordered = Vec::with_capacity(candidates.len());
 
     if let Some(preferred) = preferred {
-        if let Ok(devices) = host.input_devices() {
-            for device in devices {
-                if let Ok(name) = device.name() {
-                    if name == preferred {
-                        return Ok(ResolvedInput {
-                            device,
-                            name,
-                            fallback_from: None,
-                        });
-                    }
-                }
-            }
+        if let Some(index) = candidates
+            .iter()
+            .position(|candidate| preference_matches(preferred, &candidate.info))
+        {
+            let candidate = candidates.remove(index);
+            ordered.push(ResolvedInput {
+                device: candidate.device,
+                info: candidate.info,
+                using_fallback: false,
+            });
         }
-        // Preferred device is gone (e.g. wireless receiver unplugged). Fall
-        // back to the system default so dictation can continue; the UI is
-        // told via AudioNotice::FallbackAtStart.
-        let (device, name) = default_or_first_input(host).ok_or_else(|| {
-            format!(
-                "麦克风「{preferred}」不可用，且没有其他可用麦克风。请检查连接或系统麦克风权限。"
-            )
-        })?;
-        return Ok(ResolvedInput {
-            device,
-            name,
-            fallback_from: Some(preferred.to_string()),
+    }
+
+    if let Some(default_index) = candidates.iter().position(|candidate| candidate.is_default) {
+        let candidate = candidates.remove(default_index);
+        ordered.push(ResolvedInput {
+            device: candidate.device,
+            info: candidate.info,
+            using_fallback: preferred.is_some(),
         });
     }
+    ordered.extend(candidates.into_iter().map(|candidate| ResolvedInput {
+        device: candidate.device,
+        info: candidate.info,
+        using_fallback: preferred.is_some(),
+    }));
 
-    let (device, name) = default_or_first_input(host)
-        .ok_or_else(|| "未检测到可用麦克风。请检查连接或系统麦克风权限。".to_string())?;
-    Ok(ResolvedInput {
-        device,
-        name,
-        fallback_from: None,
-    })
+    if ordered.is_empty() {
+        Err(if let Some(preferred) = preferred {
+            format!(
+                "麦克风「{}」不可用，且没有其他可用麦克风。请检查连接或系统麦克风权限。",
+                preferred_display_name(preferred)
+            )
+        } else {
+            "未检测到可用麦克风。请检查连接或系统麦克风权限。".into()
+        })
+    } else {
+        Ok(ordered)
+    }
 }
 
-fn default_or_first_input(host: &cpal::Host) -> Option<(Device, String)> {
-    if let Some(device) = host.default_input_device() {
-        if let Ok(name) = device.name() {
-            return Some((device, name));
+fn start_first_available_stream(
+    host: &cpal::Host,
+    preferred: Option<&InputDevicePreference>,
+    pcm_sink: &PcmSink,
+    err_tx: &Sender<ControlMsg>,
+    input_gain_db: f32,
+) -> Result<(Stream, ResolvedInput), String> {
+    let candidates = ordered_input_candidates(host, preferred)?;
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        let stream = match build_input_stream(
+            &candidate.device,
+            pcm_sink.clone(),
+            err_tx.clone(),
+            input_gain_db,
+        ) {
+            Ok(stream) => stream,
+            Err(error) => {
+                failures.push(format!("{}：{error}", candidate.info.name));
+                continue;
+            }
+        };
+        if let Err(error) = stream.play() {
+            failures.push(format!("{}：启动失败（{error}）", candidate.info.name));
+            continue;
+        }
+        return Ok((stream, candidate));
+    }
+    Err(format!("所有可用麦克风均无法启动：{}", failures.join("；")))
+}
+
+struct EnumeratedInput {
+    device: Device,
+    info: ActiveInputDevice,
+    is_default: bool,
+}
+
+fn enumerate_input_devices(host: &cpal::Host) -> Result<Vec<EnumeratedInput>, AudioError> {
+    let default_name = host
+        .default_input_device()
+        .and_then(|device| device.name().ok())
+        .unwrap_or_default();
+    let mut platform_devices = platform_input_devices();
+    let default_platform_id = platform_devices
+        .iter()
+        .find(|device| device.is_default)
+        .map(|device| device.id.clone());
+    let devices = host
+        .input_devices()
+        .map_err(|error| AudioError::Message(format!("读取麦克风列表失败：{error}")))?;
+    let mut enumerated = Vec::new();
+
+    for device in devices {
+        let name = device
+            .name()
+            .map_err(|error| AudioError::Message(format!("读取麦克风名称失败：{error}")))?;
+        let platform_index = if name == default_name {
+            default_platform_id
+                .as_deref()
+                .and_then(|default_id| {
+                    platform_devices
+                        .iter()
+                        .position(|item| item.name == name && item.id == default_id)
+                })
+                .or_else(|| platform_devices.iter().position(|item| item.name == name))
+        } else {
+            platform_devices.iter().position(|item| item.name == name)
+        };
+        let platform = platform_index.map(|index| platform_devices.remove(index));
+        let id = platform
+            .as_ref()
+            .map(|item| item.id.clone())
+            .unwrap_or_else(|| name.clone());
+        let is_default = default_platform_id
+            .as_deref()
+            .map(|default_id| default_id == id)
+            .unwrap_or_else(|| name == default_name);
+        enumerated.push(EnumeratedInput {
+            device,
+            info: ActiveInputDevice { id, name },
+            is_default,
+        });
+    }
+    Ok(enumerated)
+}
+
+fn preference_matches(preference: &InputDevicePreference, device: &ActiveInputDevice) -> bool {
+    device.id == preference.id
+        || (!preference.id.starts_with("coreaudio:") && device.name == preference.id)
+}
+
+fn preferred_display_name(preference: &InputDevicePreference) -> &str {
+    if preference.name.trim().is_empty() {
+        &preference.id
+    } else {
+        &preference.name
+    }
+}
+
+#[derive(Debug)]
+struct PlatformInputDevice {
+    id: String,
+    name: String,
+    is_default: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn platform_input_devices() -> Vec<PlatformInputDevice> {
+    macos_device_ids::input_devices().unwrap_or_default()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_input_devices() -> Vec<PlatformInputDevice> {
+    Vec::new()
+}
+
+#[cfg(target_os = "macos")]
+mod macos_device_ids {
+    use super::PlatformInputDevice;
+    use core_foundation::base::TCFType;
+    use core_foundation::string::{CFString, CFStringRef};
+    use objc2_core_audio::{
+        kAudioDevicePropertyDeviceUID, kAudioDevicePropertyStreams,
+        kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyElementMain, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyScopeInput, kAudioObjectSystemObject, AudioObjectGetPropertyData,
+        AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
+    };
+    use std::ffi::c_void;
+    use std::mem::{size_of, MaybeUninit};
+    use std::ptr::{null, NonNull};
+
+    pub(super) fn input_devices() -> Result<Vec<PlatformInputDevice>, String> {
+        let devices_address = address(kAudioHardwarePropertyDevices);
+        let device_ids = get_property_vec::<AudioObjectID>(
+            kAudioObjectSystemObject as AudioObjectID,
+            &devices_address,
+        )?;
+        let default_id = get_property::<AudioObjectID>(
+            kAudioObjectSystemObject as AudioObjectID,
+            &address(kAudioHardwarePropertyDefaultInputDevice),
+        )
+        .ok();
+
+        let mut devices = Vec::new();
+        for object_id in device_ids {
+            if !has_input_streams(object_id) {
+                continue;
+            }
+            let Ok(name) = string_property(object_id, kAudioObjectPropertyName) else {
+                continue;
+            };
+            let Ok(uid) = string_property(object_id, kAudioDevicePropertyDeviceUID) else {
+                continue;
+            };
+            devices.push(PlatformInputDevice {
+                id: format!("coreaudio:{uid}"),
+                name,
+                is_default: default_id == Some(object_id),
+            });
+        }
+        Ok(devices)
+    }
+
+    fn has_input_streams(object_id: AudioObjectID) -> bool {
+        let streams_address = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut size = 0_u32;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(
+                object_id,
+                NonNull::from(&streams_address),
+                0,
+                null(),
+                NonNull::from(&mut size),
+            )
+        };
+        status == 0 && size >= size_of::<AudioObjectID>() as u32
+    }
+
+    fn address(selector: u32) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress {
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
         }
     }
-    for device in host.input_devices().ok()? {
-        if let Ok(name) = device.name() {
-            return Some((device, name));
+
+    fn string_property(object_id: AudioObjectID, selector: u32) -> Result<String, String> {
+        let raw = get_property::<CFStringRef>(object_id, &address(selector))?;
+        if raw.is_null() {
+            return Err("CoreAudio 设备属性为空。".into());
         }
+        let value = unsafe { CFString::wrap_under_get_rule(raw) };
+        Ok(value.to_string())
     }
-    None
+
+    fn get_property<T: Copy>(
+        object_id: AudioObjectID,
+        address: &AudioObjectPropertyAddress,
+    ) -> Result<T, String> {
+        let mut value = MaybeUninit::<T>::uninit();
+        let mut size = size_of::<T>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                object_id,
+                NonNull::from(address),
+                0,
+                null(),
+                NonNull::from(&mut size),
+                NonNull::new(value.as_mut_ptr().cast::<c_void>())
+                    .ok_or_else(|| "CoreAudio 返回空地址。".to_string())?,
+            )
+        };
+        if status != 0 || size != size_of::<T>() as u32 {
+            return Err(format!("读取 CoreAudio 设备属性失败（{status}）。"));
+        }
+        Ok(unsafe { value.assume_init() })
+    }
+
+    fn get_property_vec<T: Copy + Default>(
+        object_id: AudioObjectID,
+        address: &AudioObjectPropertyAddress,
+    ) -> Result<Vec<T>, String> {
+        let mut size = 0_u32;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(
+                object_id,
+                NonNull::from(address),
+                0,
+                null(),
+                NonNull::from(&mut size),
+            )
+        };
+        if status != 0 || !(size as usize).is_multiple_of(size_of::<T>()) {
+            return Err(format!("读取 CoreAudio 设备列表大小失败（{status}）。"));
+        }
+        let mut values = vec![T::default(); size as usize / size_of::<T>()];
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                object_id,
+                NonNull::from(address),
+                0,
+                null(),
+                NonNull::from(&mut size),
+                NonNull::new(values.as_mut_ptr().cast::<c_void>())
+                    .ok_or_else(|| "CoreAudio 返回空设备列表。".to_string())?,
+            )
+        };
+        if status != 0 {
+            return Err(format!("读取 CoreAudio 设备列表失败（{status}）。"));
+        }
+        Ok(values)
+    }
 }
 
 fn downmix_f32(data: &[f32], channels: usize) -> Vec<f32> {
@@ -717,5 +950,31 @@ mod tests {
             boosted_peak > base_peak * 2.0,
             "manual offset did not raise the level: {base_peak:.4} -> {boosted_peak:.4}"
         );
+    }
+
+    #[test]
+    fn legacy_name_preference_still_resolves() {
+        let preference = InputDevicePreference {
+            id: "Wireless Mic".into(),
+            name: "Wireless Mic".into(),
+        };
+        let device = ActiveInputDevice {
+            id: "coreaudio:stable-wireless-id".into(),
+            name: "Wireless Mic".into(),
+        };
+        assert!(preference_matches(&preference, &device));
+    }
+
+    #[test]
+    fn stable_id_does_not_silently_bind_to_different_hardware_with_same_name() {
+        let preference = InputDevicePreference {
+            id: "coreaudio:original-id".into(),
+            name: "Wireless Mic".into(),
+        };
+        let replacement = ActiveInputDevice {
+            id: "coreaudio:replacement-id".into(),
+            name: "Wireless Mic".into(),
+        };
+        assert!(!preference_matches(&preference, &replacement));
     }
 }

@@ -28,6 +28,10 @@ pub struct AppSettings {
     pub max_sentence_silence_ms: u32,
     #[serde(default)]
     pub selected_input_device_id: String,
+    /// Last known display name for the preferred microphone. The stable ID
+    /// remains authoritative; the name keeps an offline preference legible.
+    #[serde(default)]
+    pub selected_input_device_name: String,
     #[serde(default = "default_shortcut")]
     pub shortcut: String,
     #[serde(default)]
@@ -68,6 +72,8 @@ struct SharedSettings {
     max_sentence_silence_ms: u32,
     #[serde(default)]
     selected_input_device_id: String,
+    #[serde(default)]
+    selected_input_device_name: String,
     #[serde(default = "default_shortcut")]
     shortcut: String,
     #[serde(default)]
@@ -86,6 +92,7 @@ impl Default for SharedSettings {
             semantic_smoothing_enabled: false,
             max_sentence_silence_ms: default_max_sentence_silence_ms(),
             selected_input_device_id: String::new(),
+            selected_input_device_name: String::new(),
             shortcut: default_shortcut(),
             input_gain_db: 0.0,
             history_text_size: default_history_text_size(),
@@ -125,6 +132,7 @@ impl AppSettings {
             semantic_smoothing_enabled: shared.semantic_smoothing_enabled,
             max_sentence_silence_ms: shared.max_sentence_silence_ms,
             selected_input_device_id: shared.selected_input_device_id,
+            selected_input_device_name: shared.selected_input_device_name,
             shortcut: shared.shortcut,
             launch_at_login: variant.launch_at_login,
             mute_system_audio_during_dictation: variant.mute_system_audio_during_dictation,
@@ -143,6 +151,7 @@ impl AppSettings {
             semantic_smoothing_enabled: self.semantic_smoothing_enabled,
             max_sentence_silence_ms: self.max_sentence_silence_ms,
             selected_input_device_id: self.selected_input_device_id.clone(),
+            selected_input_device_name: self.selected_input_device_name.clone(),
             shortcut: self.shortcut.clone(),
             input_gain_db: self.input_gain_db,
             history_text_size: normalize_history_text_size(&self.history_text_size),
@@ -353,6 +362,8 @@ mod tests {
         let variant = root.join("variant");
         let settings = AppSettings {
             volc_api_key: "secret".into(),
+            selected_input_device_id: "coreaudio:wireless-id".into(),
+            selected_input_device_name: "Wireless Mic".into(),
             onboarding_completed: true,
             mute_system_audio_during_dictation: true,
             ..AppSettings::default()
@@ -370,6 +381,8 @@ mod tests {
         assert!(variant_raw.contains("muteSystemAudioDuringDictation"));
         assert!(shared_raw.contains("\"historyTextSize\": \"standard\""));
         assert!(shared_raw.contains("\"semanticSmoothingEnabled\": false"));
+        assert!(shared_raw.contains("\"selectedInputDeviceId\": \"coreaudio:wireless-id\""));
+        assert!(shared_raw.contains("\"selectedInputDeviceName\": \"Wireless Mic\""));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -81,10 +81,10 @@ async function dismissResult() {
 
 /**
  * Transient microphone notices (fallback to default mic, mid-session
- * disconnect/restore). They replace the preview line for a few seconds,
- * then the live transcript comes back.
+ * disconnect/restore). They briefly use the small status line so live
+ * transcript content is never hidden.
  */
-const MIC_NOTICE_MS = 5000;
+const MIC_NOTICE_MS = 2600;
 let lastState: UiState | null = null;
 let lastNoticeSeq = 0;
 let noticeSeqInitialized = false;
@@ -98,12 +98,13 @@ function clearNotice() {
     noticeTimer = undefined;
   }
   capsule()?.classList.remove("notice");
-  textEl()?.classList.remove("notice");
+  if (lastState) renderStatus(lastState);
 }
 
 function showNotice(text: string) {
   activeNotice = text;
   capsule()?.classList.add("notice");
+  if (lastState) renderStatus(lastState);
   if (noticeTimer) window.clearTimeout(noticeTimer);
   noticeTimer = window.setTimeout(() => {
     clearNotice();
@@ -112,12 +113,6 @@ function showNotice(text: string) {
 }
 
 function renderPreview(state: UiState) {
-  if (activeNotice) {
-    textEl()?.classList.add("notice");
-    setPreviewText(activeNotice);
-    return;
-  }
-  textEl()?.classList.remove("notice");
   if (state.phase === "error") {
     // The status line carries the real error message; keep the preview quiet.
     const text = textEl();
@@ -128,6 +123,22 @@ function renderPreview(state: UiState) {
     return;
   }
   setPreviewText(state.transcript || "");
+}
+
+function renderStatus(state: UiState) {
+  const status = statusEl();
+  if (!status) return;
+  if (activeNotice) status.textContent = activeNotice;
+  else if (state.phase === "starting") status.textContent = "启动录音中";
+  else if (state.phase === "connecting") status.textContent = "连接中";
+  else if (state.phase === "recording") {
+    if (state.recognitionPhase === "connecting") status.textContent = "录音中 · 连接中";
+    else if (state.recognitionPhase === "streaming") status.textContent = "正在听写";
+    else status.textContent = "本地录音中";
+  }
+  else if (state.phase === "finalizing") status.textContent = "收尾中";
+  else if (state.phase === "error") status.textContent = state.status || "出错了";
+  else status.textContent = "待命";
 }
 
 async function copyResult() {
@@ -282,20 +293,7 @@ function applyState(state: UiState) {
     }
   }
 
-  const status = statusEl();
-  if (status) {
-    if (state.phase === "starting") status.textContent = "启动录音中";
-    else if (state.phase === "connecting") status.textContent = "连接中";
-    else if (state.phase === "recording") {
-      if (state.recognitionPhase === "connecting") status.textContent = "录音中 · 连接中";
-      else if (state.recognitionPhase === "streaming") status.textContent = "正在听写";
-      else status.textContent = "本地录音中";
-    }
-    else if (state.phase === "finalizing") status.textContent = "收尾中";
-    else if (state.phase === "error")
-      status.textContent = state.status || "出错了";
-    else status.textContent = "待命";
-  }
+  renderStatus(state);
 
   renderPreview(state);
 
