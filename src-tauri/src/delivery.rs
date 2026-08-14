@@ -24,20 +24,17 @@ pub enum InsertionProbe {
     Unknown,
 }
 
-/// Keep the app that owned the caret when dictation started unless the app
-/// currently in front is confidently text-insertable. Transient utilities
-/// such as screenshot tools may become frontmost during recording, but they
-/// must not replace the original dictation destination.
+/// Deliver to the app that is frontmost when dictation stops.
+///
+/// Falling back to the app captured at start is only safe when macOS cannot
+/// identify any current frontmost app. If the user deliberately switched apps
+/// and the new app has no caret, returning the old app here would reactivate it
+/// and paste into a stale insertion point instead of showing the copy prompt.
 pub(crate) fn choose_delivery_target(
     initial_target: Option<String>,
     current_target: Option<String>,
-    current_probe: InsertionProbe,
 ) -> Option<String> {
-    if current_probe == InsertionProbe::Insertable {
-        current_target.or(initial_target)
-    } else {
-        initial_target.or(current_target)
-    }
+    current_target.or(initial_target)
 }
 
 /// Roles that represent a real text insertion point (native controls and
@@ -728,7 +725,7 @@ fn post_paste_via_cgevent() -> bool {
 
 #[cfg(test)]
 mod clipboard_transaction_tests {
-    use super::{choose_delivery_target, clipboard_is_still_temporary, InsertionProbe};
+    use super::{choose_delivery_target, clipboard_is_still_temporary};
 
     #[cfg(target_os = "macos")]
     fn assert_snapshot_preserves_original(
@@ -751,34 +748,18 @@ mod clipboard_transaction_tests {
     }
 
     #[test]
-    fn screenshot_utility_does_not_replace_the_original_dictation_target() {
+    fn app_switch_never_reactivates_the_original_dictation_target() {
         assert_eq!(
-            choose_delivery_target(
-                Some("Notes".into()),
-                Some("Snipaste".into()),
-                InsertionProbe::NotInsertable,
-            ),
-            Some("Notes".into())
-        );
-        assert_eq!(
-            choose_delivery_target(
-                Some("Notes".into()),
-                Some("Snipaste".into()),
-                InsertionProbe::Unknown,
-            ),
-            Some("Notes".into())
+            choose_delivery_target(Some("Codex".into()), Some("Chrome".into())),
+            Some("Chrome".into())
         );
     }
 
     #[test]
-    fn deliberate_switch_to_another_text_app_becomes_the_delivery_target() {
+    fn original_target_is_only_used_when_current_app_is_unavailable() {
         assert_eq!(
-            choose_delivery_target(
-                Some("Notes".into()),
-                Some("Chrome".into()),
-                InsertionProbe::Insertable,
-            ),
-            Some("Chrome".into())
+            choose_delivery_target(Some("Codex".into()), None),
+            Some("Codex".into())
         );
     }
 

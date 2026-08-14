@@ -1754,11 +1754,8 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
                 .as_deref()
                 .map(|target| delivery::probe_insertion_target(Some(target)))
                 .unwrap_or(delivery::InsertionProbe::Unknown);
-            let target = delivery::choose_delivery_target(
-                initial_target.clone(),
-                current_target.clone(),
-                current_probe,
-            );
+            let target =
+                delivery::choose_delivery_target(initial_target.clone(), current_target.clone());
             eprintln!(
                 "[delivery] target initial={initial_target:?} current={current_target:?} current_probe={current_probe:?} selected={target:?}"
             );
