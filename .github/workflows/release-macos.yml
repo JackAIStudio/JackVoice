@@ -92,15 +92,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          delivery_dir="$CARGO_TARGET_DIR/release/bundle/dmg/delivery"
+          delivery_root="$CARGO_TARGET_DIR/release/bundle/dmg/delivery"
           shopt -s nullglob
+          delivery_dirs=("$delivery_root"/build-"$JACKVOICE_BUILD_ID"-*)
+          if [[ "${#delivery_dirs[@]}" -ne 1 || ! -d "${delivery_dirs[0]}" ]]; then
+            echo "::error::预期当前构建标识对应 1 个交付目录，实际找到 ${#delivery_dirs[@]} 个"
+            exit 1
+          fi
+          delivery_dir="${delivery_dirs[0]}"
+          dmg_assets=("$delivery_dir"/JackVoice-*.dmg)
           release_assets=(
-            "$delivery_dir"/*.dmg
-            "$delivery_dir"/*.dmg.sha256
-            "$delivery_dir"/*.dmg.json
+            "${dmg_assets[0]}#macOS Apple 芯片安装包（DMG）"
+            "$delivery_dir/SHA256SUMS.txt#SHA-256 校验文件"
+            "$delivery_dir/release-manifest.json#发布校验清单"
           )
-          if [[ "${#release_assets[@]}" -ne 3 ]]; then
-            echo "::error::预期 3 个交付文件，实际找到 ${#release_assets[@]} 个"
+          if [[ "${#dmg_assets[@]}" -ne 1 || ! -f "$delivery_dir/SHA256SUMS.txt" || ! -f "$delivery_dir/release-manifest.json" ]]; then
+            echo "::error::交付目录必须包含 1 个 DMG、SHA256SUMS.txt 和 release-manifest.json"
             exit 1
           fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
@@ -111,4 +118,11 @@ jobs:
             --draft \
             --verify-tag \
             --generate-notes \
+            --notes "## 下载
+
+          ### macOS（Apple 芯片）
+
+          [下载 JackVoice ${RELEASE_TAG#v} 安装包（DMG）](https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG/$(basename "${dmg_assets[0]}"))
+
+          适用于搭载 Apple 芯片的 Mac。下载后打开 DMG，将 JackVoice 拖入 Applications 即可安装。" \
             --title "JackVoice ${RELEASE_TAG#v}"
