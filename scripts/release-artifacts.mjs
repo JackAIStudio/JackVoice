@@ -80,6 +80,7 @@ export function findMountedJackVoiceBuildImages(images, bundleDirectory) {
     return (
       fileName.endsWith(".dmg") &&
       (fileName.startsWith("jackvoice_") ||
+        fileName.startsWith("jackvoice-") ||
         (fileName.startsWith("rw.") && fileName.includes(".jackvoice_")))
     );
   });
@@ -105,11 +106,22 @@ export function sha256File(filePath) {
   return createHash("sha256").update(readFileSync(filePath)).digest("hex");
 }
 
-export function deliveryDmgFileName(sourceFileName, buildId, sha256) {
+export function deliveryDirectoryName(buildId, sha256) {
   const normalizedBuildId = resolveReleaseBuildId(buildId);
   if (!/^[a-f0-9]{64}$/i.test(sha256)) throw new Error("DMG SHA-256 格式无效。");
+  return `build-${normalizedBuildId}-${sha256.slice(0, 16)}`;
+}
+
+export function releaseDmgFileName(version, sourceFileName) {
+  if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error("正式版版本号必须使用 x.y.z。");
   if (!sourceFileName.endsWith(".dmg")) throw new Error("正式交付源文件必须是 DMG。");
-  return `${sourceFileName.slice(0, -4)}_build-${normalizedBuildId}_${sha256.slice(0, 16)}.dmg`;
+  const architecture = sourceFileName.match(/_(aarch64|x64)\.dmg$/)?.[1];
+  const architectureLabel = {
+    aarch64: "Apple-Silicon",
+    x64: "Intel",
+  }[architecture];
+  if (!architectureLabel) throw new Error(`无法从正式 DMG 文件名解析架构：${sourceFileName}`);
+  return `JackVoice-${version}-macOS-${architectureLabel}.dmg`;
 }
 
 export function createDeliveryArtifact({
@@ -137,12 +149,12 @@ export function createDeliveryArtifact({
   const normalizedBuildId = resolveReleaseBuildId(buildId);
   const dmgSha256 = sha256File(sourceDmgPath);
   const appSha256 = sha256File(appExecutablePath);
-  const deliveryDirectory = join(dirname(sourceDmgPath), "delivery");
-  const fileName = deliveryDmgFileName(
-    basename(sourceDmgPath),
-    normalizedBuildId,
-    dmgSha256,
+  const deliveryDirectory = join(
+    dirname(sourceDmgPath),
+    "delivery",
+    deliveryDirectoryName(normalizedBuildId, dmgSha256),
   );
+  const fileName = releaseDmgFileName(version, basename(sourceDmgPath));
   const deliveryPath = join(deliveryDirectory, fileName);
   mkdirSync(deliveryDirectory, { recursive: true });
 
@@ -158,10 +170,10 @@ export function createDeliveryArtifact({
   }
 
   const bytes = statSync(deliveryPath).size;
-  const checksumPath = `${deliveryPath}.sha256`;
+  const checksumPath = join(deliveryDirectory, "SHA256SUMS.txt");
   writeFileSync(checksumPath, `${dmgSha256}  ${fileName}\n`, { encoding: "utf8" });
 
-  const manifestPath = `${deliveryPath}.json`;
+  const manifestPath = join(deliveryDirectory, "release-manifest.json");
   const manifest = {
     schemaVersion: 2,
     product: "JackVoice",
@@ -178,6 +190,7 @@ export function createDeliveryArtifact({
 
   return {
     buildId: normalizedBuildId,
+    deliveryDirectory,
     deliveryPath,
     checksumPath,
     manifestPath,

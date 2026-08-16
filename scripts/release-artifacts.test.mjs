@@ -2,16 +2,17 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 
 import {
   createDeliveryArtifact,
   createReleaseBuildId,
-  deliveryDmgFileName,
+  deliveryDirectoryName,
   findMountedJackVoiceBuildImages,
   parseMountedDiskImages,
   productionDmgPath,
+  releaseDmgFileName,
   resolveReleaseBuildId,
   validateReleaseVersions,
 } from "./release-artifacts.mjs";
@@ -49,6 +50,10 @@ image-path      : /Users/test/Downloads/JackVoice_0.1.0_aarch64.dmg
 image-path      : /Users/test/Library/Caches/JackVoice/release-cargo-target/release/bundle/macos/rw.123.JackVoice_8.16.12_aarch64.dmg
 /dev/disk14\tGUID_partition_scheme
 /dev/disk14s1\tUUID\t/Volumes/dmg.temp
+================================================
+image-path      : /Users/test/Library/Caches/JackVoice/release-cargo-target/release/bundle/dmg/delivery/build-20260816T041402564Z-d7c07b590314588c/JackVoice-8.16.12-macOS-Apple-Silicon.dmg
+/dev/disk15\tGUID_partition_scheme
+/dev/disk15s1\tUUID\t/Volumes/JackVoice
 `;
   const images = parseMountedDiskImages(output);
   assert.deepEqual(images[0], {
@@ -62,18 +67,25 @@ image-path      : /Users/test/Library/Caches/JackVoice/release-cargo-target/rele
       images,
       "/Users/test/Library/Caches/JackVoice/release-cargo-target/release/bundle",
     ).map((image) => image.device),
-    ["/dev/disk12", "/dev/disk14"],
+    ["/dev/disk12", "/dev/disk14", "/dev/disk15"],
   );
 });
 
-test("交付文件名同时绑定版本、构建标识和内容哈希", () => {
+test("面向用户的安装包使用短名，构建目录保留构建标识和内容哈希", () => {
   assert.equal(
-    deliveryDmgFileName(
-      "JackVoice_8.16.12_aarch64.dmg",
+    deliveryDirectoryName(
       "20260811T073045123Z",
       "a".repeat(64),
     ),
-    "JackVoice_8.16.12_aarch64_build-20260811T073045123Z_aaaaaaaaaaaaaaaa.dmg",
+    "build-20260811T073045123Z-aaaaaaaaaaaaaaaa",
+  );
+  assert.equal(
+    releaseDmgFileName("8.16.12", "JackVoice_8.16.12_aarch64.dmg"),
+    "JackVoice-8.16.12-macOS-Apple-Silicon.dmg",
+  );
+  assert.equal(
+    releaseDmgFileName("8.16.12", "JackVoice_8.16.12_x64.dmg"),
+    "JackVoice-8.16.12-macOS-Intel.dmg",
   );
   assert.equal(
     productionDmgPath("/tmp/target", "8.16.12", "arm64"),
@@ -108,6 +120,9 @@ test("交付产物包含可独立核验的 DMG、SHA-256 和清单", () => {
 
     assert.equal(artifact.dmgSha256, expectedDmgSha);
     assert.ok(existsSync(artifact.deliveryPath));
+    assert.equal(basename(artifact.deliveryPath), "JackVoice-8.16.12-macOS-Apple-Silicon.dmg");
+    assert.equal(basename(artifact.checksumPath), "SHA256SUMS.txt");
+    assert.equal(basename(artifact.manifestPath), "release-manifest.json");
     assert.equal(
       readFileSync(artifact.checksumPath, "utf8"),
       `${expectedDmgSha}  ${artifact.deliveryPath.split("/").at(-1)}\n`,
@@ -115,6 +130,7 @@ test("交付产物包含可独立核验的 DMG、SHA-256 和清单", () => {
     const manifest = JSON.parse(readFileSync(artifact.manifestPath, "utf8"));
     assert.equal(manifest.version, "8.16.12");
     assert.equal(manifest.buildId, "20260811T073045123Z");
+    assert.equal(manifest.dmg.fileName, "JackVoice-8.16.12-macOS-Apple-Silicon.dmg");
     assert.equal(manifest.dmg.sha256, expectedDmgSha);
     assert.equal(manifest.bundleIdentifier, "com.jackvoice.app");
     assert.equal(manifest.schemaVersion, 2);
