@@ -62,10 +62,32 @@ fn default_bottom_center(app: &AppHandle) -> Option<(f64, f64)> {
     Some((x, y))
 }
 
-fn apply_position(app: &AppHandle, x: f64, y: f64) {
-    if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
-        let _ = window.set_position(tauri::LogicalPosition::new(x, y));
-    }
+fn center_on_settings_screen(app: &AppHandle) -> Option<(f64, f64)> {
+    let anchor = app
+        .get_webview_window(MAIN_LABEL)
+        .or_else(|| app.get_webview_window(OVERLAY_LABEL))?;
+    let monitor = anchor.current_monitor().ok().flatten()?;
+    let work = monitor.work_area();
+    let scale = monitor.scale_factor();
+
+    let work_x = work.position.x as f64 / scale;
+    let work_y = work.position.y as f64 / scale;
+    let work_w = work.size.width as f64 / scale;
+    let work_h = work.size.height as f64 / scale;
+
+    Some((
+        work_x + (work_w - OVERLAY_WIDTH).max(0.0) / 2.0,
+        work_y + (work_h - OVERLAY_HEIGHT).max(0.0) / 2.0,
+    ))
+}
+
+fn apply_position(app: &AppHandle, x: f64, y: f64) -> Result<(), String> {
+    let window = app
+        .get_webview_window(OVERLAY_LABEL)
+        .ok_or_else(|| "实时预览胶囊尚未创建。".to_string())?;
+    window
+        .set_position(tauri::LogicalPosition::new(x, y))
+        .map_err(|e| format!("移动实时预览胶囊失败：{e}"))
 }
 
 pub fn ensure_overlay(app: &AppHandle) -> Result<(), String> {
@@ -112,7 +134,7 @@ pub fn show_overlay(app: &AppHandle) {
         // If user never dragged it, re-snap above dock each show.
         if load_saved_position(app).is_none() {
             if let Some((x, y)) = default_bottom_center(app) {
-                apply_position(app, x, y);
+                let _ = apply_position(app, x, y);
             }
         }
         // Remember the user's working app before the capsule takes any attention.
@@ -240,12 +262,11 @@ pub fn save_overlay_position(app: AppHandle, x: f64, y: f64) -> Result<(), Strin
 }
 
 pub fn reset_overlay_position(app: AppHandle) -> Result<(), String> {
-    if let Some(path) = position_path(&app) {
-        let _ = fs::remove_file(path);
-    }
-    if let Some((x, y)) = default_bottom_center(&app) {
-        apply_position(&app, x, y);
-    }
+    ensure_overlay(&app)?;
+    let (x, y) = center_on_settings_screen(&app)
+        .ok_or_else(|| "无法获取当前屏幕，请稍后重试。".to_string())?;
+    save_position(&app, &OverlayPosition { x, y })?;
+    apply_position(&app, x, y)?;
     Ok(())
 }
 

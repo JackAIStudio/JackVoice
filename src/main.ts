@@ -1987,6 +1987,27 @@ async function setHistoryTextSize(size: string) {
   }
 }
 
+async function resetOverlayPosition() {
+  const button = $("#reset-overlay-position") as HTMLButtonElement | null;
+  const originalLabel = button?.textContent || "移到屏幕中央";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "正在移动…";
+  }
+  try {
+    await invoke("reset_overlay_position");
+    showToast("实时预览胶囊已移到屏幕中央", "success");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    showToast(`移动失败：${message}`, "error");
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalLabel;
+    }
+  }
+}
+
 async function saveRecognitionOptions() {
   const semanticPunctuationEnabled =
     ($("#semantic-punctuation") as HTMLInputElement | null)?.checked ?? true;
@@ -2449,6 +2470,9 @@ function bindSettingsModal() {
 
   $("#history-text-size")?.addEventListener("change", (e) => {
     void setHistoryTextSize((e.target as HTMLSelectElement).value);
+  });
+  $("#reset-overlay-position")?.addEventListener("click", () => {
+    void resetOverlayPosition();
   });
   $("#mic-select")?.addEventListener("change", () => void onMicChanged());
   $("#mic-test-btn")?.addEventListener("click", () => void startMicTest());
