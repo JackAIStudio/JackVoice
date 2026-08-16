@@ -2582,7 +2582,7 @@ function bindDict() {
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
-  const version = import.meta.env.VITE_JACKVOICE_VERSION || "8.12.5";
+  const version = import.meta.env.VITE_JACKVOICE_VERSION || "8.16.12";
   const buildId = import.meta.env.VITE_JACKVOICE_BUILD_ID || "development";
   const buildVersion = $("#app-build-version");
   if (buildVersion) buildVersion.textContent = `v${version} · build ${buildId}`;
