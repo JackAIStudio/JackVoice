@@ -6,6 +6,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "JackVoice Dev",
         "width": 1080,
         "height": 760,

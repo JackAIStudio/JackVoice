@@ -3,8 +3,9 @@ use std::fs;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
+use crate::main_window::MAIN_LABEL;
+
 const OVERLAY_LABEL: &str = "overlay";
-const MAIN_LABEL: &str = "main";
 const OVERLAY_WIDTH: f64 = 340.0;
 const OVERLAY_HEIGHT: f64 = 46.0;
 const DOCK_GAP: f64 = 14.0;

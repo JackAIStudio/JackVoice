@@ -492,9 +492,8 @@ impl AppState {
             let message = crate::onboarding::microphone_permission_error(microphone_authorization);
             let ui = self.require_onboarding(&message)?;
             let _ = app.emit("jackvoice://state", ui);
-            if let Some(main) = app.get_webview_window("main") {
-                let _ = main.show();
-                let _ = main.set_focus();
+            if let Err(error) = crate::main_window::show_main_window(&app) {
+                eprintln!("[main-window] 麦克风权限恢复窗口显示失败：{error}");
             }
             return Err(message);
         }
@@ -1065,9 +1064,8 @@ impl AppState {
             self.stop(app).await
         } else {
             if !self.snapshot().onboarding_completed {
-                if let Some(main) = app.get_webview_window("main") {
-                    let _ = main.show();
-                    let _ = main.set_focus();
+                if let Err(error) = crate::main_window::show_main_window(&app) {
+                    eprintln!("[main-window] 首次设置窗口显示失败：{error}");
                 }
                 return Err("请先完成必需权限设置，再开始使用 JackVoice。".into());
             }
@@ -1076,9 +1074,8 @@ impl AppState {
                 let message = permissions.missing_permissions_message();
                 let ui = self.require_onboarding(&message)?;
                 let _ = app.emit("jackvoice://state", ui);
-                if let Some(main) = app.get_webview_window("main") {
-                    let _ = main.show();
-                    let _ = main.set_focus();
+                if let Err(error) = crate::main_window::show_main_window(&app) {
+                    eprintln!("[main-window] 权限恢复窗口显示失败：{error}");
                 }
                 return Err(message);
             }

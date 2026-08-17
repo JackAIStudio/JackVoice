@@ -4,6 +4,7 @@ mod credentials;
 mod delivery;
 mod history;
 mod hotwords;
+mod main_window;
 mod normalize;
 mod onboarding;
 mod output_mute;
@@ -437,13 +438,7 @@ fn dismiss_overlay(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn open_settings_window(app: AppHandle) -> Result<(), String> {
-    if let Some(main) = app.get_webview_window("main") {
-        let _ = main.show();
-        let _ = main.set_focus();
-        Ok(())
-    } else {
-        Err("设置窗口不存在。".into())
-    }
+    main_window::show_main_window(&app)
 }
 
 #[tauri::command]
@@ -459,6 +454,10 @@ fn open_external_url(url: String, app: AppHandle) -> Result<(), String> {
     app.opener()
         .open_url(url, None::<String>)
         .map_err(|error| format!("无法使用系统浏览器打开链接：{error}"))
+}
+
+fn app_context<R: tauri::Runtime>() -> tauri::Context<R> {
+    tauri::generate_context!()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -503,9 +502,8 @@ pub fn run() {
                 return;
             }
             eprintln!("[single-instance] 检测到重复实例，唤起已有 JackVoice 窗口");
-            if let Some(main) = app.get_webview_window("main") {
-                let _ = main.show();
-                let _ = main.set_focus();
+            if let Err(error) = main_window::show_main_window(app) {
+                eprintln!("[single-instance] {error}");
             }
         }))
         .plugin(tauri_plugin_opener::init())
@@ -530,6 +528,7 @@ pub fn run() {
                 })
                 .build(),
         )
+        .on_window_event(main_window::handle_window_event)
         .setup(|app| {
             let directories = storage::prepare_directories(app.handle())
                 .map_err(Box::<dyn std::error::Error>::from)?;
@@ -552,6 +551,8 @@ pub fn run() {
             app.manage(instance_guard);
             app.manage(state);
             app.manage(shortcut::ShortcutCaptureState::default());
+            main_window::ensure_main_window(app.handle())
+                .map_err(Box::<dyn std::error::Error>::from)?;
             let state = app.state::<AppState>();
             let mut initial_state = state.snapshot();
             let accessibility_trusted = onboarding::accessibility_is_trusted();
@@ -572,18 +573,15 @@ pub fn run() {
             // the user can walk through the permission setup. The window is
             // otherwise hidden by design (background dictation app).
             if !initial_state.onboarding_completed {
-                if let Some(main) = app.get_webview_window("main") {
-                    eprintln!("[onboarding] showing main window for first-run setup");
-                    match main.show() {
-                        Ok(()) => {
+                eprintln!("[onboarding] showing main window for first-run setup");
+                match main_window::show_main_window(app.handle()) {
+                    Ok(()) => {
+                        if let Some(main) = app.get_webview_window(main_window::MAIN_LABEL) {
                             eprintln!("[onboarding] window shown, visible={:?}", main.is_visible());
                             let _ = main.set_position(tauri::LogicalPosition::new(80.0, 80.0));
-                            let _ = main.set_focus();
                         }
-                        Err(e) => eprintln!("[onboarding] show failed: {e}"),
                     }
-                } else {
-                    eprintln!("[onboarding] main window not found");
+                    Err(error) => eprintln!("[onboarding] show failed: {error}"),
                 }
             }
 
@@ -659,19 +657,16 @@ pub fn run() {
             open_settings_window,
             open_external_url
         ])
-        .build(tauri::generate_context!())
+        .build(app_context())
         .expect("error while building JackVoice")
         .run(|app, event| match event {
             // Clicking the Dock icon should open settings manually.
-            tauri::RunEvent::Reopen {
-                has_visible_windows,
-                ..
-            } => {
-                if !has_visible_windows {
-                    if let Some(main) = app.get_webview_window("main") {
-                        let _ = main.show();
-                        let _ = main.set_focus();
-                    }
+            tauri::RunEvent::Reopen { .. } => {
+                // `has_visible_windows` is application-wide and can be true
+                // because the dictation overlay is visible. A Dock click is an
+                // explicit request for settings, so always present `main`.
+                if let Err(error) = main_window::show_main_window(app) {
+                    eprintln!("[main-window] Dock 唤起失败：{error}");
                 }
             }
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {

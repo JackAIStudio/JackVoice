@@ -54,3 +54,6 @@ security-framework = "3.7"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 clipboard-win = "5.4"
+
+[dev-dependencies]
+tauri = { version = "2", features = ["macos-private-api", "test"] }

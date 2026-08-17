@@ -14,6 +14,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "JackVoice",
         "width": 1080,
         "height": 760,
