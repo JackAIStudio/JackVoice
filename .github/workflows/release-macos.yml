@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "已存在且与 package.json 版本一致的发布标签，例如 v8.16.12"
+        description: "已存在且与 package.json 版本一致的发布标签，例如 v8.17.15"
         required: true
         type: string
 

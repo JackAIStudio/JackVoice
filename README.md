@@ -191,7 +191,7 @@ macOS 权限测试必须使用 `qa:first-run:dev` 打开的构建后 `.app`，�
 
 如果不希望每次手动 `export`，可在仓库根目录创建被 `*.local` 规则忽略的 `.jackvoice-release.local`，使用 JSON 保存上述四个 App Store Connect 标识和本机 `.p8` 路径。`build:desktop:release` 只在正式发布构建中读取该文件，显式环境变量优先；普通桌面构建和其他项目不会继承这些公证变量。私钥内容不得写入配置文件或仓库。
 
-GitHub Actions 的 `Release macOS` 工作流只接受 `v8.16.12` 形式且与 `package.json` 一致的现有标签，使用受保护的 `release` Environment 构建 Apple Silicon DMG，并创建草稿 GitHub Release。该 Environment 需要配置变量 `JACKVOICE_APPLE_TEAM_ID`，以及 Secrets：`APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_API_ISSUER`、`APPLE_API_KEY`、`APPLE_API_PRIVATE_KEY`。建议限制可部署标签并启用人工批准；正式发布凭据不得提供给 Pull Request 工作流。
+GitHub Actions 的 `Release macOS` 工作流只接受 `v8.17.15` 形式且与 `package.json` 一致的现有标签，使用受保护的 `release` Environment 构建 Apple Silicon DMG，并创建草稿 GitHub Release。该 Environment 需要配置变量 `JACKVOICE_APPLE_TEAM_ID`，以及 Secrets：`APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_API_ISSUER`、`APPLE_API_KEY`、`APPLE_API_PRIVATE_KEY`。建议限制可部署标签并启用人工批准；正式发布凭据不得提供给 Pull Request 工作流。
 
 开发版仍使用独立的 `com.jackvoice.app.dev` 和本地临时签名，不得作为正式版分发。正式安装包使用 `JackVoice-<版本>-macOS-Apple-Silicon.dmg` 形式的用户可读短名；构建标识和内容哈希保留在 `bundle/dmg/delivery/build-<构建标识>-<哈希>` 目录及 `release-manifest.json` 中，另附 `SHA256SUMS.txt`、完整第三方许可清单与对应源码版本。产物必须完成 Developer ID 签名、公证和干净机器安装验证。
 
