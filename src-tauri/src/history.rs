@@ -212,6 +212,102 @@ pub fn delete_record(dir: &Path, record_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 更新一条已有记录的识别结果。录音文件、完成时间和记录 id 保持不变。
+pub struct RecognitionPatch {
+    pub text: Option<String>,
+    pub recognition: Option<RecognitionContext>,
+    pub recognition_status: String,
+    pub recognition_error: String,
+}
+
+pub fn update_recognition(
+    dir: &Path,
+    record_id: &str,
+    patch: RecognitionPatch,
+) -> Result<HistoryRecord, String> {
+    let mut records = load_records(dir);
+    let record = records
+        .iter_mut()
+        .find(|record| record.id == record_id)
+        .ok_or_else(|| "找不到这条历史记录。".to_string())?;
+    if let Some(text) = patch.text {
+        let trimmed = text.trim().to_string();
+        record.char_count = trimmed.chars().filter(|c| !c.is_whitespace()).count() as u32;
+        record.text = trimmed;
+    }
+    if let Some(recognition) = patch.recognition {
+        record.recognition = Some(recognition);
+    }
+    record.recognition_status = patch.recognition_status;
+    record.recognition_error = patch.recognition_error;
+    let updated = record.clone();
+    persist_records(dir, &records)?;
+    Ok(updated)
+}
+
+pub fn record_by_id(dir: &Path, record_id: &str) -> Result<HistoryRecord, String> {
+    load_records(dir)
+        .into_iter()
+        .find(|record| record.id == record_id)
+        .ok_or_else(|| "找不到这条历史记录。".to_string())
+}
+
+/// 取出可自动重试的失败记录，最近的优先。
+pub fn pending_auto_retry_records(dir: &Path) -> Vec<HistoryRecord> {
+    let mut records: Vec<HistoryRecord> = load_records(dir)
+        .into_iter()
+        .filter(record_is_pending_auto_retry)
+        .collect();
+    records.sort_by(|a, b| b.finished_at_ms.cmp(&a.finished_at_ms));
+    records
+}
+
+pub fn record_is_pending_auto_retry(record: &HistoryRecord) -> bool {
+    record_has_playable_audio(record)
+        && matches!(record.recognition_status.as_str(), "failed" | "retrying")
+        && is_auto_retryable_recognition_error(&record.recognition_error)
+}
+
+pub fn record_has_playable_audio(record: &HistoryRecord) -> bool {
+    record.audio.is_some() && !record.audio_missing
+}
+
+/// 网络/连接类失败可以自动重试；用户取消和鉴权问题需要人工处理。
+pub fn is_auto_retryable_recognition_error(error: &str) -> bool {
+    let error = error.trim();
+    if error.is_empty() {
+        return false;
+    }
+    if error.contains("用户已取消")
+        || error.contains("尚未配置豆包语音 API Key")
+        || error.contains("API Key 未通过认证")
+        || error.contains("鉴权失败")
+        || error.contains("豆包语音服务拒绝访问")
+    {
+        return false;
+    }
+    true
+}
+
+pub fn read_pcm(dir: &Path, record_id: &str) -> Result<Vec<u8>, String> {
+    let wav = read_audio(dir, record_id)?;
+    pcm_from_wav(&wav)
+}
+
+fn pcm_from_wav(wav: &[u8]) -> Result<Vec<u8>, String> {
+    if wav.len() <= WAV_HEADER_BYTES as usize
+        || wav.get(0..4) != Some(b"RIFF")
+        || wav.get(8..12) != Some(b"WAVE")
+    {
+        return Err("录音文件损坏，无法重新转写。".into());
+    }
+    let pcm = wav[WAV_HEADER_BYTES as usize..].to_vec();
+    if pcm.len() < 2 || pcm.len() & 1 != 0 {
+        return Err("录音文件没有可识别的音频数据。".into());
+    }
+    Ok(pcm)
+}
+
 pub fn ensure_audio_dir(dir: &Path) -> Result<PathBuf, String> {
     let path = audio_dir(dir);
     fs::create_dir_all(&path).map_err(|e| format!("创建录音文件夹失败：{e}"))?;
@@ -641,6 +737,116 @@ mod tests {
         let records = load(&dir).records;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].recording_error, "录音缓冲区已满");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn network_errors_are_auto_retryable_but_cancellations_are_not() {
+        assert!(is_auto_retryable_recognition_error(
+            "连接火山引擎实时识别失败：TLS error: connection closed via error",
+        ));
+        assert!(is_auto_retryable_recognition_error(
+            "录音结束前实时识别尚未连接完成"
+        ));
+        assert!(!is_auto_retryable_recognition_error("用户已取消文字识别"));
+        assert!(!is_auto_retryable_recognition_error(
+            "尚未配置豆包语音 API Key"
+        ));
+        assert!(!is_auto_retryable_recognition_error(
+            "API Key 未通过认证。请确认填写的是豆包语音控制台"
+        ));
+        assert!(!is_auto_retryable_recognition_error(""));
+    }
+
+    #[test]
+    fn update_recognition_fills_failed_transcript() {
+        let dir = temp_dir();
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut recorder = AudioRecorder::create(&dir, &id).unwrap();
+        recorder.write_pcm(&[0, 0, 1, 0]).unwrap();
+        let artifact = recorder.finish().unwrap();
+        append(
+            &dir,
+            HistoryAppend {
+                id: id.clone(),
+                text: "",
+                duration_ms: 1,
+                audio: Some(artifact),
+                recognition: None,
+                recording_error: None,
+                recognition_error: Some("没有网络".into()),
+            },
+        )
+        .unwrap();
+
+        let updated = update_recognition(
+            &dir,
+            &id,
+            RecognitionPatch {
+                text: Some("补上的转写".into()),
+                recognition: None,
+                recognition_status: "completed".into(),
+                recognition_error: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.text, "补上的转写");
+        assert_eq!(updated.char_count, 5);
+        assert_eq!(updated.recognition_status, "completed");
+        assert!(updated.recognition_error.is_empty());
+        assert_eq!(pending_auto_retry_records(&dir).len(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelled_failed_records_are_not_auto_retried() {
+        let dir = temp_dir();
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut recorder = AudioRecorder::create(&dir, &id).unwrap();
+        recorder.write_pcm(&[0, 0, 1, 0]).unwrap();
+        let artifact = recorder.finish().unwrap();
+        append(
+            &dir,
+            HistoryAppend {
+                id,
+                text: "",
+                duration_ms: 1,
+                audio: Some(artifact),
+                recognition: None,
+                recording_error: None,
+                recognition_error: Some("用户已取消文字识别".into()),
+            },
+        )
+        .unwrap();
+        assert!(pending_auto_retry_records(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_pcm_strips_wav_header() {
+        let dir = temp_dir();
+        let id = uuid::Uuid::new_v4().to_string();
+        let pcm = [0_u8, 0, 1, 0];
+        let mut recorder = AudioRecorder::create(&dir, &id).unwrap();
+        recorder.write_pcm(&pcm).unwrap();
+        let artifact = recorder.finish().unwrap();
+        append(
+            &dir,
+            HistoryAppend {
+                id: id.clone(),
+                text: "",
+                duration_ms: 1,
+                audio: Some(artifact),
+                recognition: None,
+                recording_error: None,
+                recognition_error: Some("没有网络".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(read_pcm(&dir, &id).unwrap(), pcm);
+        let pending = pending_auto_retry_records(&dir);
+        assert_eq!(pending.len(), 1);
+        assert!(record_is_pending_auto_retry(&pending[0]));
         let _ = fs::remove_dir_all(&dir);
     }
 

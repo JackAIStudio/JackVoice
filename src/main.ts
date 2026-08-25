@@ -80,7 +80,7 @@ type HistoryRecord = {
     inputGainDb: number;
     inputDeviceId: string;
   };
-  recognitionStatus?: "completed" | "noSpeech" | "failed";
+  recognitionStatus?: "completed" | "noSpeech" | "failed" | "retrying";
   recognitionError?: string;
   recordingError?: string;
   audioMissing?: boolean;
@@ -176,6 +176,52 @@ async function copyHistoryText(text: string, button: HTMLButtonElement) {
       button.classList.remove("copied", "copy-failed");
       button.title = "复制";
     }, 1500);
+  }
+}
+
+function canRetryHistoryRecognition(record: HistoryRecord) {
+  return !!record.audio && !record.audioMissing && (
+    record.recognitionStatus === "failed"
+    || record.recognitionStatus === "retrying"
+    || record.recognitionStatus === "noSpeech"
+    || !!record.recognitionError
+    || !record.text.trim()
+  );
+}
+
+function historyPreviewText(record: HistoryRecord) {
+  if (record.text.trim()) return record.text;
+  if (record.recognitionStatus === "retrying") return "正在根据本地录音重新转写…";
+  if (record.recordingError) return "本地录音异常 · 文件可能不完整";
+  if (record.recognitionError) return "录音已保存 · 实时识别未完成";
+  return "本次录音未生成文字";
+}
+
+async function retryHistoryRecognition(recordId: string, button?: HTMLButtonElement) {
+  if (button) {
+    button.disabled = true;
+    button.textContent = "正在重试";
+  }
+  try {
+    const data = await invoke<HistoryData>("retry_history_recognition", { recordId });
+    renderStats(data.stats);
+    renderHistory(data.records);
+    const updated = data.records.find((record) => record.id === recordId);
+    if (updated && selectedHistoryId === recordId) {
+      renderHistoryDetail(updated);
+    }
+    if (updated?.text.trim()) {
+      showToast("已根据本地录音补全听写文字", "success");
+    } else if (updated?.recognitionStatus === "noSpeech") {
+      showToast("重新转写完成，仍未识别到文字", "success");
+    } else {
+      showToast(updated?.recognitionError || "重新转写未完成", "error");
+    }
+  } catch (error) {
+    await refreshHistory();
+    showToast(`重新转写失败：${String(error)}`, "error");
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 
@@ -757,6 +803,11 @@ async function refreshHistory() {
     const data = await invoke<HistoryData>("get_history");
     renderStats(data.stats);
     renderHistory(data.records);
+    if (selectedHistoryId) {
+      const selected = data.records.find((record) => record.id === selectedHistoryId);
+      const detail = $("#history-detail") as HTMLDialogElement | null;
+      if (selected && detail?.open) renderHistoryDetail(selected);
+    }
   } catch (error) {
     console.error("load history failed", error);
   }
@@ -829,7 +880,7 @@ function renderHistory(records: HistoryRecord[]) {
     for (const record of group.items) {
       const hasPlayableAudio = !!record.audio && !record.audioMissing;
       const row = document.createElement("div");
-      row.className = `history-row${record.id === selectedHistoryId ? " active" : ""}`;
+      row.className = `history-row${record.id === selectedHistoryId ? " active" : ""}${canRetryHistoryRecognition(record) ? " needs-retry" : ""}`;
       row.dataset.historyRow = record.id;
       row.tabIndex = 0;
       row.setAttribute("role", "button");
@@ -854,12 +905,7 @@ function renderHistory(records: HistoryRecord[]) {
 
       const text = document.createElement("div");
       text.className = "history-row-text";
-      text.textContent = record.text
-        || (record.recordingError
-          ? "本地录音异常 · 文件可能不完整"
-          : record.recognitionError
-            ? "录音已保存 · 实时识别未完成"
-            : "本次录音未生成文字");
+      text.textContent = historyPreviewText(record);
 
       const actions = document.createElement("div");
       actions.className = "history-row-actions";
@@ -873,6 +919,19 @@ function renderHistory(records: HistoryRecord[]) {
           void copyHistoryText(record.text, copy);
         });
         actions.appendChild(copy);
+      }
+
+      if (canRetryHistoryRecognition(record) && hasPlayableAudio) {
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.className = "history-row-action";
+        retry.textContent = record.recognitionStatus === "retrying" ? "转写中" : "重试转写";
+        retry.disabled = record.recognitionStatus === "retrying";
+        retry.addEventListener("click", (event) => {
+          event.stopPropagation();
+          void retryHistoryRecognition(record.id, retry);
+        });
+        actions.appendChild(retry);
       }
 
       if (hasPlayableAudio) {
@@ -1016,7 +1075,12 @@ function renderHistoryDetail(record: HistoryRecord) {
     content.appendChild(recordingNotice);
   }
 
-  if (record.recognitionError) {
+  if (record.recognitionStatus === "retrying") {
+    const recognitionNotice = document.createElement("div");
+    recognitionNotice.className = "detail-no-audio retrying";
+    recognitionNotice.textContent = "正在根据本地录音重新转写，完成后会自动更新这条记录。";
+    content.appendChild(recognitionNotice);
+  } else if (record.recognitionError) {
     const recognitionNotice = document.createElement("div");
     recognitionNotice.className = "detail-no-audio";
     recognitionNotice.textContent = `实时识别未完成：${record.recognitionError}`;
@@ -1028,7 +1092,10 @@ function renderHistoryDetail(record: HistoryRecord) {
   transcriptLabel.textContent = "听写文字";
   const transcript = document.createElement("div");
   transcript.className = "detail-transcript";
-  transcript.textContent = record.text || "本次录音未生成听写文字。";
+  transcript.textContent = record.text
+    || (record.recognitionStatus === "retrying"
+      ? "正在重新转写…"
+      : "本次录音未生成听写文字。");
   content.append(transcriptLabel, transcript);
 
   const info = document.createElement("details");
@@ -1074,6 +1141,15 @@ function renderHistoryDetail(record: HistoryRecord) {
         .finally(() => (reveal.disabled = false));
     });
     footerStart.appendChild(reveal);
+    if (canRetryHistoryRecognition(record)) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "detail-action primary";
+      retry.textContent = record.recognitionStatus === "retrying" ? "正在转写…" : "重新转写";
+      retry.disabled = record.recognitionStatus === "retrying";
+      retry.addEventListener("click", () => void retryHistoryRecognition(record.id, retry));
+      footerStart.appendChild(retry);
+    }
   }
   const remove = document.createElement("button");
   remove.type = "button";
@@ -2611,4 +2687,5 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
   await listen("jackvoice://history", () => void refreshHistory());
+  window.addEventListener("online", () => void refreshHistory());
 });

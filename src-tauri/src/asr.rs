@@ -670,6 +670,42 @@ pub async fn test_connection(config: VolcAsrConfig) -> Result<(), AsrError> {
     Ok(())
 }
 
+const FILE_RECOGNITION_CHUNK_BYTES: usize = 3_200;
+
+/// 把已保存的 PCM16 录音回放到同一条实时识别通道，补出失败听写的转写稿。
+pub async fn transcribe_pcm(
+    config: VolcAsrConfig,
+    semantic_punctuation_enabled: bool,
+    semantic_smoothing_enabled: bool,
+    max_sentence_silence_ms: u32,
+    hotwords: Vec<String>,
+    pcm: Vec<u8>,
+    on_update: impl FnMut(TranscriptUpdate) + Send + 'static,
+) -> Result<String, AsrError> {
+    if pcm.len() < 2 || pcm.len() & 1 != 0 {
+        return Err(AsrError::Message("录音文件没有可识别的音频数据。".into()));
+    }
+    let session = tokio::time::timeout(
+        Duration::from_secs(20),
+        RealtimeSession::connect(
+            config,
+            semantic_punctuation_enabled,
+            semantic_smoothing_enabled,
+            max_sentence_silence_ms,
+            hotwords,
+            on_update,
+        ),
+    )
+    .await
+    .map_err(|_| AsrError::Message("连接豆包语音超时".into()))??;
+    for chunk in pcm.chunks(FILE_RECOGNITION_CHUNK_BYTES) {
+        session.send_audio(chunk.to_vec()).await?;
+        // 回放略快于实时，避免把整段录音一次性灌进识别通道。
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    session.finish().await
+}
+
 #[cfg(test)]
 mod volc_protocol_tests {
     use super::*;

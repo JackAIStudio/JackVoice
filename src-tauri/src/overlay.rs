@@ -193,7 +193,12 @@ fn frontmost_app_name() -> Option<String> {
     let raw = String::from_utf8_lossy(&out.stdout);
     let (name, window_count) = raw.trim().rsplit_once('\t')?;
     let window_count = window_count.parse::<usize>().ok()?;
-    if name.is_empty() || name.starts_with("JackVoice") || window_count == 0 {
+    // macOS reports the process name as "jackvoice" (lowercase), while other
+    // code paths use "JackVoice". Compare case-insensitively so this app is
+    // never mistaken for the app we should restore focus to after the capsule
+    // hides. Otherwise canceling a dictation while JackVoice is frontmost would
+    // reactivate the main window instead of returning focus to the user's app.
+    if name.is_empty() || name.to_lowercase().starts_with("jackvoice") || window_count == 0 {
         None
     } else {
         Some(name.to_string())

@@ -46,6 +46,15 @@ fn delete_history_record(
     Ok(history::load(&state.data_dir()))
 }
 
+#[tauri::command]
+async fn retry_history_recognition(
+    record_id: String,
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<history::HistoryData, String> {
+    state.retry_history_recognition(app, record_id).await
+}
+
 /// 以二进制 IPC 返回 WAV，前端只在用户点击播放时按需读取。
 #[tauri::command]
 fn get_history_audio(
@@ -568,6 +577,7 @@ pub fn run() {
                 shortcut::install_fn_shortcut_monitor(app.handle().clone());
             }
             let _ = crate::overlay::ensure_overlay(app.handle());
+            session::start_pending_recognition_retries(app.handle().clone());
 
             // First run (onboarding not finished yet): show the main window so
             // the user can walk through the permission setup. The window is
@@ -619,6 +629,7 @@ pub fn run() {
             get_state,
             get_history,
             delete_history_record,
+            retry_history_recognition,
             get_history_audio,
             reveal_history_audio,
             get_hotwords,

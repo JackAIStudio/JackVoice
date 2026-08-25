@@ -2,12 +2,12 @@ use crate::asr::{RealtimeSession, TranscriptUpdate, VolcAsrConfig, ASR_ENGINE_NA
 use crate::audio::{self, AudioCapture, InputDeviceInfo, InputDevicePreference};
 use crate::credentials::{CredentialMode, CredentialSource};
 use crate::delivery::{self, DeliveryResult};
-use crate::history::{AudioRecorder, HistoryAppend, RecognitionContext};
+use crate::history::{AudioRecorder, HistoryAppend, RecognitionContext, RecognitionPatch};
 use crate::output_mute::OutputMuteGuard;
 use crate::settings::{self, AppSettings};
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -196,6 +196,12 @@ pub struct AppState {
     monitor: Mutex<Option<MonitorSession>>,
     mic_fallback_state: Mutex<MicFallbackState>,
     cancel_requested: Mutex<bool>,
+    /// Prevents overlapping background sweeps of failed transcripts.
+    retry_in_flight: AtomicBool,
+    /// Record ids currently being re-transcribed, whether manual or automatic.
+    retrying_records: Mutex<HashSet<String>>,
+    /// File transcription shares one ASR connection at a time.
+    retry_gate: tokio::sync::Mutex<()>,
     /// Bumped whenever a dictation session starts, so a scheduled
     /// "hide the error capsule" task never hides a newer session's capsule.
     session_epoch: AtomicU64,
@@ -287,6 +293,9 @@ impl AppState {
             monitor: Mutex::new(None),
             mic_fallback_state: Mutex::new(MicFallbackState::default()),
             cancel_requested: Mutex::new(false),
+            retry_in_flight: AtomicBool::new(false),
+            retrying_records: Mutex::new(HashSet::new()),
+            retry_gate: tokio::sync::Mutex::new(()),
             session_epoch: AtomicU64::new(0),
         })
     }
@@ -1058,6 +1067,242 @@ impl AppState {
         Ok(self.snapshot())
     }
 
+    pub async fn retry_history_recognition(
+        &self,
+        app: AppHandle,
+        record_id: String,
+    ) -> Result<crate::history::HistoryData, String> {
+        self.transcribe_history_record(&app, record_id.trim(), false)
+            .await?;
+        Ok(crate::history::load(&self.shared_data_dir))
+    }
+
+    pub async fn retry_pending_history_recognitions(
+        &self,
+        app: AppHandle,
+    ) -> Result<crate::history::HistoryData, String> {
+        if self.active.lock().is_some() {
+            return Ok(crate::history::load(&self.shared_data_dir));
+        }
+        if self.settings.lock().volc_api_key.trim().is_empty() {
+            return Ok(crate::history::load(&self.shared_data_dir));
+        }
+        if self.retry_in_flight.swap(true, Ordering::AcqRel) {
+            return Ok(crate::history::load(&self.shared_data_dir));
+        }
+        let result = async {
+            let pending = crate::history::pending_auto_retry_records(&self.shared_data_dir);
+            for record in pending {
+                if self.active.lock().is_some() {
+                    break;
+                }
+                if self.retrying_records.lock().contains(&record.id) {
+                    continue;
+                }
+                match self.transcribe_history_record(&app, &record.id, true).await {
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("[history] 自动重试转写失败 {}：{error}", record.id);
+                        if crate::history::is_auto_retryable_recognition_error(&error) {
+                            break;
+                        }
+                    }
+                }
+            }
+            crate::history::load(&self.shared_data_dir)
+        }
+        .await;
+        self.retry_in_flight.store(false, Ordering::Release);
+        Ok(result)
+    }
+
+    async fn transcribe_history_record(
+        &self,
+        app: &AppHandle,
+        record_id: &str,
+        automatic: bool,
+    ) -> Result<crate::history::HistoryRecord, String> {
+        if record_id.is_empty() {
+            return Err("记录编号无效。".into());
+        }
+        if self.active.lock().is_some() {
+            return Err("正在听写中，请先结束听写再重试转写。".into());
+        }
+
+        let record = crate::history::record_by_id(&self.shared_data_dir, record_id)?;
+        if !crate::history::record_has_playable_audio(&record) {
+            return Err("这条记录没有可重试的本地录音。".into());
+        }
+        if automatic && !crate::history::record_is_pending_auto_retry(&record) {
+            return Ok(record);
+        }
+        if !automatic && !record_allows_manual_retry(&record) {
+            return Err("这条记录已经有听写文字。".into());
+        }
+
+        let settings = self.settings.lock().clone();
+        if settings.volc_api_key.trim().is_empty() {
+            return Err("尚未配置豆包语音 API Key，无法重试转写。".into());
+        }
+
+        let _gate = self.retry_gate.lock().await;
+        if self.active.lock().is_some() {
+            return Err("正在听写中，请先结束听写再重试转写。".into());
+        }
+        let record = crate::history::record_by_id(&self.shared_data_dir, record_id)?;
+        if automatic && !crate::history::record_is_pending_auto_retry(&record) {
+            return Ok(record);
+        }
+        if !automatic && !record_allows_manual_retry(&record) {
+            return Err("这条记录已经有听写文字。".into());
+        }
+
+        {
+            let mut retrying = self.retrying_records.lock();
+            if !retrying.insert(record.id.clone()) {
+                return Err("这条记录正在重新转写。".into());
+            }
+        }
+
+        let started = crate::history::update_recognition(
+            &self.shared_data_dir,
+            record_id,
+            RecognitionPatch {
+                text: None,
+                recognition: None,
+                recognition_status: "retrying".into(),
+                recognition_error: record.recognition_error.clone(),
+            },
+        );
+        if let Err(error) = started {
+            self.retrying_records.lock().remove(&record.id);
+            return Err(error);
+        }
+        let _ = app.emit("jackvoice://history", true);
+
+        let pcm = match crate::history::read_pcm(&self.shared_data_dir, record_id) {
+            Ok(pcm) => pcm,
+            Err(error) => {
+                self.finish_failed_retry(app, record_id, &record, error.clone());
+                return Err(error);
+            }
+        };
+
+        let dictionary = crate::hotwords::load(&self.shared_data_dir);
+        let hotwords = record
+            .recognition
+            .as_ref()
+            .map(|context| context.hotwords.clone())
+            .unwrap_or_else(|| crate::hotwords::recognition_words(&dictionary));
+        let punctuation = record
+            .recognition
+            .as_ref()
+            .map(|context| context.semantic_punctuation_enabled)
+            .unwrap_or(settings.semantic_punctuation_enabled);
+        let smoothing = record
+            .recognition
+            .as_ref()
+            .map(|context| context.semantic_smoothing_enabled)
+            .unwrap_or(settings.semantic_smoothing_enabled);
+        let silence = record
+            .recognition
+            .as_ref()
+            .map(|context| context.max_sentence_silence_ms)
+            .unwrap_or(settings.max_sentence_silence_ms);
+        let replacement_rules = crate::hotwords::user_replacement_rules(&self.shared_data_dir);
+        let config = VolcAsrConfig {
+            api_key: settings.volc_api_key.clone(),
+            resource_id: settings.volc_resource_id.clone(),
+            boosting_table_id: settings.volc_boosting_table_id.clone(),
+        };
+
+        let result = crate::asr::transcribe_pcm(
+            config,
+            punctuation,
+            smoothing,
+            silence,
+            hotwords,
+            pcm,
+            |_| {},
+        )
+        .await
+        .map_err(|error| format_volc_connection_error(&error.to_string()));
+
+        let outcome = match result {
+            Ok(text) => {
+                let final_text = crate::hotwords::apply_replacements(&text, &replacement_rules);
+                let recognition_status = if final_text.trim().is_empty() {
+                    "noSpeech"
+                } else {
+                    "completed"
+                };
+                crate::history::update_recognition(
+                    &self.shared_data_dir,
+                    record_id,
+                    RecognitionPatch {
+                        text: Some(final_text),
+                        recognition: record.recognition.clone(),
+                        recognition_status: recognition_status.into(),
+                        recognition_error: String::new(),
+                    },
+                )
+            }
+            Err(error) => {
+                let _ = crate::history::update_recognition(
+                    &self.shared_data_dir,
+                    record_id,
+                    RecognitionPatch {
+                        text: None,
+                        recognition: None,
+                        recognition_status: "failed".into(),
+                        recognition_error: error.clone(),
+                    },
+                );
+                Err(error)
+            }
+        };
+
+        self.retrying_records.lock().remove(&record.id);
+        let _ = app.emit("jackvoice://history", true);
+
+        match outcome {
+            Ok(updated) => {
+                let mut ui = self.ui.lock();
+                ui.volc_credential_status = VolcCredentialStatus::Verified;
+                if ui.phase == "idle" && !updated.text.trim().is_empty() {
+                    if ui.transcript.trim().is_empty() {
+                        ui.transcript = updated.text.clone();
+                    }
+                    ui.status = "已根据本地录音补全听写文字。".into();
+                }
+                let _ = app.emit("jackvoice://state", ui.clone());
+                Ok(updated)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn finish_failed_retry(
+        &self,
+        app: &AppHandle,
+        record_id: &str,
+        record: &crate::history::HistoryRecord,
+        error: String,
+    ) {
+        let _ = crate::history::update_recognition(
+            &self.shared_data_dir,
+            record_id,
+            RecognitionPatch {
+                text: None,
+                recognition: None,
+                recognition_status: "failed".into(),
+                recognition_error: error,
+            },
+        );
+        self.retrying_records.lock().remove(&record.id);
+        let _ = app.emit("jackvoice://history", true);
+    }
+
     pub async fn toggle(&self, app: AppHandle) -> Result<UiState, String> {
         let is_active = self.active.lock().is_some();
         if is_active {
@@ -1809,6 +2054,12 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
             local_error.get_or_insert(format!("录音文件已保存，但写入历史记录失败：{error}"));
         } else {
             let _ = app.emit("jackvoice://history", true);
+            if recognition_error
+                .as_ref()
+                .is_some_and(|error| crate::history::is_auto_retryable_recognition_error(error))
+            {
+                schedule_pending_recognition_retries(&app);
+            }
         }
 
         let mut delivery_result = None;
@@ -2148,6 +2399,47 @@ fn restore_output_mute(mut guard: Option<OutputMuteGuard>) {
             eprintln!("[output-mute] 恢复系统音频失败：{error}");
         }
     }
+}
+
+fn record_allows_manual_retry(record: &crate::history::HistoryRecord) -> bool {
+    crate::history::record_has_playable_audio(record)
+        && (record.text.trim().is_empty()
+            || !record.recognition_error.is_empty()
+            || matches!(
+                record.recognition_status.as_str(),
+                "failed" | "retrying" | "noSpeech"
+            ))
+}
+
+pub fn start_pending_recognition_retries(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        loop {
+            if let Some(state) = app.try_state::<AppState>() {
+                let _ = state.retry_pending_history_recognitions(app.clone()).await;
+            }
+            tokio::time::sleep(Duration::from_secs(45)).await;
+        }
+    });
+}
+
+fn schedule_pending_recognition_retries(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        for delay_secs in [8_u64, 20, 45] {
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            let Some(state) = app.try_state::<AppState>() else {
+                continue;
+            };
+            if state.active.lock().is_some() {
+                continue;
+            }
+            if crate::history::pending_auto_retry_records(&state.shared_data_dir).is_empty() {
+                return;
+            }
+            let _ = state.retry_pending_history_recognitions(app.clone()).await;
+        }
+    });
 }
 
 /// 将服务端/网络层的原始连接错误转成用户能采取行动的提示。

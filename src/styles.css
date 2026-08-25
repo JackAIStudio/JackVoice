@@ -596,7 +596,8 @@ kbd.shortcut {
 
 .history-row:hover .history-row-actions,
 .history-row:focus-within .history-row-actions,
-.history-row.playing .history-row-actions {
+.history-row.playing .history-row-actions,
+.history-row.needs-retry .history-row-actions {
   opacity: 1;
 }
 
@@ -684,6 +685,12 @@ kbd.shortcut {
 }
 
 .detail-action:hover:not(:disabled) { background: var(--hover); }
+.detail-action.primary {
+  border-color: #cfe8df;
+  background: #f4faf7;
+  color: var(--mint-dark);
+}
+.detail-action.primary:hover:not(:disabled) { background: #e7f6f0; }
 .detail-action.danger:hover:not(:disabled) { border-color: #f0c5c5; color: var(--danger); }
 .detail-action:disabled { cursor: wait; opacity: 0.5; }
 
@@ -787,6 +794,11 @@ kbd.shortcut {
   font-size: 11px;
 }
 
+.detail-no-audio.retrying {
+  background: #f4faf7;
+  color: var(--mint-dark);
+}
+
 .detail-section-label {
   margin-bottom: 10px;
   color: var(--text-2);
@@ -833,6 +845,12 @@ kbd.shortcut {
   justify-content: space-between;
   gap: 12px;
   margin-top: 20px;
+}
+
+.detail-footer > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .app-toast {
