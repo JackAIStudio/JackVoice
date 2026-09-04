@@ -9,6 +9,10 @@ publish = false
 rust-version = "1.88"
 edition = "2021"
 
+[workspace]
+members = ["crates/jackvoice-agent-bridge"]
+resolver = "2"
+
 [lib]
 name = "jackvoice_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -42,6 +46,7 @@ http = "1"
 base64 = "0.22"
 webrtc-audio-processing = { version = "~2.1", features = ["bundled"] }
 keyring = "4.1.6"
+jackvoice-agent-bridge = { path = "crates/jackvoice-agent-bridge" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"

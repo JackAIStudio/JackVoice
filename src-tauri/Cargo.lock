@@ -2276,6 +2276,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "http",
+ "jackvoice-agent-bridge",
  "keyring",
  "objc2",
  "objc2-app-kit",
@@ -2300,6 +2301,14 @@ dependencies = [
  "url",
  "uuid",
  "webrtc-audio-processing",
+]
+
+[[package]]
+name = "jackvoice-agent-bridge"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
