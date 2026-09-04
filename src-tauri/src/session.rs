@@ -1137,7 +1137,7 @@ impl AppState {
             return Ok(record);
         }
         if !automatic && !record_allows_manual_retry(&record) {
-            return Err("这条记录已经有听写文字。".into());
+            return Err("这条记录没有可重新转写的本地录音。".into());
         }
 
         let settings = self.settings.lock().clone();
@@ -1154,7 +1154,7 @@ impl AppState {
             return Ok(record);
         }
         if !automatic && !record_allows_manual_retry(&record) {
-            return Err("这条记录已经有听写文字。".into());
+            return Err("这条记录没有可重新转写的本地录音。".into());
         }
 
         {
@@ -1273,7 +1273,7 @@ impl AppState {
                     if ui.transcript.trim().is_empty() {
                         ui.transcript = updated.text.clone();
                     }
-                    ui.status = "已根据本地录音补全听写文字。".into();
+                    ui.status = "已根据本地录音完成转写。".into();
                 }
                 let _ = app.emit("jackvoice://state", ui.clone());
                 Ok(updated)
@@ -2403,12 +2403,6 @@ fn restore_output_mute(mut guard: Option<OutputMuteGuard>) {
 
 fn record_allows_manual_retry(record: &crate::history::HistoryRecord) -> bool {
     crate::history::record_has_playable_audio(record)
-        && (record.text.trim().is_empty()
-            || !record.recognition_error.is_empty()
-            || matches!(
-                record.recognition_status.as_str(),
-                "failed" | "retrying" | "noSpeech"
-            ))
 }
 
 pub fn start_pending_recognition_retries(app: AppHandle) {
@@ -2624,5 +2618,48 @@ mod volc_connection_error_tests {
         assert!(
             update_audio_device_state(&mut ui, &mut state, Some(&preference), &notice).is_some()
         );
+    }
+
+    #[test]
+    fn manual_retry_is_allowed_whenever_playable_audio_exists() {
+        use crate::history::{AudioArtifact, HistoryRecord};
+        let mut record = HistoryRecord {
+            id: "rec-1".into(),
+            finished_at_ms: 1000,
+            text: "已经有完整的听写文字".into(),
+            char_count: 10,
+            duration_ms: 5000,
+            audio: Some(AudioArtifact {
+                file_name: "rec-1.wav".into(),
+                mime_type: "audio/wav".into(),
+                sample_rate_hz: 16000,
+                channels: 1,
+                bits_per_sample: 16,
+                duration_ms: 5000,
+                size_bytes: 160000,
+            }),
+            audio_missing: false,
+            recognition: None,
+            recording_error: String::new(),
+            recognition_status: "completed".into(),
+            recognition_error: String::new(),
+        };
+        // 就算已经有完整文字，也允许手动重新转写
+        assert!(super::record_allows_manual_retry(&record));
+
+        // 没有文字时同样允许重试
+        record.text = String::new();
+        record.char_count = 0;
+        record.recognition_status = "noSpeech".into();
+        assert!(super::record_allows_manual_retry(&record));
+
+        // 音频丢失时不允许重新转写
+        record.audio_missing = true;
+        assert!(!super::record_allows_manual_retry(&record));
+
+        // 没有本地录音时不允许重新转写
+        record.audio = None;
+        record.audio_missing = false;
+        assert!(!super::record_allows_manual_retry(&record));
     }
 }
