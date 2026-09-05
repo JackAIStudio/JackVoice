@@ -520,6 +520,34 @@ fn write_windows_snapshot(formats: &[(u32, Vec<u8>)]) -> Result<(), String> {
     Ok(())
 }
 
+/// Apps with proprietary / non-standard rendering engines (such as WeChat / WXWork)
+/// that do not expose accessibility UI elements (`AXFocusedUIElement` is always
+/// missing value), but do support standard system Cmd+V paste when frontmost.
+pub fn is_unsupported_ax_app(name: Option<&str>) -> bool {
+    let Some(name) = name else {
+        return false;
+    };
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    matches!(
+        lower.as_str(),
+        "wechat"
+            | "微信"
+            | "wxwork"
+            | "企业微信"
+            | "qq"
+            | "tencentmeeting"
+            | "wemeet"
+            | "dingtalk"
+            | "钉钉"
+    ) || lower.starts_with("wechat")
+        || lower.starts_with("wxwork")
+        || lower.starts_with("dingtalk")
+}
+
 /// Probe the target app's focused UI element through the macOS Accessibility
 /// API (via osascript) and decide whether there is a real text insertion point.
 ///
@@ -529,6 +557,14 @@ fn write_windows_snapshot(formats: &[(u32, Vec<u8>)]) -> Result<(), String> {
 pub fn probe_insertion_target(process_name: Option<&str>) -> InsertionProbe {
     #[cfg(target_os = "macos")]
     {
+        if is_unsupported_ax_app(process_name) {
+            eprintln!(
+                "[delivery] target app {:?} has non-standard AX tree; treating as Unknown (best-effort paste)",
+                process_name
+            );
+            return InsertionProbe::Unknown;
+        }
+
         let selector = match process_name {
             Some(name) if !name.trim().is_empty() => {
                 let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
@@ -544,9 +580,13 @@ pub fn probe_insertion_target(process_name: Option<&str>) -> InsertionProbe {
             concat!(
                 "tell application \"System Events\"\n",
                 "\t{selector}\n",
+                "\tset actualName to \"\"\n",
+                "\ttry\n",
+                "\t\tset actualName to (name of p as string)\n",
+                "\tend try\n",
                 "\ttry\n",
                 "\t\tset el to value of attribute \"AXFocusedUIElement\" of p\n",
-                "\t\tif el is missing value then return \"__missing__\"\n",
+                "\t\tif el is missing value then return actualName & \"|__missing__\"\n",
                 "\t\tset r to value of attribute \"AXRole\" of el as string\n",
                 "\t\tset sel to \"absent\"\n",
                 "\t\ttry\n",
@@ -557,7 +597,7 @@ pub fn probe_insertion_target(process_name: Option<&str>) -> InsertionProbe {
                 "\t\ttry\n",
                 "\t\t\tset ins to (value of attribute \"AXInsertionPointLineNumber\" of el) as string\n",
                 "\t\tend try\n",
-                "\t\treturn r & \"|\" & sel & \"|\" & ins\n",
+                "\t\treturn actualName & \"|\" & r & \"|\" & sel & \"|\" & ins\n",
                 "\ton error\n",
                 "\t\treturn \"__error__\"\n",
                 "\tend try\n",
@@ -603,11 +643,7 @@ fn run_probe_script(script: &str) -> InsertionProbe {
                     return InsertionProbe::Unknown;
                 }
                 let line = out.trim();
-                return match line {
-                    "__missing__" => InsertionProbe::NotInsertable,
-                    "__error__" | "" => InsertionProbe::Unknown,
-                    _ => classify_probe_line(line),
-                };
+                return parse_probe_output(line);
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
@@ -622,6 +658,38 @@ fn run_probe_script(script: &str) -> InsertionProbe {
     }
 }
 
+/// Parse the probe script output line.
+///
+/// Output formats:
+/// - `appName|__missing__`: Target app exposes no focused element.
+/// - `appName|ROLE|SEL|INS`: Target app element attributes.
+/// - Legacy `__missing__`, `__error__`, or empty string.
+#[cfg(target_os = "macos")]
+fn parse_probe_output(line: &str) -> InsertionProbe {
+    if line.is_empty() || line == "__error__" {
+        return InsertionProbe::Unknown;
+    }
+
+    if let Some((app_name, rest)) = line.split_once('|') {
+        if rest == "__missing__" {
+            return if is_unsupported_ax_app(Some(app_name)) {
+                eprintln!(
+                    "[delivery] target app {app_name} returned __missing__ but has non-standard AX; treating as Unknown"
+                );
+                InsertionProbe::Unknown
+            } else {
+                InsertionProbe::NotInsertable
+            };
+        }
+        return classify_probe_line(app_name, rest);
+    }
+
+    match line {
+        "__missing__" => InsertionProbe::NotInsertable,
+        _ => classify_probe_line("", line),
+    }
+}
+
 /// Classify the probe output line `ROLE|SEL|INS`.
 ///
 /// Insertable when the focused element is a known text role, or when it
@@ -629,8 +697,8 @@ fn run_probe_script(script: &str) -> InsertionProbe {
 /// `AXWebArea` focus reports an out-of-range line number, so it stays
 /// NotInsertable and Cmd+V is never fired without a real insertion point.
 #[cfg(target_os = "macos")]
-fn classify_probe_line(line: &str) -> InsertionProbe {
-    let mut parts = line.split('|');
+fn classify_probe_line(app_name: &str, rest: &str) -> InsertionProbe {
+    let mut parts = rest.split('|');
     let role = parts.next().unwrap_or("").trim();
     let sel = parts.next().unwrap_or("").trim();
     let ins = parts.next().unwrap_or("").trim();
@@ -639,12 +707,14 @@ fn classify_probe_line(line: &str) -> InsertionProbe {
     let has_caret = matches!(ins_line, Some(v) if (0.0..1_000_000_000.0).contains(&v));
     let probe = if TEXT_ROLES.contains(&role) || has_caret {
         InsertionProbe::Insertable
+    } else if is_unsupported_ax_app(Some(app_name)) {
+        InsertionProbe::Unknown
     } else {
         InsertionProbe::NotInsertable
     };
 
     eprintln!(
-        "[delivery] probe role={role} selectedTextRange={sel} insertionPointLine={ins} -> {probe:?}"
+        "[delivery] probe app={app_name} role={role} selectedTextRange={sel} insertionPointLine={ins} -> {probe:?}"
     );
     probe
 }
@@ -725,7 +795,64 @@ fn post_paste_via_cgevent() -> bool {
 
 #[cfg(test)]
 mod clipboard_transaction_tests {
-    use super::{choose_delivery_target, clipboard_is_still_temporary};
+    use super::{choose_delivery_target, clipboard_is_still_temporary, is_unsupported_ax_app};
+
+    #[test]
+    fn recognizes_unsupported_ax_apps() {
+        assert!(is_unsupported_ax_app(Some("WeChat")));
+        assert!(is_unsupported_ax_app(Some("wechat")));
+        assert!(is_unsupported_ax_app(Some("微信")));
+        assert!(is_unsupported_ax_app(Some("WXWork")));
+        assert!(is_unsupported_ax_app(Some("企业微信")));
+        assert!(is_unsupported_ax_app(Some("DingTalk")));
+        assert!(is_unsupported_ax_app(Some("钉钉")));
+        assert!(is_unsupported_ax_app(Some("QQ")));
+        assert!(!is_unsupported_ax_app(Some("Google Chrome")));
+        assert!(!is_unsupported_ax_app(Some("Notes")));
+        assert!(!is_unsupported_ax_app(Some("Terminal")));
+        assert!(!is_unsupported_ax_app(None));
+        assert!(!is_unsupported_ax_app(Some("")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn probe_output_parsing_handles_unsupported_ax_apps() {
+        use super::{parse_probe_output, InsertionProbe};
+
+        // WeChat exposes no AXFocusedUIElement, should be treated as Unknown (best-effort paste)
+        assert_eq!(
+            parse_probe_output("WeChat|__missing__"),
+            InsertionProbe::Unknown
+        );
+        assert_eq!(
+            parse_probe_output("微信|__missing__"),
+            InsertionProbe::Unknown
+        );
+
+        // Standard apps that report __missing__ are genuinely not insertable
+        assert_eq!(
+            parse_probe_output("Google Chrome|__missing__"),
+            InsertionProbe::NotInsertable
+        );
+        assert_eq!(
+            parse_probe_output("Finder|__missing__"),
+            InsertionProbe::NotInsertable
+        );
+
+        // Standard apps with valid caret or text role are insertable
+        assert_eq!(
+            parse_probe_output("Terminal|AXTextArea|present|0"),
+            InsertionProbe::Insertable
+        );
+        assert_eq!(
+            parse_probe_output("Notes|AXTextArea|present|12"),
+            InsertionProbe::Insertable
+        );
+
+        // Error or empty string falls back to Unknown
+        assert_eq!(parse_probe_output("__error__"), InsertionProbe::Unknown);
+        assert_eq!(parse_probe_output(""), InsertionProbe::Unknown);
+    }
 
     #[cfg(target_os = "macos")]
     fn assert_snapshot_preserves_original(
