@@ -30,10 +30,10 @@ pub enum InsertionProbe {
 /// identify any current frontmost app. If the user deliberately switched apps
 /// and the new app has no caret, returning the old app here would reactivate it
 /// and paste into a stale insertion point instead of showing the copy prompt.
-pub(crate) fn choose_delivery_target(
-    initial_target: Option<String>,
-    current_target: Option<String>,
-) -> Option<String> {
+pub(crate) fn choose_delivery_target<T>(
+    initial_target: Option<T>,
+    current_target: Option<T>,
+) -> Option<T> {
     current_target.or(initial_target)
 }
 
@@ -551,12 +551,12 @@ pub fn is_unsupported_ax_app(name: Option<&str>) -> bool {
 /// Probe the target app's focused UI element through the macOS Accessibility
 /// API (via osascript) and decide whether there is a real text insertion point.
 ///
-/// `process_name` should be the app that will receive the paste (the app that
-/// was frontmost when the capsule showed). When unavailable, probe the
-/// current frontmost app instead.
-pub fn probe_insertion_target(process_name: Option<&str>) -> InsertionProbe {
+/// Prefer the remembered process PID so a development JackAICut is not
+/// confused with the production install of the same product name.
+pub fn probe_insertion_target(target: Option<&crate::overlay::FrontmostApp>) -> InsertionProbe {
     #[cfg(target_os = "macos")]
     {
+        let process_name = target.map(|app| app.name.as_str());
         if is_unsupported_ax_app(process_name) {
             eprintln!(
                 "[delivery] target app {:?} has non-standard AX tree; treating as Unknown (best-effort paste)",
@@ -565,13 +565,7 @@ pub fn probe_insertion_target(process_name: Option<&str>) -> InsertionProbe {
             return InsertionProbe::Unknown;
         }
 
-        let selector = match process_name {
-            Some(name) if !name.trim().is_empty() => {
-                let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
-                format!("set p to first application process whose name is \"{escaped}\"")
-            }
-            _ => "set p to first application process whose frontmost is true".to_string(),
-        };
+        let selector = process_selector(target);
         // Also report whether the focused element exposes a live insertion
         // point. Chrome exposes a focused <textarea> as AXGroup, and some
         // Electron/web surfaces only expose AXWebArea — role alone is not
@@ -610,8 +604,24 @@ pub fn probe_insertion_target(process_name: Option<&str>) -> InsertionProbe {
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = process_name;
+        let _ = target;
         InsertionProbe::Unknown
+    }
+}
+
+pub(crate) fn process_selector(target: Option<&crate::overlay::FrontmostApp>) -> String {
+    match target {
+        Some(app) if app.pid > 0 => {
+            format!(
+                "set p to first application process whose unix id is {}",
+                app.pid
+            )
+        }
+        Some(app) if !app.name.trim().is_empty() => {
+            let escaped = app.name.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("set p to first application process whose name is \"{escaped}\"")
+        }
+        _ => "set p to first application process whose frontmost is true".to_string(),
     }
 }
 
@@ -877,16 +887,34 @@ mod clipboard_transaction_tests {
     #[test]
     fn app_switch_never_reactivates_the_original_dictation_target() {
         assert_eq!(
-            choose_delivery_target(Some("Codex".into()), Some("Chrome".into())),
-            Some("Chrome".into())
+            choose_delivery_target(Some("Codex".to_string()), Some("Chrome".to_string())),
+            Some("Chrome".to_string())
         );
     }
 
     #[test]
     fn original_target_is_only_used_when_current_app_is_unavailable() {
         assert_eq!(
-            choose_delivery_target(Some("Codex".into()), None),
-            Some("Codex".into())
+            choose_delivery_target(Some("Codex".to_string()), None),
+            Some("Codex".to_string())
+        );
+    }
+
+    #[test]
+    fn probe_selects_the_remembered_process_by_pid() {
+        let target = crate::overlay::FrontmostApp {
+            pid: 12345,
+            name: "JackAICut for DaVinci Resolve Studio".into(),
+        };
+        let selector = super::process_selector(Some(&target));
+        assert_eq!(
+            selector,
+            "set p to first application process whose unix id is 12345"
+        );
+        assert!(!selector.contains("name is"));
+        assert_eq!(
+            super::process_selector(None),
+            "set p to first application process whose frontmost is true"
         );
     }
 

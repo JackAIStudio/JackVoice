@@ -427,7 +427,7 @@ async fn retry_last_transcript(
     crate::overlay::hide_overlay(&app);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let probe = delivery::probe_insertion_target(target.as_deref());
+    let probe = delivery::probe_insertion_target(target.as_ref());
     let result = delivery::deliver_text(&app, &text, probe).await;
     let ui = state.apply_delivery_result(&result);
     let _ = app.emit("jackvoice://state", ui);
@@ -498,13 +498,7 @@ pub fn run() {
             // 正在听写时不要抢焦点：否则自动粘贴的目标应用会被设置窗口顶掉。
             let dictating = app
                 .try_state::<AppState>()
-                .map(|state| {
-                    let phase = state.snapshot().phase;
-                    matches!(
-                        phase.as_str(),
-                        "starting" | "connecting" | "recording" | "finalizing"
-                    )
-                })
+                .map(|state| state.snapshot().is_live_dictation())
                 .unwrap_or(false);
             if dictating {
                 eprintln!("[single-instance] 重复实例已忽略（正在听写中，不抢占焦点）");
@@ -671,11 +665,17 @@ pub fn run() {
         .build(app_context())
         .expect("error while building JackVoice")
         .run(|app, event| match event {
-            // Clicking the Dock icon should open settings manually.
+            // Dock icon click opens settings, except when the live capsule
+            // itself caused this activation.
             tauri::RunEvent::Reopen { .. } => {
-                // `has_visible_windows` is application-wide and can be true
-                // because the dictation overlay is visible. A Dock click is an
-                // explicit request for settings, so always present `main`.
+                if overlay::suppress_reopen_for_overlay(app)
+                    || app
+                        .try_state::<AppState>()
+                        .is_some_and(|state| state.snapshot().is_live_dictation())
+                {
+                    eprintln!("[main-window] 忽略 Reopen：听写胶囊仍在前台，不打开设置窗口");
+                    return;
+                }
                 if let Err(error) = main_window::show_main_window(app) {
                     eprintln!("[main-window] Dock 唤起失败：{error}");
                 }

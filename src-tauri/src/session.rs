@@ -99,6 +99,17 @@ pub struct UiState {
     pub history_text_size: String,
 }
 
+impl UiState {
+    /// Live capture / recognition lifecycle. Overlay clicks during these
+    /// phases must not present the settings window.
+    pub fn is_live_dictation(&self) -> bool {
+        matches!(
+            self.phase.as_str(),
+            "starting" | "connecting" | "recording" | "finalizing"
+        )
+    }
+}
+
 impl Default for UiState {
     fn default() -> Self {
         Self {
@@ -1037,8 +1048,9 @@ impl AppState {
     }
 
     pub async fn cancel(&self, app: AppHandle) -> Result<UiState, String> {
-        // Silent cancel: stop capture/session and hide overlay.
-        // Do NOT focus/show the settings window. Main UI is manual-only.
+        // Silent cancel: stop capture, keep the local recording, skip ASR
+        // finalization / paste. Hide the capsule without launching another
+        // app or presenting the settings window.
         let had_active = self.active.lock().is_some();
         *self.cancel_requested.lock() = true;
         if had_active {
@@ -2067,16 +2079,17 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
         if !final_text.trim().is_empty() && local_error.is_none() && recognition_error.is_none() {
             let initial_target = crate::overlay::remembered_frontmost_app();
             let current_target = crate::overlay::current_frontmost_app();
-            let current_probe = current_target
-                .as_deref()
-                .map(|target| delivery::probe_insertion_target(Some(target)))
-                .unwrap_or(delivery::InsertionProbe::Unknown);
+            let current_probe = delivery::probe_insertion_target(current_target.as_ref());
             let target =
                 delivery::choose_delivery_target(initial_target.clone(), current_target.clone());
             eprintln!(
                 "[delivery] target initial={initial_target:?} current={current_target:?} current_probe={current_probe:?} selected={target:?}"
             );
-            let reactivate_target = target.is_some() && target != current_target;
+            let reactivate_target = target.as_ref().is_some_and(|selected| {
+                current_target
+                    .as_ref()
+                    .is_none_or(|current| current.pid != selected.pid)
+            });
             crate::overlay::set_remembered_frontmost_app(target.clone());
             crate::overlay::hide_overlay_for_delivery(&app, reactivate_target);
             // Keep the original working delay for every delivery, including
@@ -2086,7 +2099,7 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
             tokio::time::sleep(Duration::from_millis(350)).await;
             let probe = if reactivate_target {
                 // Probe after a genuinely different target has been restored.
-                delivery::probe_insertion_target(target.as_deref())
+                delivery::probe_insertion_target(target.as_ref())
             } else {
                 // Preserve the already-valid caret and the probe captured while
                 // its exact window was still active.
