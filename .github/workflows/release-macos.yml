@@ -1,9 +1,10 @@
 name: Release macOS
 
+# 正式发布走本机 npm run build:desktop:release：构建、Developer ID 签名、Apple 公证、
+# staple 与 Gatekeeper 验收都在开发机完成，再手动发布 GitHub Release。
+# 这里保留手动触发的备用入口，不监听 tag，避免每次发版都因 release 环境缺少
+# APPLE_CERTIFICATE 等凭据而留下一次失败运行。
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:
@@ -15,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-macos-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  group: release-macos-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
@@ -27,7 +28,7 @@ jobs:
     permissions:
       contents: write
     env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ inputs.tag }}
       CARGO_TARGET_DIR: ${{ github.workspace }}/.release-cargo-target
       JACKVOICE_BUILD_ID: gh-${{ github.run_id }}-${{ github.run_attempt }}
       JACKVOICE_APPLE_TEAM_ID: ${{ vars.JACKVOICE_APPLE_TEAM_ID }}
@@ -38,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
