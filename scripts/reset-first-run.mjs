@@ -83,6 +83,64 @@ function timestamp() {
   return new Date().toISOString().replaceAll(":", "-").replaceAll(".", "-");
 }
 
+function commandReferencesBinary(command, binaryPath) {
+  const haystack = command.replaceAll("\\", "/");
+  const needle = binaryPath.replaceAll("\\", "/");
+  let from = 0;
+  while (from <= haystack.length) {
+    const index = haystack.indexOf(needle, from);
+    if (index < 0) return false;
+    const before = index === 0 ? "" : haystack[index - 1];
+    const after = haystack[index + needle.length] ?? "";
+    const boundaryBefore = index === 0 || before === " " || before === "\t" || before === "\"" || before === "'";
+    const boundaryAfter = after === "" || after === " " || after === "\t" || after === "\"" || after === "'";
+    if (boundaryBefore && boundaryAfter) return true;
+    from = index + needle.length;
+  }
+  return false;
+}
+
+function uniquePaths(paths) {
+  const seen = new Set();
+  const result = [];
+  for (const path of paths) {
+    const key = path.replaceAll("\\", "/");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(path);
+  }
+  return result;
+}
+
+let cachedDevBareTargets;
+
+function devBareTargetDirectories() {
+  if (cachedDevBareTargets) return cachedDevBareTargets;
+  const paths = [];
+  const explicit = process.env.CARGO_TARGET_DIR?.trim();
+  if (explicit) paths.push(resolve(process.cwd(), explicit));
+  if (platform() === "darwin") {
+    paths.push(join(homedir(), "Library", "Caches", "JackVoice", "dev-cargo-target"));
+    paths.push(join(homedir(), "Library", "Caches", "JackVoice", "qa-cargo-target"));
+  }
+  // Historical default, still used when cargo is invoked without the desktop
+  // script and without CARGO_TARGET_DIR / .cargo/config.toml.
+  paths.push(resolve(process.cwd(), "src-tauri", "target"));
+  try {
+    paths.push(cargoTargetDirectory());
+  } catch {
+    // A missing toolchain must not stop --quit from seeing the known caches.
+  }
+  cachedDevBareTargets = uniquePaths(paths);
+  return cachedDevBareTargets;
+}
+
+function commandReferencesDevBareBinary(command, profile) {
+  return devBareTargetDirectories().some((dir) =>
+    commandReferencesBinary(command, join(dir, profile, "jackvoice")),
+  );
+}
+
 function runningProcessList(identifier) {
   if (platform() !== "darwin") return [];
   try {
@@ -104,8 +162,8 @@ function runningProcessList(identifier) {
       .filter(({ command }) => {
         if (identifier.endsWith(".dev")) {
           return (
-            command.includes("target/debug/jackvoice") ||
-            command.includes("target/release/jackvoice") ||
+            commandReferencesDevBareBinary(command, "debug") ||
+            commandReferencesDevBareBinary(command, "release") ||
             command.includes("JackVoice Dev.app/Contents/MacOS/jackvoice")
           );
         }
@@ -125,7 +183,7 @@ function quitRunningProcesses(identifier) {
   for (const entry of running) {
     const pid = Number(entry.pid);
     if (!Number.isSafeInteger(pid) || pid <= 1) continue;
-    if (entry.command.includes("target/debug/jackvoice")) {
+    if (commandReferencesDevBareBinary(entry.command, "debug")) {
       const pgid = Number(
         execFileSync("/bin/ps", ["-p", entry.pid, "-o", "pgid="], {
           encoding: "utf8",

@@ -30,11 +30,17 @@ cargo build --locked --release \
   --bin jackvoice-mcp
 ```
 
-二进制在 `src-tauri/target/release/jackvoice-mcp`。桌面应用的 Cargo 缓存目录与此无关，这个 sidecar 很小，也不依赖 WebRTC。
+二进制在 Cargo 的 `<target_directory>/release/jackvoice-mcp`，不要写死 `src-tauri/target`。设置了 `CARGO_TARGET_DIR`，或 `.cargo/config.toml` 里写了 `build.target-dir` 时，输出不在仓库里。macOS 上若仓库放在 iCloud 的「桌面」或「文稿」目录，target 应改到本地缓存（例如 `$HOME/Library/Caches/JackVoice/dev-cargo-target`），否则构建产物会被云端驱逐。用下面这条命令读实际的 `target_directory`：
 
 ```bash
-src-tauri/target/release/jackvoice-mcp --version
-src-tauri/target/release/jackvoice-mcp --health-check
+cargo metadata --format-version 1 --no-deps --manifest-path src-tauri/Cargo.toml
+```
+
+桌面应用的 Cargo 缓存目录与此无关，这个 sidecar 很小，也不依赖 WebRTC。
+
+```bash
+"<target_directory>/release/jackvoice-mcp" --version
+"<target_directory>/release/jackvoice-mcp" --health-check
 ```
 
 可用 `JACKVOICE_SHARED_DATA_DIR` 覆盖词库目录；默认与应用相同，为系统数据目录下的 `com.jackvoice.shared`。

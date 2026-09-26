@@ -78,7 +78,7 @@ cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
 cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
 ```
 
-`npm run dev` 和桌面构建命令会固定使用项目内置的 Abseil；若检测到 WebRTC 曾使用 Homebrew Abseil 生成的不兼容缓存，启动脚本会只清理并重建该依赖。一般不再需要手动清理整个 Cargo target 目录。macOS Developer ID 构建产物默认放在 `~/Library/Caches/JackVoice/release-cargo-target`，避免仓库位于 iCloud 的“桌面”或“文稿”目录时，File Provider 元数据破坏 Developer ID 签名。
+`npm run dev` 和桌面构建命令会固定使用项目内置的 Abseil；若检测到 WebRTC 曾使用 Homebrew Abseil 生成的不兼容缓存，启动脚本会只清理并重建该依赖。一般不再需要手动清理整个 Cargo target 目录。macOS 上这些命令都不把 Cargo 缓存留在仓库里：`npm run dev` 和 `npm run build:desktop:dev` 使用 `~/Library/Caches/JackVoice/dev-cargo-target`，Developer ID 构建使用 `~/Library/Caches/JackVoice/release-cargo-target`。这样仓库位于 iCloud 的“桌面”或“文稿”目录时，File Provider 既不会往签名产物上贴元数据，也不会把几十 GB 的构建缓存驱逐成 dataless 文件。直接跑 `cargo` 时，用 `CARGO_TARGET_DIR` 或仓库根目录的 `.cargo/config.toml`（`build.target-dir`）做同样的改道。
 
 macOS Developer ID 构建不允许使用 ad-hoc 临时签名。`npm run build:desktop` 会自动选择钥匙串中唯一的 `Developer ID Application`；如果存在多个发布身份，必须显式指定完整证书名称：
 
@@ -185,7 +185,7 @@ npm run reset:first-run:production
 
 macOS QA 构建产物默认放在 `~/Library/Caches/JackVoice/qa-cargo-target`。这样即使源码仓库位于 iCloud 同步的“桌面”或“文稿”目录，File Provider 附加的 FinderInfo 也不会破坏开发版 `.app` 的本地签名；首次构建缓存会稍慢，之后会增量复用。
 
-macOS 权限测试必须使用 `qa:first-run:dev` 打开的构建后 `.app`，期间不要再执行 `npm run dev`。后者直接运行 `target/debug/jackvoice` 裸二进制，它的临时代码签名哈希是另一套 TCC 身份：按 `com.jackvoice.app.dev` 重置的权限不会作用到这个裸进程，也不能代表用户下载、安装后的真实授权行为。
+macOS 权限测试必须使用 `qa:first-run:dev` 打开的构建后 `.app`，期间不要再执行 `npm run dev`。后者直接运行 `~/Library/Caches/JackVoice/dev-cargo-target/debug/jackvoice` 裸二进制，它的临时代码签名哈希是另一套 TCC 身份：按 `com.jackvoice.app.dev` 重置的权限不会作用到这个裸进程，也不能代表用户下载、安装后的真实授权行为。
 
 这套本机重置适合快速回归；发布前仍应在新的 macOS 用户账户或干净虚拟机中安装最终签名、公证的产物，完成一次真正无旧数据、无旧权限、无旧钥匙串条目的验收。
 

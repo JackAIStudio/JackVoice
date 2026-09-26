@@ -70,12 +70,14 @@ function resolveCargoTargetDir() {
   if (process.env.CARGO_TARGET_DIR?.trim()) {
     return process.env.CARGO_TARGET_DIR.trim();
   }
-  // A signed .app cannot contain FinderInfo/resource-fork metadata. iCloud
-  // File Provider may attach it immediately when the repository lives in
-  // Desktop/Documents, before Tauri reaches codesign. Keep production bundle
-  // artifacts in a local, non-synced cache so signing is deterministic.
-  if (build && production && platform() === "darwin") {
-    return join(homedir(), "Library", "Caches", "JackVoice", "release-cargo-target");
+  // iCloud File Provider attaches FinderInfo to anything under Desktop/Documents
+  // and evicts large build trees into dataless files. Both break this repo:
+  // codesign rejects the metadata, and cargo stalls re-downloading the cache.
+  // Keep every macOS build cache outside the synced tree. QA passes set
+  // CARGO_TARGET_DIR themselves and still win via the check above.
+  if (platform() === "darwin") {
+    const cacheName = build && production ? "release-cargo-target" : "dev-cargo-target";
+    return join(homedir(), "Library", "Caches", "JackVoice", cacheName);
   }
   const metadata = execFileSync(
     "cargo",
