@@ -4,11 +4,6 @@ fn main() {
         // AVCaptureDevice through the Objective-C runtime. Link the owning
         // framework explicitly so the class is guaranteed to be registered.
         println!("cargo:rustc-link-lib=framework=AVFoundation");
-        println!("cargo:rustc-link-lib=framework=AppKit");
-        println!("cargo:rerun-if-changed=src/pasteboard_provider.m");
-        cc::Build::new()
-            .file("src/pasteboard_provider.m")
-            .compile("pasteboard_provider");
     }
 
     // Only load the canonical capability manifest. Finder/cloud-sync conflict
