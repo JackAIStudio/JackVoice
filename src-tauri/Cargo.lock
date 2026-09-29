@@ -2268,6 +2268,7 @@ version = "9.11.23"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "cc",
  "chrono",
  "clipboard-win",
  "core-foundation 0.10.1",
