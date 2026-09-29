@@ -2079,11 +2079,10 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
         if !final_text.trim().is_empty() && local_error.is_none() && recognition_error.is_none() {
             let initial_target = crate::overlay::remembered_frontmost_app();
             let current_target = crate::overlay::current_frontmost_app();
-            let current_probe = delivery::probe_insertion_target(current_target.as_ref());
             let target =
                 delivery::choose_delivery_target(initial_target.clone(), current_target.clone());
             eprintln!(
-                "[delivery] target initial={initial_target:?} current={current_target:?} current_probe={current_probe:?} selected={target:?}"
+                "[delivery] target initial={initial_target:?} current={current_target:?} selected={target:?}"
             );
             let reactivate_target = target.as_ref().is_some_and(|selected| {
                 current_target
@@ -2092,19 +2091,13 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
             });
             crate::overlay::set_remembered_frontmost_app(target.clone());
             crate::overlay::hide_overlay_for_delivery(&app, reactivate_target);
-            // Keep the original working delay for every delivery, including
-            // when the target app never changed. The global shortcut fires
-            // while Option is still physically held; posting Cmd+V
-            // immediately can therefore become Cmd+Option+V in the target.
+            if let Some(target_app) = target.as_ref() {
+                crate::overlay::activate_running_process(target_app.pid);
+            }
+            // Keep the delay for every delivery so physical Option/Space keys
+            // have time to be released by the user before posting Cmd+V.
             tokio::time::sleep(Duration::from_millis(350)).await;
-            let probe = if reactivate_target {
-                // Probe after a genuinely different target has been restored.
-                delivery::probe_insertion_target(target.as_ref())
-            } else {
-                // Preserve the already-valid caret and the probe captured while
-                // its exact window was still active.
-                current_probe
-            };
+            let probe = delivery::probe_insertion_target(target.as_ref());
             let delivery = delivery::deliver_text(&app, &final_text, probe).await;
             needs_copy_prompt = !delivery.pasted;
             delivery_result = Some(delivery);

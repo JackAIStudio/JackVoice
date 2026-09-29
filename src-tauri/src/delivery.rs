@@ -41,6 +41,30 @@ pub(crate) fn choose_delivery_target<T>(
 /// Chromium-exposed web text fields).
 const TEXT_ROLES: &[&str] = &["AXTextField", "AXTextArea", "AXComboBox"];
 
+/// Roles that definitely represent non-text, read-only system or UI controls
+/// where Cmd+V paste makes no sense and should be skipped.
+const DEFINITELY_NON_TEXT_ROLES: &[&str] = &[
+    "AXMenuBar",
+    "AXMenuBarItem",
+    "AXMenu",
+    "AXMenuItem",
+    "AXDock",
+    "AXButton",
+    "AXRadioButton",
+    "AXCheckBox",
+    "AXImage",
+    "AXScrollBar",
+    "AXProgressIndicator",
+    "AXSlider",
+    "AXColorWell",
+    "AXToolbar",
+    "AXTabGroup",
+    "AXStaticText",
+    "AXTable",
+    "AXList",
+    "AXOutline",
+];
+
 pub async fn deliver_text<R: Runtime>(
     app: &AppHandle<R>,
     text: &str,
@@ -682,20 +706,20 @@ fn parse_probe_output(line: &str) -> InsertionProbe {
 
     if let Some((app_name, rest)) = line.split_once('|') {
         if rest == "__missing__" {
-            return if is_unsupported_ax_app(Some(app_name)) {
-                eprintln!(
-                    "[delivery] target app {app_name} returned __missing__ but has non-standard AX; treating as Unknown"
-                );
-                InsertionProbe::Unknown
-            } else {
-                InsertionProbe::NotInsertable
-            };
+            // Modern browsers and Electron apps (JackDSH, Cursor, Chrome, Slack, Obsidian)
+            // lazily expose AX and return __missing__ even when a text field has active focus.
+            // In the presence of a safe, transparent clipboard transaction, missing AX must
+            // never block delivery; treat as Unknown to perform best-effort paste.
+            eprintln!(
+                "[delivery] target app {app_name} returned __missing__; treating as Unknown (best-effort paste)"
+            );
+            return InsertionProbe::Unknown;
         }
         return classify_probe_line(app_name, rest);
     }
 
     match line {
-        "__missing__" => InsertionProbe::NotInsertable,
+        "__missing__" => InsertionProbe::Unknown,
         _ => classify_probe_line("", line),
     }
 }
@@ -703,9 +727,11 @@ fn parse_probe_output(line: &str) -> InsertionProbe {
 /// Classify the probe output line `ROLE|SEL|INS`.
 ///
 /// Insertable when the focused element is a known text role, or when it
-/// exposes a sane `AXInsertionPointLineNumber` (a live caret). Page-level
-/// `AXWebArea` focus reports an out-of-range line number, so it stays
-/// NotInsertable and Cmd+V is never fired without a real insertion point.
+/// exposes a sane `AXInsertionPointLineNumber` (a live caret).
+/// Definitely non-text elements (such as buttons, menus, dock, sliders) without
+/// a caret are classified as NotInsertable.
+/// Generic containers (AXGroup, AXWebArea, custom elements) fall back to
+/// Unknown (best-effort paste) so web/Electron forms and rich editors are never blocked.
 #[cfg(target_os = "macos")]
 fn classify_probe_line(app_name: &str, rest: &str) -> InsertionProbe {
     let mut parts = rest.split('|');
@@ -719,8 +745,12 @@ fn classify_probe_line(app_name: &str, rest: &str) -> InsertionProbe {
         InsertionProbe::Insertable
     } else if is_unsupported_ax_app(Some(app_name)) {
         InsertionProbe::Unknown
-    } else {
+    } else if DEFINITELY_NON_TEXT_ROLES.contains(&role) {
         InsertionProbe::NotInsertable
+    } else {
+        // Generic containers or unknown web roles can host editable text
+        // (e.g. Monaco editor, contenteditable div, web search boxes).
+        InsertionProbe::Unknown
     };
 
     eprintln!(
@@ -839,14 +869,15 @@ mod clipboard_transaction_tests {
             InsertionProbe::Unknown
         );
 
-        // Standard apps that report __missing__ are genuinely not insertable
+        // Modern browsers and Electron apps (Chrome, JackDSH, Cursor, Obsidian) lazily
+        // expose AX trees and return __missing__; must fall back to Unknown for best-effort paste
         assert_eq!(
             parse_probe_output("Google Chrome|__missing__"),
-            InsertionProbe::NotInsertable
+            InsertionProbe::Unknown
         );
         assert_eq!(
-            parse_probe_output("Finder|__missing__"),
-            InsertionProbe::NotInsertable
+            parse_probe_output("JackDSH|__missing__"),
+            InsertionProbe::Unknown
         );
 
         // Standard apps with valid caret or text role are insertable
@@ -857,6 +888,26 @@ mod clipboard_transaction_tests {
         assert_eq!(
             parse_probe_output("Notes|AXTextArea|present|12"),
             InsertionProbe::Insertable
+        );
+
+        // Explicitly non-text UI elements without a caret are NotInsertable
+        assert_eq!(
+            parse_probe_output("System Settings|AXButton|absent|missing"),
+            InsertionProbe::NotInsertable
+        );
+        assert_eq!(
+            parse_probe_output("Finder|AXMenuBarItem|absent|missing"),
+            InsertionProbe::NotInsertable
+        );
+
+        // Web groups and custom containers fall back to Unknown
+        assert_eq!(
+            parse_probe_output("Google Chrome|AXGroup|absent|missing"),
+            InsertionProbe::Unknown
+        );
+        assert_eq!(
+            parse_probe_output("Safari|AXWebArea|absent|missing"),
+            InsertionProbe::Unknown
         );
 
         // Error or empty string falls back to Unknown

@@ -424,11 +424,15 @@ async fn retry_last_transcript(
     }
 
     let target = crate::overlay::remembered_frontmost_app();
+    if let Some(target_app) = target.as_ref() {
+        crate::overlay::activate_running_process(target_app.pid);
+    }
     crate::overlay::hide_overlay(&app);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let probe = delivery::probe_insertion_target(target.as_ref());
-    let result = delivery::deliver_text(&app, &text, probe).await;
+    // The user explicitly requested retry from the capsule; trust their intent
+    // and deliver via best-effort paste rather than gating behind AX probes.
+    let result = delivery::deliver_text(&app, &text, delivery::InsertionProbe::Unknown).await;
     let ui = state.apply_delivery_result(&result);
     let _ = app.emit("jackvoice://state", ui);
     let _ = app.emit("jackvoice://delivery", result.clone());

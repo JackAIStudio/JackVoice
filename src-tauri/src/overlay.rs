@@ -286,7 +286,7 @@ fn read_frontmost_app() -> Option<FrontmostApp> {
 }
 
 #[cfg(target_os = "macos")]
-fn activate_running_process(pid: i32) {
+pub(crate) fn activate_running_process(pid: i32) {
     use std::process::Command;
     // Block until System Events flips `frontmost` so a subsequent Cmd+V lands
     // in this exact process, not a newly launched bundle of the same name.
@@ -295,6 +295,9 @@ fn activate_running_process(pid: i32) {
         .arg(restore_process_script(pid))
         .status();
 }
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn activate_running_process(_pid: i32) {}
 
 fn main_is_visible(app: &AppHandle) -> bool {
     app.get_webview_window(MAIN_LABEL)
