@@ -4,7 +4,7 @@ use std::io::{self, BufRead, Write};
 
 const SERVER_NAME: &str = "jackvoice";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const INSTRUCTIONS: &str = "JackVoice MCP 只读取本机热词和替换词，不读写听写历史、录音或 API Key。校正转写时先 get_glossary：热词是常用专有词表，替换词是已知 A→B。再对文本调用 apply_replacements 做确定性替换（含最长匹配和短语锁）。若某热词等于某条替换的 from，最终写法用 to。当前版本不会修改词库。";
+const INSTRUCTIONS: &str = "JackVoice MCP 只读取本机热词和替换词，不读写听写历史、录音或 API Key。校正转写时先 get_glossary：热词是常用专有词表，替换词是已知 A→B。再对文本调用 apply_replacements 做确定性替换（含最长匹配、短语锁；英文和数字只在整词边界替换，中文按连续文字匹配）。若某热词等于某条替换的 from，最终写法用 to。当前版本不会修改词库。";
 
 pub fn run_stdio_server() -> Result<(), String> {
     let tools = AgentTools::discover()?;

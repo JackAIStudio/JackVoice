@@ -27,6 +27,24 @@ pub struct ReplacementTrace {
     pub applied: Vec<ReplacementRule>,
 }
 
+/// 拉丁字母和数字只在整词边界上替换。下划线、连字符、空格、标点和中文都算边界，
+/// 所以 `Cloud` 能改 `Cloud Code`，但不会钻进 `iCloud` / `Cloudflare`。
+/// 规则两端若不是 ASCII 字母或数字（例如中文「绘画」），仍按连续文字匹配。
+fn latin_match_is_bounded(chars: &[char], start: usize, end: usize) -> bool {
+    if start >= end || end > chars.len() {
+        return false;
+    }
+    let starts_with_word = chars[start].is_ascii_alphanumeric();
+    let ends_with_word = chars[end - 1].is_ascii_alphanumeric();
+    if starts_with_word && start > 0 && chars[start - 1].is_ascii_alphanumeric() {
+        return false;
+    }
+    if ends_with_word && end < chars.len() && chars[end].is_ascii_alphanumeric() {
+        return false;
+    }
+    true
+}
+
 pub fn hotwords_path(dir: &Path) -> PathBuf {
     dir.join("hotwords.json")
 }
@@ -163,9 +181,11 @@ pub fn apply_replacements_detailed(text: &str, rules: &[(String, String)]) -> Re
             applied: Vec::new(),
         };
     }
-    // 单次从左到右最长匹配：在原文位置选最长 from，避免
+    // 单次从左到右最长匹配：在原文位置选最长、且满足词边界的 from，避免
     // 1) 短词先吃掉长词的一部分；
-    // 2) 先替换长词后再被短词二次误伤（如 DaVinciPlayground → DaVinci Playground → 达芬奇 Playground）。
+    // 2) 先替换长词后再被短词二次误伤（如 DaVinciPlayground → DaVinci Playground → 达芬奇 Playground）；
+    // 3) 英文短词钻进更长单词（如 Cloud → Claude 把 iCloud 改成 iClaude）。
+    // 短语锁仍然必要：词边界挡不住「DaVinci Playground」里独立成词的 DaVinci。
     let patterns: Vec<(Vec<char>, &str, &str)> = rules
         .iter()
         .map(|(from, to)| {
@@ -200,7 +220,7 @@ pub fn apply_replacements_detailed(text: &str, rules: &[(String, String)]) -> Re
                 .iter()
                 .map(|c| c.to_lowercase().next().unwrap_or(*c))
                 .eq(pattern.iter().copied());
-            if matched {
+            if matched && latin_match_is_bounded(&chars, i, i + plen) {
                 best_len = plen;
                 best = Some((*from, *to));
             }
@@ -334,6 +354,53 @@ mod tests {
         assert_eq!(
             apply_replacements("继续用 DaVinci Playground", &rules),
             "继续用 DaVinci Playground"
+        );
+    }
+
+    #[test]
+    fn apply_replacements_keeps_latin_rules_on_word_boundaries() {
+        let rules = vec![
+            ("Cloud".into(), "Claude".into()),
+            ("Claude Code".into(), "Claude Code".into()),
+            ("ClaudeCode".into(), "Claude Code".into()),
+            ("i Cloud".into(), "iCloud".into()),
+            ("Tree".into(), "Trae".into()),
+            ("绘画".into(), "会话".into()),
+        ];
+
+        assert_eq!(
+            apply_replacements("有这个 iCloud 中的文件，还有 icloud", &rules),
+            "有这个 iCloud 中的文件，还有 icloud"
+        );
+        assert_eq!(
+            apply_replacements("Cloud Code 和 cloud code，以及 ClaudeCode", &rules),
+            "Claude Code 和 Claude code，以及 Claude Code"
+        );
+        assert_eq!(
+            apply_replacements("还有 Cloudflare，不要改成 Claudeflare", &rules),
+            "还有 Cloudflare，不要改成 Claudeflare"
+        );
+        assert_eq!(
+            apply_replacements("street 上的 Tree，以及 Cloud。", &rules),
+            "street 上的 Trae，以及 Claude。"
+        );
+        assert_eq!(apply_replacements("这个绘画", &rules), "这个会话");
+        assert_eq!(
+            apply_replacements("i Cloud 的文件在说Cloud", &rules),
+            "iCloud 的文件在说Claude"
+        );
+        assert_eq!(
+            apply_replacements("Cloud2 保持原样", &rules),
+            "Cloud2 保持原样"
+        );
+    }
+
+    #[test]
+    fn apply_replacements_still_needs_phrase_lock_for_multiword_phrases() {
+        let rules = vec![("DaVinci".into(), "达芬奇".into())];
+        assert_eq!(
+            apply_replacements("打开 DaVinci Playground", &rules),
+            "打开 达芬奇 Playground"
         );
     }
 

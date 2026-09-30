@@ -97,6 +97,7 @@ pub struct UiState {
     /// Whether the first-run onboarding walkthrough has been completed.
     pub onboarding_completed: bool,
     pub history_text_size: String,
+    pub session_pinned: bool,
 }
 
 impl UiState {
@@ -147,6 +148,7 @@ impl Default for UiState {
             system_audio_mute_supported: crate::output_mute::supported(),
             onboarding_completed: false,
             history_text_size: "standard".into(),
+            session_pinned: false,
         }
     }
 }
@@ -216,6 +218,8 @@ pub struct AppState {
     /// Bumped whenever a dictation session starts, so a scheduled
     /// "hide the error capsule" task never hides a newer session's capsule.
     session_epoch: AtomicU64,
+    /// Per-session stateless pin toggle: reset to false on every dictation start.
+    session_pinned: AtomicBool,
 }
 
 impl AppState {
@@ -308,11 +312,28 @@ impl AppState {
             retrying_records: Mutex::new(HashSet::new()),
             retry_gate: tokio::sync::Mutex::new(()),
             session_epoch: AtomicU64::new(0),
+            session_pinned: AtomicBool::new(false),
         })
     }
 
     pub fn snapshot(&self) -> UiState {
-        self.ui.lock().clone()
+        let mut ui = self.ui.lock().clone();
+        ui.session_pinned = self.session_pinned.load(Ordering::Relaxed);
+        ui
+    }
+
+    pub fn toggle_session_pin(&self) -> bool {
+        let mut ui = self.ui.lock();
+        let next = !ui.session_pinned;
+        ui.session_pinned = next;
+        self.session_pinned.store(next, Ordering::Relaxed);
+        next
+    }
+
+    pub fn set_session_pin(&self, pinned: bool) {
+        let mut ui = self.ui.lock();
+        ui.session_pinned = pinned;
+        self.session_pinned.store(pinned, Ordering::Relaxed);
     }
 
     pub fn apply_delivery_result(&self, delivery: &DeliveryResult) -> UiState {
@@ -1052,6 +1073,8 @@ impl AppState {
         // finalization / paste. Hide the capsule without launching another
         // app or presenting the settings window.
         let had_active = self.active.lock().is_some();
+        self.session_pinned.store(false, Ordering::Relaxed);
+        self.ui.lock().session_pinned = false;
         *self.cancel_requested.lock() = true;
         if had_active {
             // stop without relying on UI focus changes
@@ -1341,6 +1364,9 @@ impl AppState {
     }
 
     async fn start(&self, app: AppHandle) -> Result<UiState, String> {
+        // Reset per-session pin state so every new dictation session is completely stateless
+        self.session_pinned.store(false, Ordering::Relaxed);
+        self.ui.lock().session_pinned = false;
         // Claim the session before any disk, microphone or UI work. A second
         // shortcut press from this point onward can only stop this exact session.
         let session_id = self.session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2077,6 +2103,13 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
         let mut delivery_result = None;
         let mut needs_copy_prompt = false;
         if !final_text.trim().is_empty() && local_error.is_none() && recognition_error.is_none() {
+            let is_pinned = state.session_pinned.swap(false, Ordering::Relaxed);
+            state.ui.lock().session_pinned = false;
+            if is_pinned {
+                if let Err(e) = crate::memos::add_memo(&app, &final_text) {
+                    eprintln!("[memos] 自动加入待办失败: {e}");
+                }
+            }
             let initial_target = crate::overlay::remembered_frontmost_app();
             let current_target = crate::overlay::current_frontmost_app();
             let target =
@@ -2161,16 +2194,16 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
             ui.last_delivery_message = delivery.message.clone();
         }
         let phase_is_error = ui.phase == "error";
-        let _ = app.emit("jackvoice://state", ui.clone());
-        drop(ui);
-        if let Some(delivery) = delivery_result {
-            let _ = app.emit("jackvoice://delivery", delivery);
-        }
         if phase_is_error {
             crate::overlay::show_overlay(&app);
             schedule_error_overlay_hide(&app, session_id);
         } else if needs_copy_prompt {
             crate::overlay::show_overlay(&app);
+        }
+        let _ = app.emit("jackvoice://state", ui.clone());
+        drop(ui);
+        if let Some(delivery) = delivery_result {
+            let _ = app.emit("jackvoice://delivery", delivery);
         }
     }
 }

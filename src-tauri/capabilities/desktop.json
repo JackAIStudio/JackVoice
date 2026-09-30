@@ -15,6 +15,15 @@
       "description": "Minimal capability for the dictation overlay",
       "windows": ["overlay"],
       "permissions": ["core:default"]
+    },
+    {
+      "identifier": "memos",
+      "description": "Capability for the tray memos popup window",
+      "windows": ["memos"],
+      "permissions": [
+        "core:default",
+        "clipboard-manager:allow-write-text"
+      ]
     }
   ]
 }

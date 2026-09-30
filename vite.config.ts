@@ -26,6 +26,7 @@ export default defineConfig(async () => ({
       input: {
         main: "index.html",
         overlay: "overlay.html",
+        memos: "memos.html",
       },
     },
   },

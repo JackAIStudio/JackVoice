@@ -10,6 +10,7 @@ type UiState = {
   needsCopyPrompt: boolean;
   micNotice?: string;
   micNoticeSeq?: number;
+  sessionPinned?: boolean;
 };
 
 type DeliveryResult = {
@@ -21,6 +22,7 @@ type DeliveryResult = {
 const capsule = () => document.querySelector<HTMLElement>("#capsule");
 const statusEl = () => document.querySelector<HTMLElement>("#overlay-status");
 const textEl = () => document.querySelector<HTMLElement>("#overlay-text");
+const pinBtn = () => document.querySelector<HTMLButtonElement>("#pin-btn");
 const copyBtn = () => document.querySelector<HTMLButtonElement>("#copy-btn");
 const retryBtn = () => document.querySelector<HTMLButtonElement>("#retry-btn");
 
@@ -129,6 +131,10 @@ function renderStatus(state: UiState) {
   const status = statusEl();
   if (!status) return;
   if (activeNotice) status.textContent = activeNotice;
+  else if (state.sessionPinned) {
+    if (state.phase === "finalizing") status.textContent = "正在收入待办 📌";
+    else status.textContent = "正在听写 · 📌 待办模式";
+  }
   else if (state.phase === "starting") status.textContent = "启动录音中";
   else if (state.phase === "connecting") status.textContent = "连接中";
   else if (state.phase === "recording") {
@@ -295,10 +301,23 @@ function applyState(state: UiState) {
 
   renderStatus(state);
 
+  pinBtn()?.classList.toggle("active", Boolean(state.sessionPinned));
+
   renderPreview(state);
 
-  // Keep the result card on top of the generic idle paint.
-  if (resultActive && state.phase === "idle") {
+  if (
+    state.phase === "idle" &&
+    state.needsCopyPrompt &&
+    (state.transcript || "").trim()
+  ) {
+    if (!resultActive) {
+      enterResultMode();
+    } else {
+      paintResultChrome();
+    }
+  } else if (resultActive && state.phase === "idle" && !state.needsCopyPrompt) {
+    exitResultMode();
+  } else if (resultActive && state.phase === "idle") {
     paintResultChrome();
   }
 }
@@ -339,6 +358,24 @@ window.addEventListener("DOMContentLoaded", async () => {
   document.querySelector("#confirm-btn")?.addEventListener("click", (e) => {
     e.stopPropagation();
     void invoke("toggle_dictation");
+  });
+  pinBtn()?.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    try {
+      const isPinned = await invoke<boolean>("toggle_session_pin");
+      if (lastState) {
+        lastState.sessionPinned = isPinned;
+      }
+      pinBtn()?.classList.toggle("active", isPinned);
+      if (lastState) {
+        renderStatus(lastState);
+      } else {
+        const status = statusEl();
+        if (status) status.textContent = isPinned ? "正在听写 · 📌 待办模式" : "正在听写";
+      }
+    } catch (err) {
+      console.error("toggle session pin failed", err);
+    }
   });
   copyBtn()?.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -404,7 +441,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (state) applyState(state);
     if (!delivery.pasted && (state?.transcript || "").trim()) {
       enterResultMode();
-    } else {
+    } else if (delivery.pasted) {
       exitResultMode();
     }
   });

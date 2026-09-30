@@ -59,12 +59,19 @@ const DEFINITELY_NON_TEXT_ROLES: &[&str] = &[
     "AXColorWell",
     "AXToolbar",
     "AXTabGroup",
-    "AXStaticText",
-    "AXTable",
-    "AXList",
-    "AXOutline",
-    "AXWindow",
-    "AXScrollArea",
+   "AXStaticText",
+   "AXTable",
+   "AXList",
+   "AXOutline",
+   "AXWindow",
+   "AXScrollArea",
+    "AXWebArea",
+    "AXLink",
+    "AXHeading",
+    "AXCell",
+    "AXRow",
+    "AXColumn",
+    "AXGroup",
 ];
 
 pub async fn deliver_text<R: Runtime>(
@@ -598,16 +605,12 @@ pub fn is_unsupported_ax_app(name: Option<&str>) -> bool {
 pub fn probe_insertion_target(target: Option<&crate::overlay::FrontmostApp>) -> InsertionProbe {
     #[cfg(target_os = "macos")]
     {
-        let process_name = target.map(|app| app.name.as_str());
-        if is_unsupported_ax_app(process_name) {
-            eprintln!(
-                "[delivery] target app {:?} has non-standard AX tree; treating as Unknown (best-effort paste)",
-                process_name
-            );
-            return InsertionProbe::Unknown;
-        }
+        let Some(target) = target else {
+            eprintln!("[delivery] no frontmost target app; treating as NotInsertable");
+            return InsertionProbe::NotInsertable;
+        };
 
-        let selector = process_selector(target);
+        let selector = process_selector(Some(target));
         // Also report whether the focused element exposes a live insertion
         // point. Chrome exposes a focused <textarea> as AXGroup, and some
         // Electron/web surfaces only expose AXWebArea — role alone is not
@@ -626,8 +629,8 @@ pub fn probe_insertion_target(target: Option<&crate::overlay::FrontmostApp>) -> 
                 "\t\tset r to value of attribute \"AXRole\" of el as string\n",
                 "\t\tset sel to \"absent\"\n",
                 "\t\ttry\n",
-                "\t\t\tset tmp to value of attribute \"AXSelectedTextRange\" of el\n",
-                "\t\t\tset sel to \"present\"\n",
+                "\t\t\tset selVal to (value of attribute \"AXSelectedText\" of el as string)\n",
+                "\t\t\tif selVal is not \"missing value\" and selVal is not \"\" then set sel to \"present\"\n",
                 "\t\tend try\n",
                 "\t\tset ins to \"missing\"\n",
                 "\t\ttry\n",
@@ -761,10 +764,10 @@ fn classify_probe_line(app_name: &str, rest: &str) -> InsertionProbe {
     let ins_line = ins.parse::<f64>().ok();
     let has_caret = matches!(ins_line, Some(v) if (0.0..1_000_000_000.0).contains(&v));
     let has_selection = sel == "present";
-    let probe = if TEXT_ROLES.contains(&role) || has_caret || has_selection {
+    let probe = if TEXT_ROLES.contains(&role) || has_caret {
         InsertionProbe::Insertable
-    } else if is_unsupported_ax_app(Some(app_name)) {
-        InsertionProbe::Unknown
+    } else if has_selection && !DEFINITELY_NON_TEXT_ROLES.contains(&role) {
+        InsertionProbe::Insertable
     } else if DEFINITELY_NON_TEXT_ROLES.contains(&role) {
         InsertionProbe::NotInsertable
     } else {
@@ -935,6 +938,25 @@ mod clipboard_transaction_tests {
         assert_eq!(
             parse_probe_output("Notes|AXWindow|absent|missing"),
             InsertionProbe::NotInsertable
+        );
+        // Browser web pages without a live caret are NotInsertable
+        assert_eq!(
+            parse_probe_output("Google Chrome|AXWebArea|absent|9.223372036855E+18"),
+            InsertionProbe::NotInsertable
+        );
+        assert_eq!(
+            parse_probe_output("Google Chrome|AXWebArea|present|9.223372036855E+18"),
+            InsertionProbe::NotInsertable
+        );
+        // Editor non-text UI (outline, file tree) without caret is NotInsertable
+        assert_eq!(
+            parse_probe_output("Code|AXOutline|absent|9.223372036855E+18"),
+            InsertionProbe::NotInsertable
+        );
+        // Editor text area with caret is Insertable
+        assert_eq!(
+            parse_probe_output("Code|AXTextArea|absent|0"),
+            InsertionProbe::Insertable
         );
 
         // Error or empty string falls back to Unknown

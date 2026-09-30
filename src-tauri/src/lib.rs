@@ -5,6 +5,7 @@ mod delivery;
 mod history;
 mod hotwords;
 mod main_window;
+mod memos;
 mod normalize;
 mod onboarding;
 mod output_mute;
@@ -13,6 +14,7 @@ mod session;
 mod settings;
 mod shortcut;
 mod storage;
+mod tray;
 mod volc_hotword_api;
 
 use audio::InputDeviceInfo;
@@ -450,6 +452,45 @@ fn dismiss_overlay(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn toggle_session_pin(state: tauri::State<'_, AppState>, app: AppHandle) -> bool {
+    let pinned = state.toggle_session_pin();
+    let _ = app.emit("jackvoice://state", state.snapshot());
+    pinned
+}
+
+#[tauri::command]
+fn set_session_pin(state: tauri::State<'_, AppState>, app: AppHandle, pinned: bool) -> bool {
+    state.set_session_pin(pinned);
+    let _ = app.emit("jackvoice://state", state.snapshot());
+    pinned
+}
+
+#[tauri::command]
+fn get_memos(app: AppHandle) -> Vec<crate::memos::MemoItem> {
+    crate::memos::list_memos(&app)
+}
+
+#[tauri::command]
+fn add_memo(app: AppHandle, text: String) -> Result<crate::memos::MemoItem, String> {
+    crate::memos::add_memo(&app, &text)
+}
+
+#[tauri::command]
+fn toggle_memo(app: AppHandle, id: String) -> Result<Vec<crate::memos::MemoItem>, String> {
+    crate::memos::toggle_memo(&app, &id)
+}
+
+#[tauri::command]
+fn delete_memo(app: AppHandle, id: String) -> Result<Vec<crate::memos::MemoItem>, String> {
+    crate::memos::delete_memo(&app, &id)
+}
+
+#[tauri::command]
+fn clear_completed_memos(app: AppHandle) -> Result<Vec<crate::memos::MemoItem>, String> {
+    crate::memos::clear_completed_memos(&app)
+}
+
+#[tauri::command]
 fn open_settings_window(app: AppHandle) -> Result<(), String> {
     main_window::show_main_window(&app)
 }
@@ -575,6 +616,8 @@ pub fn run() {
                 shortcut::install_fn_shortcut_monitor(app.handle().clone());
             }
             let _ = crate::overlay::ensure_overlay(app.handle());
+            let _ = crate::tray::setup_tray(app.handle());
+            let _ = crate::tray::ensure_memos_window(app.handle());
             session::start_pending_recognition_retries(app.handle().clone());
 
             // First run (onboarding not finished yet): show the main window so
@@ -663,6 +706,13 @@ pub fn run() {
             copy_last_transcript,
             retry_last_transcript,
             dismiss_overlay,
+            toggle_session_pin,
+            set_session_pin,
+            get_memos,
+            add_memo,
+            toggle_memo,
+            delete_memo,
+            clear_completed_memos,
             open_settings_window,
             open_external_url
         ])
