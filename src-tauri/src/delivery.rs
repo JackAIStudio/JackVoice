@@ -543,6 +543,11 @@ fn write_windows_snapshot(formats: &[(u32, Vec<u8>)]) -> Result<(), String> {
 /// Apps with proprietary / non-standard rendering engines (such as WeChat / WXWork)
 /// that do not expose accessibility UI elements (`AXFocusedUIElement` is always
 /// missing value), but do support standard system Cmd+V paste when frontmost.
+///
+/// `app_mode_loader` is the process name of a Chrome-installed web app (PWA).
+/// The shim is the frontmost process and owns the window, but the blinking
+/// caret stays inside Chrome's renderer and is never reported as
+/// `AXFocusedUIElement`. Cmd+V still reaches that caret.
 pub fn is_unsupported_ax_app(name: Option<&str>) -> bool {
     let Some(name) = name else {
         return false;
@@ -575,6 +580,7 @@ pub fn is_unsupported_ax_app(name: Option<&str>) -> bool {
             | "obsidian"
             | "notion"
             | "chatgpt"
+            | "app_mode_loader"
     ) || lower.starts_with("wechat")
         || lower.starts_with("wxwork")
         || lower.starts_with("dingtalk")
@@ -862,6 +868,10 @@ mod clipboard_transaction_tests {
         assert!(is_unsupported_ax_app(Some("JackDSH")));
         assert!(is_unsupported_ax_app(Some("jackdsh")));
         assert!(is_unsupported_ax_app(Some("Cursor")));
+        assert!(is_unsupported_ax_app(Some("app_mode_loader")));
+        assert!(is_unsupported_ax_app(Some("App_Mode_Loader")));
+        assert!(!is_unsupported_ax_app(Some("Google Chrome")));
+        assert!(!is_unsupported_ax_app(Some("Safari")));
         assert!(!is_unsupported_ax_app(Some("Finder")));
         assert!(!is_unsupported_ax_app(Some("Notes")));
         assert!(!is_unsupported_ax_app(Some("Terminal")));
@@ -885,6 +895,11 @@ mod clipboard_transaction_tests {
         );
         assert_eq!(
             parse_probe_output("JackDSH|__missing__"),
+            InsertionProbe::Unknown
+        );
+        // Chrome installed PWAs report no focused element even with a live caret.
+        assert_eq!(
+            parse_probe_output("app_mode_loader|__missing__"),
             InsertionProbe::Unknown
         );
 
