@@ -268,6 +268,23 @@ pub(crate) fn restore_process_script(pid: i32) -> String {
 
 #[cfg(target_os = "macos")]
 fn read_frontmost_app() -> Option<FrontmostApp> {
+    {
+        use objc2_app_kit::NSWorkspace;
+        let workspace = NSWorkspace::sharedWorkspace();
+        if let Some(front) = workspace.frontmostApplication() {
+            let pid = front.processIdentifier() as i32;
+            if pid > 0 {
+                let name = front
+                    .localizedName()
+                    .map(|n| n.to_string())
+                    .unwrap_or_default();
+                let app = FrontmostApp { pid, name };
+                if !is_self_app(&app, std::process::id()) {
+                    return Some(app);
+                }
+            }
+        }
+    }
     use std::process::Command;
     let out = Command::new("osascript")
         .arg("-e")
@@ -287,6 +304,24 @@ fn read_frontmost_app() -> Option<FrontmostApp> {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn activate_running_process(pid: i32) {
+    if pid <= 0 {
+        return;
+    }
+    // Primary activation via native NSRunningApplication: macOS resolves
+    // directly by PID at the kernel level. This avoids a critical System Events
+    // bug where multiple processes sharing a binary name (e.g. WorkBuddy and
+    // WorkBuddy AI both having Mach-O name "Electron") cause
+    // `whose unix id is {pid}` to incorrectly resolve to the first matching name.
+    use objc2_app_kit::NSRunningApplication;
+    if let Some(target) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
+        #[allow(deprecated)]
+        let options = objc2_app_kit::NSApplicationActivationOptions::ActivateIgnoringOtherApps
+            | objc2_app_kit::NSApplicationActivationOptions::ActivateAllWindows;
+        if target.activateWithOptions(options) {
+            return;
+        }
+    }
+
     use std::process::Command;
     // Block until System Events flips `frontmost` so a subsequent Cmd+V lands
     // in this exact process, not a newly launched bundle of the same name.
@@ -475,5 +510,23 @@ mod tests {
         assert!(!script.contains("to activate"));
         assert!(!script.contains("tell application \"JackAICut"));
         assert!(!script.contains("tell application \"DaVinci"));
+    }
+
+    #[test]
+    fn read_frontmost_app_returns_non_self_process_or_none() {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(app) = read_frontmost_app() {
+                assert!(app.pid > 0);
+                assert!(!is_self_app(&app, std::process::id()));
+            }
+        }
+    }
+
+    #[test]
+    fn activate_running_process_tolerates_invalid_or_nonexistent_pid() {
+        activate_running_process(-1);
+        activate_running_process(0);
+        activate_running_process(999999);
     }
 }

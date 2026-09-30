@@ -588,6 +588,9 @@ pub fn is_unsupported_ax_app(name: Option<&str>) -> bool {
             | "notion"
             | "chatgpt"
             | "app_mode_loader"
+            | "workbuddy"
+            | "workbuddy ai"
+            | "electron"
     ) || lower.starts_with("wechat")
         || lower.starts_with("wxwork")
         || lower.starts_with("dingtalk")
@@ -595,6 +598,8 @@ pub fn is_unsupported_ax_app(name: Option<&str>) -> bool {
         || lower.starts_with("cursor")
         || lower.starts_with("feishu")
         || lower.starts_with("lark")
+        || lower.starts_with("workbuddy")
+        || lower.starts_with("electron")
 }
 
 /// Probe the target app's focused UI element through the macOS Accessibility
@@ -873,6 +878,12 @@ mod clipboard_transaction_tests {
         assert!(is_unsupported_ax_app(Some("Cursor")));
         assert!(is_unsupported_ax_app(Some("app_mode_loader")));
         assert!(is_unsupported_ax_app(Some("App_Mode_Loader")));
+        assert!(is_unsupported_ax_app(Some("WorkBuddy")));
+        assert!(is_unsupported_ax_app(Some("WorkBuddy AI")));
+        assert!(is_unsupported_ax_app(Some("workbuddy")));
+        assert!(is_unsupported_ax_app(Some("workbuddy ai")));
+        assert!(is_unsupported_ax_app(Some("Electron")));
+        assert!(is_unsupported_ax_app(Some("electron")));
         assert!(!is_unsupported_ax_app(Some("Google Chrome")));
         assert!(!is_unsupported_ax_app(Some("Safari")));
         assert!(!is_unsupported_ax_app(Some("Finder")));

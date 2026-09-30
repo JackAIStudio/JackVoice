@@ -52,7 +52,7 @@ jackvoice-agent-bridge = { path = "crates/jackvoice-agent-bridge" }
 core-foundation = "0.10"
 core-graphics = "0.25"
 objc2 = { version = "0.6", features = ["exception"] }
-objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem", "NSRunningApplication", "NSWorkspace"] }
 objc2-core-audio = "0.3.2"
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSData", "NSString"] }
 security-framework = "3.7"
