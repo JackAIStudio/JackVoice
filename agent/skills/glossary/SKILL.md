@@ -1,9 +1,11 @@
 ---
 name: jackvoice-glossary
-description: 当用户要校正转写、字幕、专有名词写法，或需要 JackVoice 本机热词和替换词偏好时使用。Use when correcting ASR, transcripts, subtitles, or proper nouns with the user's local JackVoice glossary.
+description: 当用户明确点名 JackVoice 词库、热词或替换词时使用。不要因为任务是字幕、转写或改错字就自动套用。Use only when the user explicitly asks for the JackVoice glossary, hotwords, or replacement rules. Do not apply it just because the task is subtitles, transcripts, or typo correction.
 ---
 
 # JackVoice 词库
+
+用户没有点名 JackVoice、热词或替换词时，不要调用下面的工具。普通字幕整理和转写校正不走这里。
 
 On DeepSeek Harness, call the tools as `mcp__jackvoice__<name>` (for example `mcp__jackvoice__get_glossary`). Short names like `get_glossary` still identify the same tools.
 
