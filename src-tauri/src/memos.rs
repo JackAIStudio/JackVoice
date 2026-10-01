@@ -50,6 +50,11 @@ pub fn save_memos(dir: &Path, memos: &[MemoItem]) -> Result<(), String> {
     Ok(())
 }
 
+fn refresh_tray_badge(app: &AppHandle, memos: &[MemoItem]) {
+    let count = memos.iter().filter(|m| !m.completed).count();
+    crate::tray::update_tray_badge(app, count);
+}
+
 pub fn add_memo(app: &AppHandle, text: &str) -> Result<MemoItem, String> {
     let text = text.trim();
     if text.is_empty() {
@@ -67,6 +72,7 @@ pub fn add_memo(app: &AppHandle, text: &str) -> Result<MemoItem, String> {
     memos.insert(0, item.clone());
     save_memos(&dir, &memos)?;
     let _ = app.emit(MEMOS_CHANGED_EVENT, &memos);
+    refresh_tray_badge(app, &memos);
     Ok(item)
 }
 
@@ -79,6 +85,7 @@ pub fn toggle_memo(app: &AppHandle, id: &str) -> Result<Vec<MemoItem>, String> {
     }
     save_memos(&dir, &memos)?;
     let _ = app.emit(MEMOS_CHANGED_EVENT, &memos);
+    refresh_tray_badge(app, &memos);
     Ok(memos)
 }
 
@@ -89,6 +96,7 @@ pub fn delete_memo(app: &AppHandle, id: &str) -> Result<Vec<MemoItem>, String> {
     memos.retain(|m| m.id != id);
     save_memos(&dir, &memos)?;
     let _ = app.emit(MEMOS_CHANGED_EVENT, &memos);
+    refresh_tray_badge(app, &memos);
     Ok(memos)
 }
 
@@ -99,6 +107,7 @@ pub fn clear_completed_memos(app: &AppHandle) -> Result<Vec<MemoItem>, String> {
     memos.retain(|m| !m.completed);
     save_memos(&dir, &memos)?;
     let _ = app.emit(MEMOS_CHANGED_EVENT, &memos);
+    refresh_tray_badge(app, &memos);
     Ok(memos)
 }
 
@@ -106,6 +115,10 @@ pub fn list_memos(app: &AppHandle) -> Vec<MemoItem> {
     let state = app.state::<crate::session::AppState>();
     let dir = state.data_dir();
     load_memos(&dir)
+}
+
+pub fn uncompleted_count(app: &AppHandle) -> usize {
+    list_memos(app).into_iter().filter(|m| !m.completed).count()
 }
 
 #[cfg(test)]

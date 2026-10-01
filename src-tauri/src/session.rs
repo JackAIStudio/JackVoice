@@ -2102,38 +2102,55 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
 
         let mut delivery_result = None;
         let mut needs_copy_prompt = false;
+        let mut saved_to_memo = false;
         if !final_text.trim().is_empty() && local_error.is_none() && recognition_error.is_none() {
             let is_pinned = state.session_pinned.swap(false, Ordering::Relaxed);
             state.ui.lock().session_pinned = false;
-            if is_pinned {
-                if let Err(e) = crate::memos::add_memo(&app, &final_text) {
-                    eprintln!("[memos] 自动加入待办失败: {e}");
+            // Pin means this take is a todo memo. Ending it (Option+Space or
+            // the confirm button) files the text and dismisses the capsule.
+            // It must not paste into a focused field, and it must not leave
+            // the result capsule up when there is no caret.
+            let mut route = route_finished_transcript(is_pinned);
+            if route == FinishedTranscriptRoute::MemoOnly {
+                match crate::memos::add_memo(&app, &final_text) {
+                    Ok(_) => saved_to_memo = true,
+                    Err(e) => {
+                        eprintln!("[memos] 自动加入待办失败，改走粘贴: {e}");
+                        route = FinishedTranscriptRoute::InsertOrPrompt;
+                    }
                 }
             }
-            let initial_target = crate::overlay::remembered_frontmost_app();
-            let current_target = crate::overlay::current_frontmost_app();
-            let target =
-                delivery::choose_delivery_target(initial_target.clone(), current_target.clone());
-            eprintln!(
-                "[delivery] target initial={initial_target:?} current={current_target:?} selected={target:?}"
-            );
-            let reactivate_target = target.as_ref().is_some_and(|selected| {
-                current_target
-                    .as_ref()
-                    .is_none_or(|current| current.pid != selected.pid)
-            });
-            crate::overlay::set_remembered_frontmost_app(target.clone());
-            crate::overlay::hide_overlay_for_delivery(&app, reactivate_target);
-            if let Some(target_app) = target.as_ref() {
-                crate::overlay::activate_running_process(target_app.pid);
+            if route == FinishedTranscriptRoute::MemoOnly {
+                needs_copy_prompt = false;
+                crate::overlay::hide_overlay(&app);
+            } else {
+                let initial_target = crate::overlay::remembered_frontmost_app();
+                let current_target = crate::overlay::current_frontmost_app();
+                let target = delivery::choose_delivery_target(
+                    initial_target.clone(),
+                    current_target.clone(),
+                );
+                eprintln!(
+                    "[delivery] target initial={initial_target:?} current={current_target:?} selected={target:?}"
+                );
+                let reactivate_target = target.as_ref().is_some_and(|selected| {
+                    current_target
+                        .as_ref()
+                        .is_none_or(|current| current.pid != selected.pid)
+                });
+                crate::overlay::set_remembered_frontmost_app(target.clone());
+                crate::overlay::hide_overlay_for_delivery(&app, reactivate_target);
+                if let Some(target_app) = target.as_ref() {
+                    crate::overlay::activate_running_process(target_app.pid);
+                }
+                // Keep the delay for every delivery so physical Option/Space keys
+                // have time to be released by the user before posting Cmd+V.
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                let probe = delivery::probe_insertion_target(target.as_ref());
+                let delivery = delivery::deliver_text(&app, &final_text, probe).await;
+                needs_copy_prompt = !delivery.pasted;
+                delivery_result = Some(delivery);
             }
-            // Keep the delay for every delivery so physical Option/Space keys
-            // have time to be released by the user before posting Cmd+V.
-            tokio::time::sleep(Duration::from_millis(350)).await;
-            let probe = delivery::probe_insertion_target(target.as_ref());
-            let delivery = delivery::deliver_text(&app, &final_text, probe).await;
-            needs_copy_prompt = !delivery.pasted;
-            delivery_result = Some(delivery);
         } else if local_error.is_none() {
             crate::overlay::hide_overlay(&app);
             crate::overlay::ensure_main_stays_in_background(&app);
@@ -2174,6 +2191,14 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
                 } else {
                     format!("本地录音已保存；实时识别未完成：{error}")
                 }
+            } else if saved_to_memo {
+                if reached_duration_limit {
+                    format!(
+                        "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束，已收入待办备忘。"
+                    )
+                } else {
+                    "已收入待办备忘。".into()
+                }
             } else if ui.transcript.trim().is_empty() {
                 if reached_duration_limit {
                     format!(
@@ -2190,7 +2215,9 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
                 "听写结束，本地录音已保存。".into()
             };
         }
-        if let Some(delivery) = delivery_result.as_ref() {
+        if saved_to_memo {
+            ui.last_delivery_message = "已收入待办备忘，未粘贴。".into();
+        } else if let Some(delivery) = delivery_result.as_ref() {
             ui.last_delivery_message = delivery.message.clone();
         }
         let phase_is_error = ui.phase == "error";
@@ -2506,6 +2533,24 @@ fn format_volc_connection_error(raw: &str) -> String {
     format!("豆包语音连接测试失败：{raw}")
 }
 
+/// Where a finished, non-empty transcript goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinishedTranscriptRoute {
+    /// Pinned as a todo memo: file it and dismiss the capsule.
+    /// Never paste, and never raise the "no caret" result capsule.
+    MemoOnly,
+    /// Normal dictation: paste into the focused field, or show the copy capsule.
+    InsertOrPrompt,
+}
+
+fn route_finished_transcript(session_pinned: bool) -> FinishedTranscriptRoute {
+    if session_pinned {
+        FinishedTranscriptRoute::MemoOnly
+    } else {
+        FinishedTranscriptRoute::InsertOrPrompt
+    }
+}
+
 /// Keep an error capsule visible long enough to read, then hide it. If a
 /// newer session started in the meantime (epoch changed) or the phase moved
 /// on, do nothing.
@@ -2531,12 +2576,25 @@ pub type SharedDelivery = DeliveryResult;
 #[cfg(test)]
 mod volc_connection_error_tests {
     use super::{
-        format_volc_connection_error, initial_volc_credential_status, sync_resolved_input_device,
-        update_audio_device_state, AppSettings, MicFallbackState, UiState, VolcCredentialStatus,
+        format_volc_connection_error, initial_volc_credential_status, route_finished_transcript,
+        sync_resolved_input_device, update_audio_device_state, AppSettings,
+        FinishedTranscriptRoute, MicFallbackState, UiState, VolcCredentialStatus,
         MAX_DICTATION_DURATION,
     };
     use crate::audio::{ActiveInputDevice, AudioNotice, InputDeviceInfo, InputDevicePreference};
     use std::time::Duration;
+
+    #[test]
+    fn pinned_dictation_is_filed_as_a_memo_and_not_pasted() {
+        assert_eq!(
+            route_finished_transcript(true),
+            FinishedTranscriptRoute::MemoOnly
+        );
+        assert_eq!(
+            route_finished_transcript(false),
+            FinishedTranscriptRoute::InsertOrPrompt
+        );
+    }
 
     #[test]
     fn limits_each_dictation_to_thirty_minutes() {
