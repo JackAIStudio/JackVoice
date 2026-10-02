@@ -44,8 +44,8 @@ pub fn save_memos(dir: &Path, memos: &[MemoItem]) -> Result<(), String> {
     let data = MemosData {
         memos: memos.to_vec(),
     };
-    let json = serde_json::to_string_pretty(&data)
-        .map_err(|e| format!("序列化待办事项失败：{e}"))?;
+    let json =
+        serde_json::to_string_pretty(&data).map_err(|e| format!("序列化待办事项失败：{e}"))?;
     fs::write(&path, json).map_err(|e| format!("保存待办事项失败：{e}"))?;
     Ok(())
 }
@@ -126,7 +126,8 @@ mod tests {
     use super::*;
 
     fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("jackvoice-memos-test-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("jackvoice-memos-test-{}", uuid::Uuid::new_v4()));
         let _ = fs::create_dir_all(&dir);
         dir
     }
