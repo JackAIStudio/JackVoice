@@ -2,6 +2,7 @@ pub mod asr;
 mod audio;
 mod credentials;
 mod delivery;
+mod dock_menu;
 mod history;
 mod hotwords;
 mod main_window;
@@ -719,6 +720,10 @@ pub fn run() {
         .build(app_context())
         .expect("error while building JackVoice")
         .run(|app, event| match event {
+            // 应用起来、NSApplicationDelegate 就位之后再装程序坞右键菜单。
+            tauri::RunEvent::Ready => {
+                dock_menu::setup(app);
+            }
             // Dock icon click opens settings, except when the live capsule
             // itself caused this activation.
             tauri::RunEvent::Reopen { .. } => {
