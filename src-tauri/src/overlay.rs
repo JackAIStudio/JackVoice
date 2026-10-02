@@ -175,18 +175,10 @@ pub struct FrontmostApp {
     pub name: String,
 }
 
+#[derive(Default)]
 struct FocusSnapshot {
     app: Option<FrontmostApp>,
     main_was_visible: bool,
-}
-
-impl Default for FocusSnapshot {
-    fn default() -> Self {
-        Self {
-            app: None,
-            main_was_visible: false,
-        }
-    }
 }
 
 /// Settings/main window is manual-only. Never auto-present it because overlay closed.
@@ -272,7 +264,7 @@ fn read_frontmost_app() -> Option<FrontmostApp> {
         use objc2_app_kit::NSWorkspace;
         let workspace = NSWorkspace::sharedWorkspace();
         if let Some(front) = workspace.frontmostApplication() {
-            let pid = front.processIdentifier() as i32;
+            let pid = front.processIdentifier();
             if pid > 0 {
                 let name = front
                     .localizedName()
@@ -358,10 +350,10 @@ fn conceal_main_if_unwanted(app: &AppHandle) {
 /// (not focused) still presents settings.
 pub fn suppress_reopen_for_overlay(app: &AppHandle) -> bool {
     app.get_webview_window(OVERLAY_LABEL)
-        .and_then(|window| {
+        .map(|window| {
             let visible = window.is_visible().ok().unwrap_or(false);
             let focused = window.is_focused().ok().unwrap_or(false);
-            Some(visible && focused)
+            visible && focused
         })
         .unwrap_or(false)
 }

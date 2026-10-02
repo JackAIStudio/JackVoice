@@ -138,9 +138,9 @@ pub fn render_badge_icon(count: usize) -> Image<'static> {
         let glyph = &GLYPHS_1DIGIT[val];
         let ox = (32 - 12) / 2;
         let oy = (32 - 16) / 2;
-        for r in 0..16 {
+        for (r, row) in glyph.iter().enumerate() {
             for c in 0..12 {
-                if ((glyph[r] >> (11 - c)) & 1) == 1 {
+                if ((row >> (11 - c)) & 1) == 1 {
                     let px = ox + c;
                     let py = oy + r;
                     let idx = (py * WIDTH + px) * 4;
@@ -194,8 +194,7 @@ pub fn update_tray_badge(app: &AppHandle, uncompleted_count: usize) {
         let _ = tray.set_icon(Some(icon));
         let _ = tray.set_icon_as_template(true);
         let _ = tray.set_tooltip(Some(format!(
-            "JackVoice 待办备忘 ({} 个待办)",
-            uncompleted_count
+            "JackVoice 待办备忘 ({uncompleted_count} 个待办)"
         )));
     }
 }
@@ -268,7 +267,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let _tray = TrayIconBuilder::with_id("jackvoice-tray")
         .icon(icon)
         .icon_as_template(true)
-        .tooltip(format!("JackVoice 待办备忘 ({} 个待办)", initial_count))
+        .tooltip(format!("JackVoice 待办备忘 ({initial_count} 个待办)"))
         .on_tray_icon_event(|tray: &tauri::tray::TrayIcon, event| {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,

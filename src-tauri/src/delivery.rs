@@ -769,12 +769,12 @@ fn classify_probe_line(app_name: &str, rest: &str) -> InsertionProbe {
     let ins_line = ins.parse::<f64>().ok();
     let has_caret = matches!(ins_line, Some(v) if (0.0..1_000_000_000.0).contains(&v));
     let has_selection = sel == "present";
-    let probe = if TEXT_ROLES.contains(&role) || has_caret {
+    // 角色本身可插入、光标行号有效，或已选中文本且角色不是明确的非文本控件，都按可插入处理。
+    let insertable = TEXT_ROLES.contains(&role)
+        || has_caret
+        || (has_selection && !DEFINITELY_NON_TEXT_ROLES.contains(&role));
+    let probe = if insertable {
         InsertionProbe::Insertable
-    } else if has_selection && !DEFINITELY_NON_TEXT_ROLES.contains(&role) {
-        InsertionProbe::Insertable
-    } else if DEFINITELY_NON_TEXT_ROLES.contains(&role) {
-        InsertionProbe::NotInsertable
     } else {
         InsertionProbe::NotInsertable
     };

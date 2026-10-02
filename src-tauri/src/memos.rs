@@ -158,7 +158,7 @@ mod tests {
         let loaded = load_memos(path);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].text, "第一条待办");
-        assert_eq!(loaded[1].completed, true);
+        assert!(loaded[1].completed);
 
         let _ = fs::remove_dir_all(&dir);
     }
