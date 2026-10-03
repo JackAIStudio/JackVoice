@@ -27,6 +27,85 @@ const copyBtn = () => document.querySelector<HTMLButtonElement>("#copy-btn");
 const retryBtn = () => document.querySelector<HTMLButtonElement>("#retry-btn");
 
 /**
+ * Audio meter (3 monochrome micro-bars) indicating microphone activity.
+ * Attack is instant, decay is gently damped to prevent visual jitter.
+ */
+let targetLevel = 0;
+let renderedLevel = 0;
+let meterRaf: number | null = null;
+let meterBarsCached: HTMLElement[] | null = null;
+
+function getBars(): HTMLElement[] {
+  if (!meterBarsCached || meterBarsCached.length === 0) {
+    meterBarsCached = Array.from(document.querySelectorAll<HTMLElement>(".meter-bar"));
+  }
+  return meterBarsCached;
+}
+
+function updateMeterFrame() {
+  meterRaf = null;
+
+  if (targetLevel > renderedLevel) {
+    // Attack: instant jump so the user sees sound right away
+    renderedLevel += (targetLevel - renderedLevel) * 0.75;
+  } else {
+    // Decay: smooth organic fall-off (prevents harsh high-frequency flickering)
+    renderedLevel += (targetLevel - renderedLevel) * 0.18;
+    if (renderedLevel < 0.005) {
+      renderedLevel = 0;
+    }
+  }
+
+  const bars = getBars();
+  if (bars.length === 3) {
+    // Waveform silhouette: 3 bars form a natural hill shape even at rest
+    const base1 = 4.5;
+    const base2 = 7.0;
+    const base3 = 5.5;
+
+    // Perceptual curve: square-root curve boosts quiet/normal speech into prominent motion.
+    const visual = Math.pow(Math.max(0, Math.min(1, renderedLevel)), 0.55);
+
+    const h1 = base1 + visual * 7.5;
+    const h2 = base2 + visual * 10.0;
+    const h3 = base3 + visual * 7.0;
+
+    // Monochrome contrast: bright pure white when speaking, clean solid muted gray when silent
+    const alpha = visual > 0.03
+      ? Math.min(0.96, 0.38 + visual * 0.58)
+      : 0.38;
+    const color = `rgba(255, 255, 255, ${alpha.toFixed(2)})`;
+
+    bars[0].style.height = `${h1.toFixed(1)}px`;
+    bars[0].style.backgroundColor = color;
+
+    bars[1].style.height = `${h2.toFixed(1)}px`;
+    bars[1].style.backgroundColor = color;
+
+    bars[2].style.height = `${h3.toFixed(1)}px`;
+    bars[2].style.backgroundColor = color;
+  }
+
+  if (renderedLevel > 0 || targetLevel > 0) {
+    meterRaf = window.requestAnimationFrame(updateMeterFrame);
+  }
+}
+
+function setAudioLevel(level: number) {
+  targetLevel = Math.max(0, Math.min(1, level));
+  if (meterRaf === null) {
+    meterRaf = window.requestAnimationFrame(updateMeterFrame);
+  }
+}
+
+function resetAudioMeter() {
+  targetLevel = 0;
+  if (meterRaf === null) {
+    meterRaf = window.requestAnimationFrame(updateMeterFrame);
+  }
+}
+
+/**
  * Result mode: dictation ended but insertion was NOT detected.
  * The capsule comes back with a manual "copy" button so the user can
  * re-copy the text themselves and nothing gets silently lost.
@@ -306,6 +385,14 @@ function applyState(state: UiState) {
   renderPreview(state);
 
   if (
+    state.phase !== "starting" &&
+    state.phase !== "recording" &&
+    state.phase !== "connecting"
+  ) {
+    resetAudioMeter();
+  }
+
+  if (
     state.phase === "idle" &&
     state.needsCopyPrompt &&
     (state.transcript || "").trim()
@@ -433,6 +520,10 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   await listen<UiState>("jackvoice://state", (event) => {
     applyState(event.payload);
+  });
+
+  await listen<number>("jackvoice://level", (event) => {
+    setAudioLevel(event.payload || 0);
   });
 
   await listen<DeliveryResult>("jackvoice://delivery", async (event) => {
