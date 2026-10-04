@@ -44,16 +44,21 @@ async function copyText(text: string, triggerEl: HTMLElement) {
     }
   }
 
-  // 避免同时存在多个 toast
+  // 避免同时存在多个微反馈 toast
   triggerEl.querySelector(".copy-toast")?.remove();
   const toast = document.createElement("div");
   toast.className = "copy-toast";
-  toast.textContent = "已复制 ✓";
+  toast.innerHTML = `
+    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <polyline points="20 6 9 17 4 12" />
+    </svg>
+    <span>已复制</span>
+  `;
   triggerEl.appendChild(toast);
 
   window.setTimeout(() => {
     toast.remove();
-  }, 900);
+  }, 750);
 }
 
 function renderMemos(memos: MemoItem[]) {
@@ -61,16 +66,28 @@ function renderMemos(memos: MemoItem[]) {
   if (!container) return;
 
   const activeCount = memos.filter((m) => !m.completed).length;
-  if (countEl()) {
-    countEl()!.textContent = String(activeCount);
+  const countBadge = countEl();
+  if (countBadge) {
+    countBadge.textContent = String(activeCount);
+    countBadge.classList.toggle("zero", activeCount === 0);
+  }
+
+  const hasCompleted = memos.some((m) => m.completed);
+  const clearButton = clearBtn();
+  if (clearButton) {
+    clearButton.disabled = !hasCompleted;
   }
 
   if (memos.length === 0) {
     container.innerHTML = `
       <div class="empty-state">
-        <div class="empty-icon">📝</div>
+        <svg class="empty-icon" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+          <rect x="8" y="2" width="8" height="4" rx="1" ry="1" />
+          <path d="m9 14 2 2 4-4" />
+        </svg>
         <div class="empty-title">暂无待办事项</div>
-        <div class="empty-desc">听写说话时点亮胶囊上的 📌 图标<br/>内容将自动收入此处</div>
+        <div class="empty-desc">听写时开启置顶，内容将自动收入</div>
       </div>
     `;
     return;
@@ -82,11 +99,19 @@ function renderMemos(memos: MemoItem[]) {
     const item = document.createElement("div");
     item.className = `memo-item${memo.completed ? " completed" : ""}`;
     item.dataset.id = memo.id;
+    item.title = "单击复制内容";
 
     // Checkbox
     const checkbox = document.createElement("div");
     checkbox.className = "memo-checkbox";
     checkbox.title = memo.completed ? "标为未完成" : "标为已完成";
+    if (memo.completed) {
+      checkbox.innerHTML = `
+        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="20 6 9 17 4 12" />
+        </svg>
+      `;
+    }
     checkbox.addEventListener("click", async (e) => {
       e.stopPropagation();
       try {
@@ -112,11 +137,33 @@ function renderMemos(memos: MemoItem[]) {
     content.appendChild(text);
     content.appendChild(meta);
 
-    // Delete button
+    // Actions (Copy + Delete)
+    const actions = document.createElement("div");
+    actions.className = "memo-actions";
+
+    const copyBtn = document.createElement("button");
+    copyBtn.className = "memo-action-btn copy-action";
+    copyBtn.title = "复制";
+    copyBtn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+      </svg>
+    `;
+    copyBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void copyText(memo.text, item);
+    });
+
     const delBtn = document.createElement("button");
-    delBtn.className = "memo-delete";
-    delBtn.textContent = "×";
+    delBtn.className = "memo-action-btn delete-action";
     delBtn.title = "删除";
+    delBtn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <line x1="18" y1="6" x2="6" y2="18" />
+        <line x1="6" y1="6" x2="18" y2="18" />
+      </svg>
+    `;
     delBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
       try {
@@ -127,10 +174,13 @@ function renderMemos(memos: MemoItem[]) {
       }
     });
 
+    actions.appendChild(copyBtn);
+    actions.appendChild(delBtn);
+
     // 点击整行直接一键复制
     item.addEventListener("click", (e) => {
       const target = e.target as HTMLElement;
-      if (target.closest(".memo-checkbox") || target.closest(".memo-delete")) {
+      if (target.closest(".memo-checkbox") || target.closest(".memo-action-btn")) {
         return;
       }
       void copyText(memo.text, item);
@@ -138,7 +188,7 @@ function renderMemos(memos: MemoItem[]) {
 
     item.appendChild(checkbox);
     item.appendChild(content);
-    item.appendChild(delBtn);
+    item.appendChild(actions);
 
     container.appendChild(item);
   }

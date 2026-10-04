@@ -1,13 +1,13 @@
 :root {
   color-scheme: dark;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
-  --bg-primary: rgba(24, 24, 28, 0.94);
-  --border-color: rgba(255, 255, 255, 0.12);
+  --bg-primary: rgba(22, 22, 26, 0.95);
+  --border-color: rgba(255, 255, 255, 0.10);
   --text-primary: #f3f5f7;
-  --text-secondary: rgba(255, 255, 255, 0.55);
-  --accent-gold: #f59e0b;
-  --accent-green: #10b981;
-  --item-hover: rgba(255, 255, 255, 0.07);
+  --text-secondary: rgba(255, 255, 255, 0.48);
+  --text-tertiary: rgba(255, 255, 255, 0.30);
+  --item-bg: rgba(255, 255, 255, 0.035);
+  --item-hover: rgba(255, 255, 255, 0.075);
 }
 
 * {
@@ -40,7 +40,7 @@ html, body {
 }
 
 .memos-header {
-  height: 44px;
+  height: 42px;
   padding: 0 14px;
   display: flex;
   align-items: center;
@@ -52,27 +52,38 @@ html, body {
 .memos-title-wrap {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
 }
 
 .memos-icon {
-  font-size: 14px;
+  width: 13px;
+  height: 13px;
+  color: rgba(255, 255, 255, 0.65);
+  flex-shrink: 0;
 }
 
 .memos-title {
   font-size: 13px;
   font-weight: 600;
+  color: #f3f5f7;
   letter-spacing: 0.2px;
 }
 
 .memos-badge {
   font-size: 11px;
-  font-weight: 700;
-  padding: 1px 6px;
-  border-radius: 10px;
-  background: rgba(245, 158, 11, 0.2);
-  color: var(--accent-gold);
-  border: 1px solid rgba(245, 158, 11, 0.35);
+  font-weight: 500;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.60);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  font-variant-numeric: tabular-nums;
+  transition: opacity 0.2s ease;
+}
+
+.memos-badge.zero {
+  opacity: 0.35;
 }
 
 .header-btn {
@@ -86,15 +97,20 @@ html, body {
   transition: all 0.15s ease;
 }
 
-.header-btn:hover {
-  background: rgba(255, 255, 255, 0.1);
+.header-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
   color: var(--text-primary);
+}
+
+.header-btn:disabled {
+  opacity: 0.25;
+  cursor: default;
 }
 
 .memos-list {
   flex: 1;
   overflow-y: auto;
-  padding: 8px 10px;
+  padding: 8px 10px 10px;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -105,7 +121,7 @@ html, body {
 }
 
 .memos-list::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.14);
   border-radius: 4px;
 }
 
@@ -115,8 +131,8 @@ html, body {
   align-items: flex-start;
   gap: 10px;
   padding: 9px 10px;
-  border-radius: 9px;
-  background: rgba(255, 255, 255, 0.04);
+  border-radius: 8px;
+  background: var(--item-bg);
   border: 1px solid rgba(255, 255, 255, 0.05);
   cursor: pointer;
   transition: background 0.15s ease, border-color 0.15s ease;
@@ -124,37 +140,32 @@ html, body {
 
 .memo-item:hover {
   background: var(--item-hover);
-  border-color: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.10);
 }
 
 .memo-checkbox {
-  width: 17px;
-  height: 17px;
+  width: 16px;
+  height: 16px;
   border-radius: 50%;
-  border: 1.5px solid rgba(255, 255, 255, 0.35);
+  border: 1.2px solid rgba(255, 255, 255, 0.28);
+  background: transparent;
   display: grid;
   place-items: center;
   flex-shrink: 0;
-  margin-top: 1px;
+  margin-top: 2px;
   cursor: pointer;
+  color: rgba(255, 255, 255, 0.85);
   transition: all 0.15s ease;
 }
 
 .memo-checkbox:hover {
-  border-color: var(--accent-gold);
+  border-color: rgba(255, 255, 255, 0.55);
+  background: rgba(255, 255, 255, 0.05);
 }
 
 .memo-item.completed .memo-checkbox {
-  background: var(--accent-green);
-  border-color: var(--accent-green);
-}
-
-.memo-item.completed .memo-checkbox::after {
-  content: "✓";
-  color: #fff;
-  font-size: 11px;
-  font-weight: 800;
-  line-height: 1;
+  background: rgba(255, 255, 255, 0.15);
+  border-color: rgba(255, 255, 255, 0.35);
 }
 
 .memo-content {
@@ -168,14 +179,14 @@ html, body {
 .memo-text {
   font-size: 12.5px;
   line-height: 1.45;
-  color: #f3f5f7;
+  color: var(--text-primary);
   word-break: break-word;
   white-space: pre-wrap;
 }
 
 .memo-item.completed .memo-text {
   text-decoration: line-through;
-  color: rgba(255, 255, 255, 0.35);
+  color: var(--text-tertiary);
 }
 
 .memo-meta {
@@ -186,91 +197,107 @@ html, body {
   color: var(--text-secondary);
 }
 
-.memo-delete {
+.memo-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
   opacity: 0;
-  border: 0;
-  background: transparent;
-  color: rgba(255, 255, 255, 0.4);
-  font-size: 14px;
-  line-height: 1;
-  cursor: pointer;
-  padding: 3px 5px;
-  border-radius: 4px;
-  transition: all 0.15s ease;
+  transition: opacity 0.15s ease;
+  flex-shrink: 0;
+  margin-top: 1px;
 }
 
-.memo-item:hover .memo-delete {
+.memo-item:hover .memo-actions {
   opacity: 1;
 }
 
-.memo-delete:hover {
-  color: #ef4444;
-  background: rgba(239, 68, 68, 0.12);
+.memo-action-btn {
+  width: 22px;
+  height: 22px;
+  border: 0;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.45);
+  border-radius: 4px;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  transition: all 0.12s ease;
+  padding: 0;
+}
+
+.memo-action-btn:hover {
+  color: rgba(255, 255, 255, 0.90);
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.memo-action-btn.delete-action:hover {
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.12);
 }
 
 .copy-toast {
   position: absolute;
-  right: 12px;
+  right: 10px;
   top: 50%;
   transform: translateY(-50%);
-  background: #10b981;
-  color: #fff;
+  background: rgba(28, 28, 32, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  color: #f3f5f7;
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 500;
   padding: 3px 8px;
   border-radius: 6px;
-  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.35);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  gap: 4px;
   pointer-events: none;
-  animation: fadeInOut 0.85s ease forwards;
+  animation: copyToastFade 0.75s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
-@keyframes fadeInOut {
-  0% { opacity: 0; transform: translateY(-50%) scale(0.9); }
-  20% { opacity: 1; transform: translateY(-50%) scale(1); }
-  80% { opacity: 1; transform: translateY(-50%) scale(1); }
-  100% { opacity: 0; transform: translateY(-50%) scale(0.95); }
+@keyframes copyToastFade {
+  0% {
+    opacity: 0;
+    transform: translateY(-50%) scale(0.92);
+  }
+  15% {
+    opacity: 1;
+    transform: translateY(-50%) scale(1);
+  }
+  80% {
+    opacity: 1;
+    transform: translateY(-50%) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-50%) scale(0.96);
+  }
 }
 
 .empty-state {
+  flex: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 48px 16px;
+  padding: 40px 16px;
   text-align: center;
-  color: var(--text-secondary);
-  gap: 8px;
+  gap: 6px;
 }
 
 .empty-icon {
-  font-size: 26px;
-  opacity: 0.6;
+  color: rgba(255, 255, 255, 0.22);
+  margin-bottom: 2px;
 }
 
 .empty-title {
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 500;
-  color: rgba(255, 255, 255, 0.7);
+  color: rgba(255, 255, 255, 0.55);
 }
 
 .empty-desc {
-  font-size: 11.5px;
-  line-height: 1.4;
-  color: rgba(255, 255, 255, 0.4);
-}
-
-.memos-footer {
-  height: 32px;
-  padding: 0 12px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
-  background: rgba(0, 0, 0, 0.18);
-  flex-shrink: 0;
-}
-
-.footer-tip {
-  font-size: 10.5px;
-  color: rgba(255, 255, 255, 0.4);
+  font-size: 11px;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.30);
 }

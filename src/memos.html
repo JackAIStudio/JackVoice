@@ -17,26 +17,29 @@
     <div class="memos-container">
       <header class="memos-header">
         <div class="memos-title-wrap">
-          <span class="memos-icon">📌</span>
+          <svg class="memos-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="12" y1="17" x2="12" y2="22" />
+            <path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V5h1a1 1 0 0 0 0-2H8a1 1 0 0 0 0 2h1v5.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17z" />
+          </svg>
           <span class="memos-title">待办备忘</span>
-          <span class="memos-badge" id="memos-count">0</span>
+          <span class="memos-badge" id="memos-count" aria-label="未完成待办数">0</span>
         </div>
         <div class="memos-actions">
-          <button id="clear-btn" class="header-btn" title="清理已完成事项">清理已完成</button>
+          <button id="clear-btn" class="header-btn" title="清理已完成事项" disabled>清理已完成</button>
         </div>
       </header>
 
       <main class="memos-list" id="memos-list">
         <div class="empty-state">
-          <div class="empty-icon">📝</div>
+          <svg class="empty-icon" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+            <rect x="8" y="2" width="8" height="4" rx="1" ry="1" />
+            <path d="m9 14 2 2 4-4" />
+          </svg>
           <div class="empty-title">暂无待办事项</div>
-          <div class="empty-desc">听写说话时点亮胶囊上的 📌 图标<br/>内容将自动收入此处</div>
+          <div class="empty-desc">听写时开启置顶，内容将自动收入</div>
         </div>
       </main>
-
-      <footer class="memos-footer">
-        <div class="footer-tip">💡 单击条目一键复制 · 听写时点亮 📌 自动收入</div>
-      </footer>
     </div>
   </body>
 </html>
