@@ -62,6 +62,10 @@ ln -sfn /absolute/path/to/JackVoice/agent/skills/glossary \
   ~/.agents/skills/jackvoice-glossary
 ```
 
+**这个 skill 只由人手打 `/jackvoice-glossary` 唤起。** frontmatter 里带一行 `disable-model-invocation: true`：Agent 的技能目录里不出现它，模型不会因为"任务像字幕/转写"就顺手把它吊起来。
+
+别把这行删掉，也别把"什么时候不要用我"写回 description——描述是每次会话都要付费的目录开销，而且超过 500 字会被截断。反触发交给这一行，描述只写"这个 skill 干什么"（`/` 菜单里给人看）。正文里那句"没点名就不要调用"留着，它不占目录开销。
+
 工具：
 
 - `get_status`

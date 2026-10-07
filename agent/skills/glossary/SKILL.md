@@ -1,6 +1,7 @@
 ---
 name: jackvoice-glossary
-description: 当用户明确点名 JackVoice 词库、热词或替换词时使用。不要因为任务是字幕、转写或改错字就自动套用。Use only when the user explicitly asks for the JackVoice glossary, hotwords, or replacement rules. Do not apply it just because the task is subtitles, transcripts, or typo correction.
+description: 读取本机 JackVoice 词库（热词与替换词），对文本做确定性替换，供转写校正与字幕定稿取用。只读，不修改词库。
+disable-model-invocation: true
 ---
 
 # JackVoice 词库
