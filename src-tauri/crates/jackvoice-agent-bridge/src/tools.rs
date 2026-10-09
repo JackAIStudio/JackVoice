@@ -1,6 +1,7 @@
 use crate::hotwords::{
     apply_replacements_detailed, load, load_replacements, sanitize_replacements, ReplacementRule,
 };
+use crate::memos::{load as load_memos, MemoEntry};
 use crate::paths::shared_data_dir;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -34,6 +35,7 @@ impl AgentTools {
             "get_hotwords" => self.get_hotwords(&arguments),
             "get_replacements" => self.get_replacements(&arguments),
             "apply_replacements" => self.apply_replacements(&arguments),
+            "get_memos" => self.get_memos(&arguments),
             _ => Err(format!("未知的 JackVoice MCP 工具：{name}")),
         }
     }
@@ -41,20 +43,49 @@ impl AgentTools {
     fn get_status(&self) -> Result<Value, String> {
         let hotwords = load(&self.data_dir);
         let replacements = sanitize_replacements(&load_replacements(&self.data_dir));
+        let memos = load_memos(&self.data_dir);
         Ok(json!({
             "bridgeVersion": BRIDGE_VERSION,
             "storeAvailable": self.data_dir.is_dir(),
             "dataDir": self.data_dir,
             "hotwordCount": hotwords.len(),
             "replacementCount": replacements.len(),
+            "memoCount": memos.iter().filter(|memo| !memo.completed).count(),
             "capabilities": {
                 "readHotwords": true,
                 "readReplacements": true,
                 "applyReplacements": true,
+                "readMemos": true,
                 "writeGlossary": false,
+                "writeMemos": false,
                 "readHistory": false,
                 "readRecordings": false
             }
+        }))
+    }
+
+    /// 默认只给未完成待办：Agent 问「我还有什么没做」时，已完成项只是噪音。
+    fn get_memos(&self, arguments: &Value) -> Result<Value, String> {
+        let query = optional_query(arguments)?;
+        let limit = optional_limit(arguments)?;
+        let include_completed = arguments
+            .get("includeCompleted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let all = load_memos(&self.data_dir);
+        let pending = all.iter().filter(|memo| !memo.completed).count();
+        let memos = all
+            .into_iter()
+            .filter(|memo| include_completed || !memo.completed)
+            .filter(|memo| matches_query(&memo.text, query))
+            .take(limit)
+            .collect::<Vec<MemoEntry>>();
+        Ok(json!({
+            "memos": memos,
+            "count": memos.len(),
+            "pendingCount": pending,
+            "includeCompleted": include_completed,
+            "query": query
         }))
     }
 
@@ -213,16 +244,16 @@ fn canonical_terms(hotwords: &[String], replacements: &[ReplacementRule]) -> Vec
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// 临时目录用进程内计数器区分，不用时间戳：同 crate 的测试是并行跑的，
+    /// 纳秒精度不够，两个测试可能拿到同一个目录名，然后互相删掉对方的文件。
     fn test_dir() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "jackvoice-agent-bridge-{}-{unique}",
-            std::process::id()
+            "jackvoice-agent-bridge-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -285,6 +316,89 @@ mod tests {
         assert_eq!(result["rewritten"], "打开 B roll 继续会话");
         assert!(result["changed"].as_bool().unwrap());
         assert_eq!(result["applied"].as_array().unwrap().len(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn seed_memos(dir: &Path) {
+        fs::write(
+            dir.join("memos.json"),
+            r#"{"memos":[
+              {"id":"m-1","text":"写周报","createdAtMs":3000,"completed":false,"source":"voice"},
+              {"id":"m-2","text":"买 HDMI 线","createdAtMs":2000,"completed":false,"source":"clipboard"},
+              {"id":"m-3","text":"已经做完的事","createdAtMs":1000,"completed":true,"source":"manual"}
+            ]}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn memos_default_to_pending_only() {
+        let dir = test_dir();
+        seed_memos(&dir);
+        let tools = AgentTools::new(dir.clone());
+        let result = tools.call("get_memos", json!({})).unwrap();
+        let texts = result["memos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|memo| memo["text"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["写周报", "买 HDMI 线"]);
+        assert_eq!(result["pendingCount"], 2);
+        assert_eq!(result["includeCompleted"], false);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn memos_expose_source_and_can_include_completed() {
+        let dir = test_dir();
+        seed_memos(&dir);
+        let tools = AgentTools::new(dir.clone());
+        let result = tools
+            .call("get_memos", json!({"includeCompleted": true}))
+            .unwrap();
+        assert_eq!(result["count"], 3);
+        let sources = result["memos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|memo| memo["source"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(sources, vec!["voice", "clipboard", "manual"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn memos_query_filters_by_text() {
+        let dir = test_dir();
+        seed_memos(&dir);
+        let tools = AgentTools::new(dir.clone());
+        let result = tools.call("get_memos", json!({"query": "hdmi"})).unwrap();
+        assert_eq!(result["count"], 1);
+        assert_eq!(result["memos"][0]["text"], "买 HDMI 线");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn memos_are_empty_without_a_store() {
+        let dir = test_dir();
+        let tools = AgentTools::new(dir.clone());
+        let result = tools.call("get_memos", json!({})).unwrap();
+        assert_eq!(result["count"], 0);
+        assert_eq!(result["pendingCount"], 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn status_reports_memo_counts_and_read_only_capabilities() {
+        let dir = test_dir();
+        seed_glossary(&dir);
+        seed_memos(&dir);
+        let tools = AgentTools::new(dir.clone());
+        let status = tools.call("get_status", json!({})).unwrap();
+        assert_eq!(status["memoCount"], 2);
+        assert_eq!(status["capabilities"]["readMemos"], true);
+        assert_eq!(status["capabilities"]["writeMemos"], false);
         fs::remove_dir_all(dir).unwrap();
     }
 

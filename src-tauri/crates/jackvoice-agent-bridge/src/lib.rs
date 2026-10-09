@@ -1,5 +1,6 @@
 pub mod hotwords;
 mod mcp;
+pub mod memos;
 mod paths;
 mod tools;
 

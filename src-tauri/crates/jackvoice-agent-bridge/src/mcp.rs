@@ -4,7 +4,7 @@ use std::io::{self, BufRead, Write};
 
 const SERVER_NAME: &str = "jackvoice";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const INSTRUCTIONS: &str = "JackVoice MCP 只读取本机热词和替换词，不读写听写历史、录音或 API Key。校正转写时先 get_glossary：热词是常用专有词表，替换词是已知 A→B。再对文本调用 apply_replacements 做确定性替换（含最长匹配、短语锁；英文和数字只在整词边界替换，中文按连续文字匹配）。若某热词等于某条替换的 from，最终写法用 to。当前版本不会修改词库。";
+const INSTRUCTIONS: &str = "JackVoice MCP 只读取本机热词、替换词和待办备忘，不读写听写历史、录音或 API Key。校正转写时先 get_glossary：热词是常用专有词表，替换词是已知 A→B。再对文本调用 apply_replacements 做确定性替换（含最长匹配、短语锁；英文和数字只在整词边界替换，中文按连续文字匹配）。若某热词等于某条替换的 from，最终写法用 to。用户问「我还有什么没做」「待办里有什么」时用 get_memos，默认只返回未完成项，每条带 source 说明它是说出来的还是抄来的。当前版本不会修改词库或待办。";
 
 pub fn run_stdio_server() -> Result<(), String> {
     let tools = AgentTools::discover()?;
@@ -112,7 +112,24 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties":false
             }),
         ),
+        tool(
+            "get_memos",
+            "读取本机 JackVoice 待办备忘。默认只返回未完成项；传 includeCompleted 连已完成一起返回。每条带 source：voice（听写置顶说出来的）、manual（面板里手打的）、clipboard（从剪贴板收进来的）。可用 query 过滤文字。只读，不改待办。",
+            memos_input_schema(),
+        ),
     ]
+}
+
+fn memos_input_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "query":{"type":"string","description":"可选。对待办文字做不区分大小写的包含过滤。"},
+            "limit":{"type":"integer","minimum":1,"maximum":5000,"description":"最多返回多少条，默认全部，上限 5000。"},
+            "includeCompleted":{"type":"boolean","description":"可选。默认 false，只返回未完成待办。"}
+        },
+        "additionalProperties":false
+    })
 }
 
 fn list_input_schema() -> Value {
@@ -166,7 +183,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exposes_read_only_glossary_tools() {
+    fn exposes_read_only_glossary_and_memo_tools() {
         let names = tool_definitions()
             .into_iter()
             .filter_map(|tool| tool["name"].as_str().map(str::to_string))
@@ -178,9 +195,22 @@ mod tests {
                 "get_glossary",
                 "get_hotwords",
                 "get_replacements",
-                "apply_replacements"
+                "apply_replacements",
+                "get_memos"
             ]
         );
+    }
+
+    #[test]
+    fn every_tool_is_declared_read_only() {
+        for tool in tool_definitions() {
+            let name = tool["name"].as_str().unwrap_or("?");
+            assert_eq!(tool["annotations"]["readOnlyHint"], true, "{name} 应当只读");
+            assert_eq!(
+                tool["annotations"]["destructiveHint"], false,
+                "{name} 不得声明为破坏性"
+            );
+        }
     }
 
     #[test]
