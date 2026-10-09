@@ -30,6 +30,86 @@ use tauri_plugin_global_shortcut::{
 };
 use tauri_plugin_opener::OpenerExt;
 
+/// 当前已注册的「存入待办」快捷键。全局快捷键插件只有一个 handler，
+/// 靠这里区分一次按下是开始听写，还是把剪贴板收入待办。
+#[derive(Default)]
+struct CaptureShortcutState(parking_lot::Mutex<Option<Shortcut>>);
+
+/// 摘掉「存入待办」快捷键，返回是否本来注册着。
+fn release_capture_shortcut(app: &AppHandle) -> bool {
+    let Some(state) = app.try_state::<CaptureShortcutState>() else {
+        return false;
+    };
+    let previous = state.0.lock().take();
+    match previous {
+        Some(shortcut) => {
+            let _ = app.global_shortcut().unregister(shortcut);
+            true
+        }
+        None => false,
+    }
+}
+
+/// 按当前设置注册「存入待办」快捷键。留空表示关闭，只保留托盘菜单入口。
+/// 不接受 Fn 组合：Fn 走原生事件监听，不属于全局快捷键插件的管辖范围。
+fn register_capture_shortcut(app: &AppHandle) -> Result<(), String> {
+    release_capture_shortcut(app);
+
+    let configured = app.state::<AppState>().capture_shortcut();
+    let trimmed = configured.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if shortcut::uses_fn_modifier(trimmed) {
+        return Err("「存入待办」不支持 Fn 组合，请换一个带 ⌘ / ⌥ / ⌃ / ⇧ 的组合。".into());
+    }
+    let parsed = trimmed
+        .parse::<Shortcut>()
+        .map_err(|_| "快捷键格式无效，可参考 CommandOrControl+Shift+M 形式。".to_string())?;
+    app.global_shortcut()
+        .register(parsed)
+        .map_err(|error| format!("无法注册该快捷键（可能与其他应用冲突）：{error}"))?;
+    if let Some(state) = app.try_state::<CaptureShortcutState>() {
+        *state.0.lock() = Some(parsed);
+    }
+    Ok(())
+}
+
+fn is_capture_shortcut(app: &AppHandle, shortcut: &Shortcut) -> bool {
+    app.try_state::<CaptureShortcutState>()
+        .and_then(|state| *state.0.lock())
+        .is_some_and(|registered| registered == *shortcut)
+}
+
+/// 两个快捷键是否指向同一个组合。写法可能不同——录制产出 `Meta+Shift+M`，
+/// 默认值是 `CommandOrControl+Shift+M`，在 macOS 上按的是同一组键——所以比解析结果。
+/// Fn 组合解析不了，而「存入待办」也不接受 Fn，返回 false 即可。
+fn same_accelerator(left: &str, right: &str) -> bool {
+    match (
+        left.trim().parse::<Shortcut>(),
+        right.trim().parse::<Shortcut>(),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// 快捷键与托盘菜单共用的收入动作。失败只写日志：这是一次后台动作，
+/// 弹窗打断用户比静默失败更糟，待办窗口开着时会自己刷新。
+fn file_clipboard_into_memos(app: &AppHandle) {
+    let text = match app.clipboard().read_text() {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("[memos] 读取剪贴板失败：{error}");
+            return;
+        }
+    };
+    match crate::memos::add_memo(app, &text, crate::memos::SOURCE_CLIPBOARD) {
+        Ok(_) => eprintln!("[memos] 已从剪贴板收入 1 条待办"),
+        Err(error) => eprintln!("[memos] 从剪贴板收入待办失败：{error}"),
+    }
+}
+
 #[tauri::command]
 fn get_state(state: tauri::State<'_, AppState>) -> UiState {
     state.snapshot()
@@ -119,6 +199,10 @@ fn update_shortcut(
     state: tauri::State<'_, AppState>,
 ) -> Result<UiState, String> {
     let trimmed = shortcut.trim().to_string();
+    // 两个快捷键撞成同一个组合时，注册失败的原因是自己而不是别人，先说清楚。
+    if same_accelerator(&trimmed, &state.capture_shortcut()) {
+        return Err("这个组合已经用于「存入待办」，请换一个。".into());
+    }
     let uses_fn = shortcut::uses_fn_modifier(&trimmed);
     let new_shortcut =
         if uses_fn {
@@ -146,7 +230,13 @@ fn update_shortcut(
         }
     }
     match state.set_shortcut(trimmed) {
-        Ok(ui) => Ok(ui),
+        Ok(ui) => {
+            // unregister_all 会把「存入待办」快捷键一并摘掉，这里补回来。
+            if let Err(error) = register_capture_shortcut(&app) {
+                eprintln!("[shortcut] {error}");
+            }
+            Ok(ui)
+        }
         Err(error) => {
             let _ = global_shortcut.unregister_all();
             if !shortcut::uses_fn_modifier(&old_shortcut) {
@@ -159,11 +249,37 @@ fn update_shortcut(
     }
 }
 
+/// 设置「存入待办」的全局快捷键。留空表示关闭，功能仍可从托盘菜单使用。
+#[tauri::command]
+fn update_capture_shortcut(
+    shortcut: String,
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiState, String> {
+    let trimmed = shortcut.trim().to_string();
+    // 留空表示关闭，否则不能和听写快捷键撞车。
+    if !trimmed.is_empty() && same_accelerator(&trimmed, &state.shortcut()) {
+        return Err("这个组合已经用于免按模式听写，请换一个。".into());
+    }
+    // 注册函数从 AppState 读取当前值，所以先落盘再注册。
+    let ui = state.set_capture_shortcut(trimmed)?;
+    if let Err(error) = register_capture_shortcut(&app) {
+        // 注册失败就退回关闭状态，界面不会显示一个其实没生效的快捷键。
+        let _ = state.set_capture_shortcut(String::new());
+        let _ = register_capture_shortcut(&app);
+        return Err(error);
+    }
+    Ok(ui)
+}
+
 #[tauri::command]
 fn start_shortcut_recording(
     app: AppHandle,
     state: tauri::State<'_, shortcut::ShortcutCaptureState>,
 ) {
+    // 录制期间先摘掉「存入待办」快捷键：用户按下的组合应当被录进去，
+    // 而不是顺手把剪贴板存成一条待办。
+    release_capture_shortcut(&app);
     // The native event tap is only useful for capturing Fn combinations.
     // Never create it before Accessibility has already been granted: doing so
     // makes macOS show a permission dialog before the onboarding UI is ready.
@@ -174,8 +290,14 @@ fn start_shortcut_recording(
 }
 
 #[tauri::command]
-fn cancel_shortcut_recording(state: tauri::State<'_, shortcut::ShortcutCaptureState>) {
+fn cancel_shortcut_recording(
+    app: AppHandle,
+    state: tauri::State<'_, shortcut::ShortcutCaptureState>,
+) {
     state.stop();
+    if let Err(error) = register_capture_shortcut(&app) {
+        eprintln!("[shortcut] {error}");
+    }
 }
 
 #[tauri::command]
@@ -472,8 +594,23 @@ fn get_memos(app: AppHandle) -> Vec<crate::memos::MemoItem> {
 }
 
 #[tauri::command]
-fn add_memo(app: AppHandle, text: String) -> Result<crate::memos::MemoItem, String> {
-    crate::memos::add_memo(&app, &text)
+fn add_memo(
+    app: AppHandle,
+    text: String,
+    source: Option<String>,
+) -> Result<crate::memos::MemoItem, String> {
+    let source = source.unwrap_or_else(|| crate::memos::SOURCE_MANUAL.to_string());
+    crate::memos::add_memo(&app, &text, &source)
+}
+
+/// 把剪贴板文字整段收进待办，作为一条。
+#[tauri::command]
+fn capture_clipboard_to_memo(app: AppHandle) -> Result<crate::memos::MemoItem, String> {
+    let text = app
+        .clipboard()
+        .read_text()
+        .map_err(|error| format!("读取剪贴板失败：{error}"))?;
+    crate::memos::add_memo(&app, &text, crate::memos::SOURCE_CLIPBOARD)
 }
 
 #[tauri::command]
@@ -564,8 +701,16 @@ pub fn run() {
         )
         .plugin(
             ShortcutBuilder::new()
-                .with_handler(|app, _shortcut, event| {
+                .with_handler(|app, shortcut, event| {
                     if event.state != ShortcutState::Pressed {
+                        return;
+                    }
+                    // 「存入待办」与听写共用一个 handler，先认这次按下的是谁。
+                    if is_capture_shortcut(app, shortcut) {
+                        let app_handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            file_clipboard_into_memos(&app_handle);
+                        });
                         return;
                     }
                     let app_handle = app.clone();
@@ -600,6 +745,7 @@ pub fn run() {
             app.manage(instance_guard);
             app.manage(state);
             app.manage(shortcut::ShortcutCaptureState::default());
+            app.manage(CaptureShortcutState::default());
             main_window::ensure_main_window(app.handle())
                 .map_err(Box::<dyn std::error::Error>::from)?;
             let state = app.state::<AppState>();
@@ -654,6 +800,12 @@ pub fn run() {
                     .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
             }
 
+            // 「存入待办」快捷键是附加能力：注册失败只记日志，听写不受影响，
+            // 托盘菜单里始终保留同一个入口。
+            if let Err(error) = register_capture_shortcut(app.handle()) {
+                eprintln!("[shortcut] {error}");
+            }
+
             // Keep the OS launch-at-login state in sync with saved settings.
             let want_autostart = app.state::<AppState>().snapshot().launch_at_login;
             let autolaunch = app.autolaunch();
@@ -680,6 +832,7 @@ pub fn run() {
             save_replacements,
             sync_volc_hotword_table,
             update_shortcut,
+            update_capture_shortcut,
             start_shortcut_recording,
             cancel_shortcut_recording,
             set_launch_at_login,
@@ -711,6 +864,7 @@ pub fn run() {
             set_session_pin,
             get_memos,
             add_memo,
+            capture_clipboard_to_memo,
             toggle_memo,
             delete_memo,
             clear_completed_memos,
@@ -751,3 +905,46 @@ pub fn run() {
 // Silence unused import warning if compiler tree-shakes differently.
 #[allow(dead_code)]
 type _InputDeviceInfo = InputDeviceInfo;
+
+#[cfg(test)]
+mod shortcut_identity_tests {
+    use super::same_accelerator;
+
+    #[test]
+    fn identical_spellings_match() {
+        assert!(same_accelerator("Alt+Space", "Alt+Space"));
+        assert!(same_accelerator(" Alt+Space ", "Alt+Space"));
+    }
+
+    #[test]
+    fn different_combinations_do_not_match() {
+        assert!(!same_accelerator("Alt+Space", "Alt+Enter"));
+        assert!(!same_accelerator(
+            "CommandOrControl+Shift+M",
+            "CommandOrControl+Shift+K"
+        ));
+        // 「存入待办」不接受 Fn，只要保证它不会和普通组合误判相等。
+        assert!(!same_accelerator("Fn+Space", "Alt+Space"));
+    }
+
+    /// 录制产出 `Super`，默认值写 `CommandOrControl`：两者只在 macOS 上指同一个键。
+    #[test]
+    fn super_and_command_or_control_follow_the_platform() {
+        #[cfg(target_os = "macos")]
+        assert!(same_accelerator(
+            "CommandOrControl+Shift+M",
+            "Super+Shift+M"
+        ));
+        #[cfg(not(target_os = "macos"))]
+        assert!(!same_accelerator(
+            "CommandOrControl+Shift+M",
+            "Super+Shift+M"
+        ));
+    }
+
+    #[test]
+    fn empty_never_matches() {
+        assert!(!same_accelerator("", ""));
+        assert!(!same_accelerator("Alt+Space", ""));
+    }
+}

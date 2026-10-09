@@ -38,6 +38,7 @@ type UiState = {
   lastDeliveryMessage: string;
   needsCopyPrompt: boolean;
   shortcut: string;
+  captureShortcut: string;
   launchAtLogin: boolean;
   muteSystemAudioDuringDictation: boolean;
   systemAudioMuteSupported: boolean;
@@ -109,7 +110,7 @@ let hotwordFilter = "";
 let replacements: ReplacementRule[] = [];
 let replacementFilter = "";
 let editingReplacementSource: string | null = null;
-let recordingShortcut = false;
+let recordingShortcut: ShortcutTarget | null = null;
 let historyRecords: HistoryRecord[] = [];
 let selectedHistoryId: string | null = null;
 let historyQuery = "";
@@ -264,6 +265,9 @@ function modLabel(token: string): string {
     case "Command":
     case "Super":
       return "⌘";
+    case "CommandOrControl":
+    case "CmdOrCtrl":
+      return /Mac|iPhone|iPad/.test(navigator.userAgent) ? "⌘" : "⌃";
     case "Ctrl":
     case "Control":
       return "⌃";
@@ -279,7 +283,9 @@ function modLabel(token: string): string {
 }
 
 function formatShortcut(accelerator: string): string {
-  return accelerator
+  const trimmed = accelerator.trim();
+  if (!trimmed) return "未设置";
+  return trimmed
     .split("+")
     .map((t) => modLabel(t.trim()))
     .join(" + ");
@@ -478,6 +484,11 @@ function applyState(state: UiState) {
   if (!recordingShortcut) {
     const scBtn = $("#shortcut-btn");
     if (scBtn) scBtn.textContent = formatShortcut(state.shortcut || "Alt+Space");
+    const captureBtn = $("#capture-shortcut-btn");
+    if (captureBtn) {
+      captureBtn.textContent = currentShortcutLabel("capture");
+      captureBtn.classList.toggle("unset", !state.captureShortcut?.trim());
+    }
   }
 
   const credentialStatus = state.volcCredentialStatus ||
@@ -1774,25 +1785,56 @@ function closeSettings() {
   $("#settings-modal")?.classList.add("hidden");
 }
 
-function showShortcutError(message: string) {
-  const el = $("#shortcut-error");
+/** 两个可录制快捷键共用一套录制流程，靠这张表区分按钮、错误位和保存命令。 */
+const SHORTCUT_TARGETS = {
+  dictation: {
+    button: "#shortcut-btn",
+    error: "#shortcut-error",
+    fallback: "Alt+Space",
+    command: "update_shortcut",
+    // 「存入待办」允许留空表示关闭，听写快捷键不允许。
+    clearable: false,
+  },
+  capture: {
+    button: "#capture-shortcut-btn",
+    error: "#capture-shortcut-error",
+    fallback: "CommandOrControl+Shift+M",
+    command: "update_capture_shortcut",
+    clearable: true,
+  },
+} as const;
+
+type ShortcutTarget = keyof typeof SHORTCUT_TARGETS;
+
+function shortcutButton(target: ShortcutTarget): HTMLButtonElement | null {
+  return $(SHORTCUT_TARGETS[target].button);
+}
+
+function currentShortcutLabel(target: ShortcutTarget): string {
+  const config = SHORTCUT_TARGETS[target];
+  const configured = target === "dictation" ? currentState?.shortcut : currentState?.captureShortcut;
+  return formatShortcut(configured || config.fallback);
+}
+
+function showShortcutError(target: ShortcutTarget, message: string) {
+  const el = $(SHORTCUT_TARGETS[target].error);
   if (el) {
     el.textContent = message;
     el.classList.remove("hidden");
   }
 }
 
-function hideShortcutError() {
-  $("#shortcut-error")?.classList.add("hidden");
+function hideShortcutError(target: ShortcutTarget) {
+  $(SHORTCUT_TARGETS[target].error)?.classList.add("hidden");
 }
 
-function startRecording() {
-  recordingShortcut = true;
-  hideShortcutError();
+function startRecording(target: ShortcutTarget) {
+  recordingShortcut = target;
+  hideShortcutError(target);
   void invoke("start_shortcut_recording").catch((error) =>
     console.error("start native shortcut recording failed", error),
   );
-  const btn = $("#shortcut-btn");
+  const btn = shortcutButton(target);
   if (btn) {
     btn.classList.add("recording");
     btn.textContent = "按下快捷键（Esc 取消）";
@@ -1800,14 +1842,16 @@ function startRecording() {
 }
 
 function stopRecording() {
-  recordingShortcut = false;
+  const target = recordingShortcut;
+  recordingShortcut = null;
   void invoke("cancel_shortcut_recording").catch((error) =>
     console.error("cancel native shortcut recording failed", error),
   );
-  const btn = $("#shortcut-btn");
+  if (!target) return;
+  const btn = shortcutButton(target);
   if (btn) {
     btn.classList.remove("recording");
-    btn.textContent = formatShortcut(currentState?.shortcut || "Alt+Space");
+    btn.textContent = currentShortcutLabel(target);
   }
 }
 
@@ -1816,7 +1860,8 @@ function acceleratorFromEvent(e: KeyboardEvent): string | null {
   if (e.ctrlKey) mods.push("Control");
   if (e.altKey) mods.push("Alt");
   if (e.shiftKey) mods.push("Shift");
-  if (e.metaKey) mods.push("Meta");
+  // ⌘ 写成 Super：全局快捷键插件不认 Meta，写成 Meta 会让录制结果被判为格式无效。
+  if (e.metaKey) mods.push("Super");
 
   const code = e.code;
   let key: string | null = null;
@@ -1846,39 +1891,49 @@ function acceleratorFromEvent(e: KeyboardEvent): string | null {
 }
 
 function onRecordKeydown(e: KeyboardEvent) {
-  if (!recordingShortcut) return;
+  const target = recordingShortcut;
+  if (!target) return;
   e.preventDefault();
   e.stopPropagation();
   if (e.key === "Escape") {
     stopRecording();
     return;
   }
+  // Backspace 关掉「存入待办」快捷键；听写快捷键不能为空。
+  if (SHORTCUT_TARGETS[target].clearable && (e.key === "Backspace" || e.key === "Delete")) {
+    stopRecording();
+    saveShortcut(target, "");
+    return;
+  }
   const accelerator = acceleratorFromEvent(e);
   if (accelerator === null) return;
   stopRecording();
   if (accelerator === "") {
-    showShortcutError("请至少包含一个修饰键（Fn / ⌘ / ⌥ / ⌃ / ⇧），或单独使用 F1–F12。");
+    showShortcutError(target, "请至少包含一个修饰键（Fn / ⌘ / ⌥ / ⌃ / ⇧），或单独使用 F1–F12。");
     return;
   }
-  saveShortcut(accelerator);
+  saveShortcut(target, accelerator);
 }
 
-function saveShortcut(accelerator: string) {
-  invoke<UiState>("update_shortcut", { shortcut: accelerator })
+function saveShortcut(target: ShortcutTarget, accelerator: string) {
+  invoke<UiState>(SHORTCUT_TARGETS[target].command, { shortcut: accelerator })
     .then((state) => applyState(state))
-    .catch((error) => showShortcutError(error instanceof Error ? error.message : String(error)));
+    .catch((error) =>
+      showShortcutError(target, error instanceof Error ? error.message : String(error)),
+    );
 }
 
 type ShortcutCaptureEvent = { accelerator: string; error: string };
 
 function onNativeShortcutCaptured(payload: ShortcutCaptureEvent) {
-  if (!recordingShortcut) return;
+  const target = recordingShortcut;
+  if (!target) return;
   stopRecording();
   if (payload.error) {
-    showShortcutError(payload.error);
+    showShortcutError(target, payload.error);
     return;
   }
-  if (payload.accelerator) saveShortcut(payload.accelerator);
+  if (payload.accelerator) saveShortcut(target, payload.accelerator);
 }
 
 /* ---------------- 命令调用 ---------------- */
@@ -2540,7 +2595,12 @@ function bindSettingsModal() {
 
   $("#shortcut-btn")?.addEventListener("click", () => {
     if (recordingShortcut) stopRecording();
-    else startRecording();
+    else startRecording("dictation");
+  });
+
+  $("#capture-shortcut-btn")?.addEventListener("click", () => {
+    if (recordingShortcut) stopRecording();
+    else startRecording("capture");
   });
   window.addEventListener("keydown", onRecordKeydown, true);
 

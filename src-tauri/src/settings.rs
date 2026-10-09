@@ -34,6 +34,9 @@ pub struct AppSettings {
     pub selected_input_device_name: String,
     #[serde(default = "default_shortcut")]
     pub shortcut: String,
+    /// 把剪贴板文字收入待办的全局快捷键；留空表示不注册。
+    #[serde(default = "default_capture_shortcut")]
+    pub capture_shortcut: String,
     #[serde(default)]
     pub launch_at_login: bool,
     /// 听写占用麦克风期间，临时静音系统输出；目前仅 macOS 支持。
@@ -76,6 +79,8 @@ struct SharedSettings {
     selected_input_device_name: String,
     #[serde(default = "default_shortcut")]
     shortcut: String,
+    #[serde(default = "default_capture_shortcut")]
+    capture_shortcut: String,
     #[serde(default)]
     input_gain_db: f32,
     #[serde(default = "default_history_text_size")]
@@ -94,6 +99,7 @@ impl Default for SharedSettings {
             selected_input_device_id: String::new(),
             selected_input_device_name: String::new(),
             shortcut: default_shortcut(),
+            capture_shortcut: default_capture_shortcut(),
             input_gain_db: 0.0,
             history_text_size: default_history_text_size(),
         }
@@ -134,6 +140,7 @@ impl AppSettings {
             selected_input_device_id: shared.selected_input_device_id,
             selected_input_device_name: shared.selected_input_device_name,
             shortcut: shared.shortcut,
+            capture_shortcut: shared.capture_shortcut,
             launch_at_login: variant.launch_at_login,
             mute_system_audio_during_dictation: variant.mute_system_audio_during_dictation,
             input_gain_db: shared.input_gain_db,
@@ -153,6 +160,7 @@ impl AppSettings {
             selected_input_device_id: self.selected_input_device_id.clone(),
             selected_input_device_name: self.selected_input_device_name.clone(),
             shortcut: self.shortcut.clone(),
+            capture_shortcut: self.capture_shortcut.clone(),
             input_gain_db: self.input_gain_db,
             history_text_size: normalize_history_text_size(&self.history_text_size),
         }
@@ -260,6 +268,12 @@ fn write_variant_settings(directory: &Path, settings: &VariantSettings) -> Resul
 
 fn default_shortcut() -> String {
     "Alt+Space".into()
+}
+
+/// 「存入待办」的默认快捷键。⌘⇧M（Windows / Linux 上为 Ctrl+Shift+M）在系统层面很少被占用；
+/// 与主快捷键冲突时注册会失败，此时功能降级为只用托盘菜单，不影响听写。
+pub fn default_capture_shortcut() -> String {
+    "CommandOrControl+Shift+M".into()
 }
 
 fn default_volc_resource_id() -> String {
@@ -396,6 +410,46 @@ mod tests {
         assert_eq!(normalize_history_text_size("compact"), "compact");
         assert_eq!(normalize_history_text_size("large"), "large");
         assert_eq!(normalize_history_text_size("unexpected"), "standard");
+    }
+
+    /// 老设置文件没有 captureShortcut，读出来要拿默认值；写回后字段落在共享设置里。
+    #[test]
+    fn capture_shortcut_defaults_for_legacy_settings_and_persists() {
+        let root = test_dir("capture-shortcut");
+        let shared = root.join("shared");
+        let variant = root.join("variant");
+        fs::create_dir_all(&shared).unwrap();
+        fs::write(
+            shared.join(SHARED_SETTINGS_FILE),
+            r#"{"shortcut":"Alt+Space","semanticPunctuationEnabled":true}"#,
+        )
+        .unwrap();
+
+        let loaded = load_settings(&shared, &variant, &variant).unwrap();
+        assert_eq!(loaded.capture_shortcut, default_capture_shortcut());
+
+        save_settings(&shared, &variant, &loaded).unwrap();
+        let raw = fs::read_to_string(shared.join(SHARED_SETTINGS_FILE)).unwrap();
+        assert!(raw.contains("captureShortcut"));
+        assert!(raw.contains("CommandOrControl+Shift+M"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 关掉「存入待办」快捷键就是存一个空串，重启后不该又冒出来。
+    #[test]
+    fn an_empty_capture_shortcut_stays_empty() {
+        let root = test_dir("capture-shortcut-off");
+        let shared = root.join("shared");
+        let variant = root.join("variant");
+        let settings = AppSettings {
+            capture_shortcut: String::new(),
+            ..AppSettings::default()
+        };
+        save_settings(&shared, &variant, &settings).unwrap();
+
+        let loaded = load_settings(&shared, &variant, &variant).unwrap();
+        assert!(loaded.capture_shortcut.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

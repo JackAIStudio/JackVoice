@@ -91,6 +91,8 @@ pub struct UiState {
     pub mic_notice: String,
     pub mic_notice_seq: u32,
     pub shortcut: String,
+    /// 把剪贴板文字收入待办的全局快捷键；留空表示不注册。
+    pub capture_shortcut: String,
     pub launch_at_login: bool,
     pub mute_system_audio_during_dictation: bool,
     pub system_audio_mute_supported: bool,
@@ -143,6 +145,7 @@ impl Default for UiState {
             mic_notice: String::new(),
             mic_notice_seq: 0,
             shortcut: "Alt+Space".into(),
+            capture_shortcut: crate::settings::default_capture_shortcut(),
             launch_at_login: false,
             mute_system_audio_during_dictation: false,
             system_audio_mute_supported: crate::output_mute::supported(),
@@ -345,6 +348,10 @@ impl AppState {
 
     pub fn shortcut(&self) -> String {
         self.settings.lock().shortcut.clone()
+    }
+
+    pub fn capture_shortcut(&self) -> String {
+        self.settings.lock().capture_shortcut.clone()
     }
 
     pub fn data_dir(&self) -> PathBuf {
@@ -994,6 +1001,20 @@ impl AppState {
         let mut ui = self.ui.lock();
         ui.shortcut = shortcut.clone();
         ui.status = format!("免按模式快捷键已更新为 {shortcut}。");
+        Ok(ui.clone())
+    }
+
+    pub fn set_capture_shortcut(&self, capture_shortcut: String) -> Result<UiState, String> {
+        let mut settings = self.settings.lock();
+        settings.capture_shortcut = capture_shortcut.clone();
+        self.save_settings(&settings)?;
+        let mut ui = self.ui.lock();
+        ui.capture_shortcut = capture_shortcut.clone();
+        ui.status = if capture_shortcut.trim().is_empty() {
+            "已关闭「存入待办」快捷键。".into()
+        } else {
+            format!("「存入待办」快捷键已更新为 {capture_shortcut}。")
+        };
         Ok(ui.clone())
     }
 
@@ -2112,7 +2133,7 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
             // the result capsule up when there is no caret.
             let mut route = route_finished_transcript(is_pinned);
             if route == FinishedTranscriptRoute::MemoOnly {
-                match crate::memos::add_memo(&app, &final_text) {
+                match crate::memos::add_memo(&app, &final_text, crate::memos::SOURCE_VOICE) {
                     Ok(_) => saved_to_memo = true,
                     Err(e) => {
                         eprintln!("[memos] 自动加入待办失败，改走粘贴: {e}");
@@ -2253,6 +2274,7 @@ fn apply_settings_to_ui(ui: &mut UiState, settings: &AppSettings) {
     ui.selected_input_device_id = settings.selected_input_device_id.clone();
     ui.selected_input_device_name = selected_input_device_display_name(settings).to_string();
     ui.shortcut = settings.shortcut.clone();
+    ui.capture_shortcut = settings.capture_shortcut.clone();
     ui.launch_at_login = settings.launch_at_login;
     ui.mute_system_audio_during_dictation = settings.mute_system_audio_during_dictation;
     ui.system_audio_mute_supported = crate::output_mute::supported();

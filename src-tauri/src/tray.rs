@@ -1,12 +1,17 @@
 use tauri::{
     image::Image,
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 
 pub const MEMOS_WINDOW_LABEL: &str = "memos";
 pub const MEMOS_WIN_WIDTH: f64 = 320.0;
-pub const MEMOS_WIN_HEIGHT: f64 = 420.0;
+pub const MEMOS_WIN_HEIGHT: f64 = 456.0;
+
+/// 托盘右键菜单项 id。
+const MENU_CAPTURE_CLIPBOARD: &str = "capture-clipboard";
+const MENU_QUIT: &str = "quit";
 
 // 1位数字 (12x16 点阵)
 const GLYPHS_1DIGIT: [[u16; 16]; 10] = [
@@ -264,10 +269,31 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let initial_count = crate::memos::uncompleted_count(app);
     let icon = render_badge_icon(initial_count);
 
+    // 右键菜单只放「没有别的入口」的动作：左键已经能打开待办备忘，
+    // 不必在菜单里再放一份。
+    let capture_item = MenuItem::with_id(
+        app,
+        MENU_CAPTURE_CLIPBOARD,
+        "从剪贴板存入待办",
+        true,
+        None::<&str>,
+    )?;
+    let quit_item = MenuItem::with_id(app, MENU_QUIT, "退出 JackVoice", true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let menu = Menu::with_items(app, &[&capture_item, &separator, &quit_item])?;
+
     let _tray = TrayIconBuilder::with_id("jackvoice-tray")
         .icon(icon)
         .icon_as_template(true)
         .tooltip(format!("JackVoice 待办备忘 ({initial_count} 个待办)"))
+        .menu(&menu)
+        // 左键仍是「打开待办备忘」，右键才弹菜单。
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app: &AppHandle, event| match event.id().as_ref() {
+            MENU_CAPTURE_CLIPBOARD => crate::file_clipboard_into_memos(app),
+            MENU_QUIT => app.exit(0),
+            _ => {}
+        })
         .on_tray_icon_event(|tray: &tauri::tray::TrayIcon, event| {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,

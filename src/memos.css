@@ -107,6 +107,80 @@ html, body {
   cursor: default;
 }
 
+.memos-compose {
+  display: flex;
+  /* 输入框会随内容长高，按钮始终贴底，和聊天输入框一个观感。 */
+  align-items: flex-end;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
+}
+
+.compose-input {
+  flex: 1;
+  min-width: 0;
+  min-height: 28px;
+  max-height: 96px;
+  padding: 5px 9px;
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 7px;
+  outline: none;
+  user-select: text;
+  resize: none;
+  overflow-y: auto;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.compose-input::-webkit-scrollbar {
+  width: 5px;
+}
+
+.compose-input::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+}
+
+.compose-input::placeholder {
+  color: var(--text-tertiary);
+}
+
+.compose-input:focus {
+  background: rgba(255, 255, 255, 0.065);
+  border-color: rgba(255, 255, 255, 0.20);
+}
+
+.compose-submit {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  color: rgba(255, 255, 255, 0.55);
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 7px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.compose-submit:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.10);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.compose-submit:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
 .memos-list {
   flex: 1;
   overflow-y: auto;
@@ -195,6 +269,18 @@ html, body {
   gap: 8px;
   font-size: 10.5px;
   color: var(--text-secondary);
+}
+
+/* 只有非语音来源才挂标记：默认态不标注，抄来的内容一眼可见。 */
+.memo-source {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-tertiary);
+}
+
+.memo-source svg {
+  width: 10px;
+  height: 10px;
 }
 
 .memo-actions {

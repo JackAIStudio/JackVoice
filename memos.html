@@ -29,6 +29,24 @@
         </div>
       </header>
 
+      <div class="memos-compose">
+        <textarea
+          id="memo-input"
+          class="compose-input"
+          rows="1"
+          placeholder="添加待办"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+        ></textarea>
+        <button id="memo-submit" class="compose-submit" type="button" title="添加待办" disabled>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="12" y1="5" x2="12" y2="19" />
+            <line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+        </button>
+      </div>
+
       <main class="memos-list" id="memos-list">
         <div class="empty-state">
           <svg class="empty-icon" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

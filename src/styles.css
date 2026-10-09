@@ -1293,6 +1293,11 @@ kbd.shortcut {
   color: #fff;
 }
 
+.shortcut-btn.unset {
+  font-weight: 500;
+  color: var(--text-2);
+}
+
 /* switch */
 
 .switch {

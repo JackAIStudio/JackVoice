@@ -270,7 +270,8 @@ fn accelerator_for_fn_event(key_code: u16, event_flags: u64) -> Result<String, S
         tokens.push("Shift");
     }
     if event_flags & FLAG_COMMAND != 0 {
-        tokens.push("Meta");
+        // 用 Super 而不是 Meta：全局快捷键插件不认 Meta，两处产出的 ⌘ 必须是同一个写法。
+        tokens.push("Super");
     }
     tokens.push(key);
     Ok(tokens.join("+"))
@@ -424,7 +425,24 @@ mod tests {
         assert_eq!(accelerator_for_fn_event(0x31, FLAG_FN).unwrap(), "Fn+Space");
         assert_eq!(
             accelerator_for_fn_event(0x28, FLAG_FN | FLAG_COMMAND).unwrap(),
-            "Fn+Meta+K"
+            "Fn+Super+K"
+        );
+    }
+
+    /// ⌘ 在设置里写成 Super。写成 Meta 的话，非 Fn 路径解析不了，
+    /// 用户录制任何 ⌘ 组合都会被判为格式无效。
+    #[test]
+    fn command_modifier_serializes_to_a_token_the_plugin_accepts() {
+        let accelerator = accelerator_for_fn_event(0x28, FLAG_FN | FLAG_COMMAND).unwrap();
+        assert!(accelerator.contains("Super"));
+        assert!(!accelerator.contains("Meta"));
+
+        let plain = "Super+Shift+M";
+        assert!(
+            plain
+                .parse::<tauri_plugin_global_shortcut::Shortcut>()
+                .is_ok(),
+            "{plain} 必须能被全局快捷键插件解析"
         );
     }
 

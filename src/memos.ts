@@ -2,16 +2,50 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
+type MemoSource = "voice" | "manual" | "clipboard";
+
 type MemoItem = {
   id: string;
   text: string;
   createdAtMs: number;
   completed: boolean;
+  source: MemoSource;
 };
 
 const listEl = () => document.querySelector<HTMLElement>("#memos-list");
 const countEl = () => document.querySelector<HTMLElement>("#memos-count");
 const clearBtn = () => document.querySelector<HTMLButtonElement>("#clear-btn");
+const inputEl = () => document.querySelector<HTMLTextAreaElement>("#memo-input");
+const submitBtn = () => document.querySelector<HTMLButtonElement>("#memo-submit");
+
+/** 非语音来源在时间旁挂一枚单色细线图标；语音是默认来源，不标注。 */
+const SOURCE_ICONS: Record<string, { title: string; svg: string }> = {
+  manual: {
+    title: "手动输入",
+    svg: `<rect x="2" y="6" width="20" height="12" rx="2.5" />
+      <path d="M6.4 10.2h.01" /><path d="M10.1 10.2h.01" /><path d="M13.8 10.2h.01" /><path d="M17.5 10.2h.01" />
+      <path d="M7.6 13.9h8.8" />`,
+  },
+  clipboard: {
+    title: "来自剪贴板",
+    svg: `<rect x="8" y="2" width="8" height="4" rx="1" />
+      <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />`,
+  },
+};
+
+function sourceBadge(source: MemoSource): HTMLElement | null {
+  const icon = SOURCE_ICONS[source];
+  if (!icon) return null;
+  const badge = document.createElement("span");
+  badge.className = "memo-source";
+  badge.title = icon.title;
+  badge.innerHTML = `
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      ${icon.svg}
+    </svg>
+  `;
+  return badge;
+}
 
 function formatTime(timestamp: number): string {
   const now = Date.now();
@@ -132,7 +166,13 @@ function renderMemos(memos: MemoItem[]) {
 
     const meta = document.createElement("div");
     meta.className = "memo-meta";
-    meta.textContent = formatTime(memo.createdAtMs);
+
+    const time = document.createElement("span");
+    time.textContent = formatTime(memo.createdAtMs);
+    meta.appendChild(time);
+
+    const badge = sourceBadge(memo.source);
+    if (badge) meta.appendChild(badge);
 
     content.appendChild(text);
     content.appendChild(meta);
@@ -203,6 +243,44 @@ async function loadMemos() {
   }
 }
 
+/** 输入框会随内容长高，最多到 CSS 里的 max-height，再高就内部滚动。 */
+function autoGrow() {
+  const input = inputEl();
+  if (!input) return;
+  input.style.height = "auto";
+  input.style.height = `${Math.min(input.scrollHeight, 96)}px`;
+}
+
+function syncSubmitState() {
+  const button = submitBtn();
+  if (button) button.disabled = !inputEl()?.value.trim();
+}
+
+function resetComposer() {
+  const input = inputEl();
+  if (input) input.value = "";
+  autoGrow();
+  syncSubmitState();
+}
+
+/**
+ * 提交输入框内容，整段作为一条待办——包括里面所有的换行。
+ * 成功才清空，失败时保留原文让用户能重试。
+ */
+async function submitInput() {
+  const input = inputEl();
+  const text = input?.value.trim();
+  if (!input || !text) return;
+  try {
+    await invoke<MemoItem>("add_memo", { text, source: "manual" });
+    resetComposer();
+    await loadMemos();
+  } catch (err) {
+    console.error("add memo failed", err);
+  }
+  input.focus();
+}
+
 window.addEventListener("DOMContentLoaded", async () => {
   clearBtn()?.addEventListener("click", async () => {
     try {
@@ -213,7 +291,30 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
 
+  const input = inputEl();
+  // 粘贴一律走浏览器默认行为，内容落在输入框里由用户过目、编辑、再回车。
+  // 曾经在这里拦截多行粘贴并直接入库，用户根本没机会看到自己粘了什么。
+  input?.addEventListener("input", () => {
+    syncSubmitState();
+    autoGrow();
+  });
+  input?.addEventListener("keydown", (event) => {
+    // 回车提交，Shift+回车换行。
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      void submitInput();
+    } else if (event.key === "Escape") {
+      resetComposer();
+    }
+  });
+  submitBtn()?.addEventListener("click", () => void submitInput());
+
+  // 面板是点托盘弹出的，打开就能直接敲字。
+  window.addEventListener("focus", () => inputEl()?.focus());
+
   await loadMemos();
+  autoGrow();
+  syncSubmitState();
 
   await listen<MemoItem[]>("jackvoice://memos-changed", (event) => {
     renderMemos(event.payload);
