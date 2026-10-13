@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { initTodos } from "./todos";
 
 type InputDeviceInfo = { id: string; name: string; isDefault: boolean };
 
@@ -2567,8 +2568,10 @@ function bindNav() {
       document.querySelectorAll(".nav-item[data-view]").forEach((n) => n.classList.remove("active"));
       item.classList.add("active");
       const view = item.getAttribute("data-view");
-      $("#view-home")?.classList.toggle("active", view === "home");
-      $("#view-dict")?.classList.toggle("active", view === "dict");
+      // 按 data-view 直接对到 view-<name>，以后加视图不必再改这里。
+      document.querySelectorAll<HTMLElement>(".view").forEach((section) => {
+        section.classList.toggle("active", section.id === `view-${view}`);
+      });
     });
   });
 }
@@ -2745,6 +2748,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   bindSettingsModal();
   bindOnboarding();
   bindExternalLinks();
+  await initTodos();
 
   await refreshState();
   await Promise.all([refreshHistory(), refreshHotwords(), refreshReplacements()]);

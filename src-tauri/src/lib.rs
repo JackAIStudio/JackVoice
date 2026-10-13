@@ -623,6 +623,15 @@ fn delete_memo(app: AppHandle, id: String) -> Result<Vec<crate::memos::MemoItem>
     crate::memos::delete_memo(&app, &id)
 }
 
+/// 撤销删除：前端把删掉的那条原样送回来，按原时间戳插回原位。
+#[tauri::command]
+fn restore_memo(
+    app: AppHandle,
+    memo: crate::memos::MemoItem,
+) -> Result<Vec<crate::memos::MemoItem>, String> {
+    crate::memos::restore_memo(&app, memo)
+}
+
 #[tauri::command]
 fn clear_completed_memos(app: AppHandle) -> Result<Vec<crate::memos::MemoItem>, String> {
     crate::memos::clear_completed_memos(&app)
@@ -867,6 +876,7 @@ pub fn run() {
             capture_clipboard_to_memo,
             toggle_memo,
             delete_memo,
+            restore_memo,
             clear_completed_memos,
             open_settings_window,
             open_external_url

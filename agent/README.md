@@ -1,6 +1,6 @@
 # Agent 接口
 
-JackVoice 可以把本机热词、替换词和待办备忘提供给本地 Agent。应用不必正在运行。当前全部只读：不会改词库或待办，不会读听写历史、录音或 API Key。
+JackVoice 可以把本机热词、替换词和待办事项提供给本地 Agent。应用不必正在运行。当前全部只读：不会改词库或待办，不会读听写历史、录音或 API Key。
 
 这是 JackVoice 自己的能力，不绑定任何剪辑软件。
 
@@ -19,7 +19,7 @@ JackVoice 可以把本机热词、替换词和待办备忘提供给本地 Agent�
 2. 用热词和 `canonicalTerms` 处理剩余的同音、近形。
 3. 若某热词等于某条替换的 `from`，展示用 `to`。
 
-## 待办备忘
+## 待办事项
 
 `get_memos` 读取 `com.jackvoice.shared/memos.json`，也就是托盘图标那个待办面板里的同一份数据。默认只返回未完成项，`includeCompleted: true` 连已完成一起给，`query` 按文字过滤。
 
@@ -98,6 +98,6 @@ ln -sfn /absolute/path/to/JackVoice/agent/skills/memos \
 - `get_hotwords`
 - `get_replacements`
 - `apply_replacements`
-- `get_memos`（读待办备忘，默认只给未完成项）
+- `get_memos`（读待办事项，默认只给未完成项）
 
 当前版本没有写入工具。词库仍在 JackVoice 词库页维护，待办仍在待办面板维护。

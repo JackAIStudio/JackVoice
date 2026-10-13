@@ -23,6 +23,7 @@
         <nav class="top-nav" aria-label="主导航">
           <button class="nav-item active" data-view="home">听写</button>
           <button class="nav-item" data-view="dict">词库</button>
+          <button class="nav-item" data-view="memos">待办</button>
         </nav>
         <div class="header-actions">
           <button id="toggle-btn" class="dictation-control idle" type="button" aria-label="开始听写">
@@ -173,6 +174,55 @@
             </section>
           </div>
         </section>
+
+        <!-- ================= 待办 ================= -->
+        <section id="view-memos" class="view">
+          <div class="history-workbench">
+            <header class="workbench-head">
+              <div class="workbench-title">
+                <div class="workbench-title-row">
+                  <h2>待办</h2>
+                  <span id="todos-count">0 项</span>
+                </div>
+                <span class="todos-sub">现在不做、接下来要做的事，先放在这里</span>
+              </div>
+              <div class="history-tools">
+                <label class="history-search">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" />
+                  </svg>
+                  <input id="todos-search" type="search" placeholder="搜索待办内容" autocomplete="off" />
+                </label>
+                <button id="todos-copy" class="todos-copy" type="button" title="复制全部未完成待办">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                  </svg>
+                  <span>复制</span>
+                </button>
+              </div>
+            </header>
+
+            <div class="todos-compose">
+              <textarea
+                id="todos-input"
+                class="todos-input"
+                rows="1"
+                placeholder="添加待办"
+                autocomplete="off"
+                spellcheck="false"
+              ></textarea>
+              <button id="todos-submit" class="todos-submit" type="button" title="添加待办" disabled>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <line x1="12" y1="5" x2="12" y2="19" />
+                  <line x1="5" y1="12" x2="19" y2="12" />
+                </svg>
+              </button>
+            </div>
+
+            <div id="todos-list" class="todos-list"></div>
+          </div>
+        </section>
       </main>
     </div>
 
@@ -227,7 +277,7 @@
               <div class="set-row">
                 <div>
                   <div class="set-title">存入待办</div>
-                  <div class="set-desc">按一下把剪贴板里的文字收进待办备忘。</div>
+                  <div class="set-desc">按一下把剪贴板里的文字收进待办事项。</div>
                 </div>
                 <button
                   id="capture-shortcut-btn"

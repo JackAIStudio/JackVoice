@@ -199,7 +199,7 @@ pub fn update_tray_badge(app: &AppHandle, uncompleted_count: usize) {
         let _ = tray.set_icon(Some(icon));
         let _ = tray.set_icon_as_template(true);
         let _ = tray.set_tooltip(Some(format!(
-            "JackVoice 待办备忘 ({uncompleted_count} 个待办)"
+            "JackVoice 待办事项 ({uncompleted_count} 项未完成)"
         )));
     }
 }
@@ -211,7 +211,7 @@ pub fn ensure_memos_window(app: &AppHandle) -> Result<(), String> {
 
     let url = WebviewUrl::App("memos.html".into());
     let window = WebviewWindowBuilder::new(app, MEMOS_WINDOW_LABEL, url)
-        .title("JackVoice 待办备忘")
+        .title("JackVoice 待办事项")
         .inner_size(MEMOS_WIN_WIDTH, MEMOS_WIN_HEIGHT)
         .resizable(false)
         .decorations(false)
@@ -221,7 +221,7 @@ pub fn ensure_memos_window(app: &AppHandle) -> Result<(), String> {
         .visible(false)
         .shadow(false)
         .build()
-        .map_err(|e| format!("创建待办备忘窗口失败：{e}"))?;
+        .map_err(|e| format!("创建待办事项窗口失败：{e}"))?;
 
     // 失去焦点时自动隐藏窗口
     let win_clone = window.clone();
@@ -239,7 +239,7 @@ pub fn toggle_memos_window(app: &AppHandle, rect: tauri::Rect) -> Result<(), Str
 
     let window = app
         .get_webview_window(MEMOS_WINDOW_LABEL)
-        .ok_or_else(|| "待办备忘窗口未创建".to_string())?;
+        .ok_or_else(|| "待办事项窗口未创建".to_string())?;
 
     if window.is_visible().unwrap_or(false) {
         let _ = window.hide();
@@ -269,7 +269,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let initial_count = crate::memos::uncompleted_count(app);
     let icon = render_badge_icon(initial_count);
 
-    // 右键菜单只放「没有别的入口」的动作：左键已经能打开待办备忘，
+    // 右键菜单只放「没有别的入口」的动作：左键已经能打开待办事项，
     // 不必在菜单里再放一份。
     let capture_item = MenuItem::with_id(
         app,
@@ -285,9 +285,9 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let _tray = TrayIconBuilder::with_id("jackvoice-tray")
         .icon(icon)
         .icon_as_template(true)
-        .tooltip(format!("JackVoice 待办备忘 ({initial_count} 个待办)"))
+        .tooltip(format!("JackVoice 待办事项 ({initial_count} 项未完成)"))
         .menu(&menu)
-        // 左键仍是「打开待办备忘」，右键才弹菜单。
+        // 左键仍是「打开待办事项」，右键才弹菜单。
         .show_menu_on_left_click(false)
         .on_menu_event(|app: &AppHandle, event| match event.id().as_ref() {
             MENU_CAPTURE_CLIPBOARD => crate::file_clipboard_into_memos(app),

@@ -2215,10 +2215,10 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
             } else if saved_to_memo {
                 if reached_duration_limit {
                     format!(
-                        "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束，已收入待办备忘。"
+                        "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束，已收入待办事项。"
                     )
                 } else {
-                    "已收入待办备忘。".into()
+                    "已收入待办事项。".into()
                 }
             } else if ui.transcript.trim().is_empty() {
                 if reached_duration_limit {
@@ -2237,7 +2237,7 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
             };
         }
         if saved_to_memo {
-            ui.last_delivery_message = "已收入待办备忘，未粘贴。".into();
+            ui.last_delivery_message = "已收入待办事项，未粘贴。".into();
         } else if let Some(delivery) = delivery_result.as_ref() {
             ui.last_delivery_message = delivery.message.clone();
         }

@@ -2074,3 +2074,360 @@ input[type="range"]#gain-db {
   .dictation-control,
   .dictation-control-icon { animation: none; transition: none; }
 }
+
+/* ================= 待办 ================= */
+
+.todos-sub {
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+.todos-copy {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 13px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.todos-copy:hover:not(:disabled) {
+  background: var(--hover);
+  border-color: #d5d7d0;
+  color: var(--text);
+}
+
+.todos-copy:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+/* 「已复制」挂在按钮左侧，别盖住按钮上写着的复制条数。 */
+.todos-copy .copy-toast {
+  right: calc(100% + 8px);
+}
+
+.todos-compose {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.todos-input {
+  flex: 1;
+  min-width: 0;
+  /* 兜底：视图还没显示时 scrollHeight 是 0，靠这个撑住不让输入框塌掉。 */
+  min-height: 38px;
+  max-height: 120px;
+  padding: 6px 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--history-text-size);
+  line-height: 1.5;
+  overflow-y: auto;
+  resize: none;
+  user-select: text;
+}
+
+.todos-input::placeholder {
+  color: var(--text-2);
+  opacity: 0.6;
+}
+
+.todos-submit {
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 9px;
+  background: var(--dark);
+  color: #fff;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.todos-submit:hover:not(:disabled) {
+  opacity: 0.86;
+}
+
+.todos-submit:disabled {
+  opacity: 0.22;
+  cursor: default;
+}
+
+.todos-list {
+  min-height: 260px;
+  max-height: calc(100vh - 268px);
+  overflow-y: auto;
+  padding: 8px 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.todos-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 72px 16px;
+  text-align: center;
+}
+
+.todos-empty strong {
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.todos-empty span {
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+/*
+ * 待办条目。和托盘小窗共用同一套 .memo-* 结构：
+ * 那边是深色玻璃，这里是浅色列表，行样式对齐听写记录。
+ */
+.memo-item {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.memo-item:hover {
+  border-color: #e5e6e1;
+  background: #f7f8f5;
+}
+
+/*
+ * 挑中待办的行。左侧一条竖线 + 浅底，和听写记录里「正在看的那条」同一套色，
+ * 但多一条竖线——批量挑选需要比「当前项」更明确的已选反馈。
+ */
+.memo-item.selected {
+  border-color: #cfe7df;
+  background: #f3faf7;
+}
+
+.memo-item.selected::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 3px;
+  height: 56%;
+  transform: translateY(-50%);
+  border-radius: 0 3px 3px 0;
+  background: var(--mint-dark);
+}
+
+.memo-checkbox {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  margin-top: 2px;
+  display: grid;
+  place-items: center;
+  border: 1.4px solid #c3c6bd;
+  /* 方形（圆角）才读作「完成」；圆形会被当成选择框，和批量挑选抢语义。 */
+  border-radius: 4px;
+  background: transparent;
+  color: #fff;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.memo-checkbox:hover {
+  border-color: var(--mint-dark);
+}
+
+.memo-item.completed .memo-checkbox {
+  border-color: var(--mint-dark);
+  background: var(--mint-dark);
+}
+
+.memo-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.memo-text {
+  color: var(--text);
+  font-size: var(--history-text-size);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.memo-item.completed .memo-text {
+  color: var(--text-2);
+  text-decoration: line-through;
+  opacity: 0.72;
+}
+
+.memo-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-2);
+  font-size: var(--history-meta-size);
+}
+
+/* 只有非语音来源才挂标记：默认态不标注，抄来的内容一眼可见。 */
+.memo-source {
+  display: inline-flex;
+  align-items: center;
+  opacity: 0.75;
+}
+
+.memo-source svg {
+  width: 11px;
+  height: 11px;
+}
+
+.memo-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.memo-item:hover .memo-actions {
+  opacity: 1;
+}
+
+.memo-action-btn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+
+.memo-action-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.memo-action-btn.delete-action:hover {
+  background: rgba(194, 61, 61, 0.1);
+  color: var(--danger);
+}
+
+.completed-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 12px 12px 6px;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  font-size: var(--history-meta-size);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-align: left;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.completed-toggle:hover {
+  color: var(--text);
+}
+
+.completed-toggle .chevron {
+  flex-shrink: 0;
+  transition: transform 0.16s ease;
+}
+
+.completed-toggle.open .chevron {
+  transform: rotate(90deg);
+}
+
+.copy-toast {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: rgba(23, 23, 26, 0.92);
+  color: #f3f5f7;
+  font-size: 11px;
+  font-weight: 500;
+  pointer-events: none;
+}
+
+/* 撤销条挂在 body 上，浮在列表之上，几秒后自己消失。 */
+.undo-bar {
+  position: fixed;
+  left: 50%;
+  /* 抬到应用级提示（.app-toast，同样是底部居中的胶囊）上方，两者重叠会糊成一团。 */
+  bottom: 76px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--card);
+  box-shadow: 0 10px 28px rgba(23, 23, 26, 0.16);
+  color: var(--text-2);
+  font-size: 12.5px;
+  /* 低于设置弹窗的遮罩（60）：弹窗打开时撤销条让位，不浮在设置上面。 */
+  z-index: 50;
+}
+
+.undo-bar button {
+  padding: 4px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: var(--dark);
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.undo-bar button:hover {
+  opacity: 0.85;
+}

@@ -212,7 +212,7 @@ function renderStatus(state: UiState) {
   if (activeNotice) status.textContent = activeNotice;
   else if (state.sessionPinned) {
     if (state.phase === "finalizing") status.textContent = "正在收入待办…";
-    else status.textContent = "正在听写 · 待办备忘";
+    else status.textContent = "正在听写 · 待办事项";
   }
   else if (state.phase === "starting") status.textContent = "启动录音中";
   else if (state.phase === "connecting") status.textContent = "连接中";
@@ -458,7 +458,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         renderStatus(lastState);
       } else {
         const status = statusEl();
-        if (status) status.textContent = isPinned ? "正在听写 · 待办备忘" : "正在听写";
+        if (status) status.textContent = isPinned ? "正在听写 · 待办事项" : "正在听写";
       }
     } catch (err) {
       console.error("toggle session pin failed", err);

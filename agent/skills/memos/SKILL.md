@@ -1,9 +1,9 @@
 ---
 name: jackvoice-memos
-description: 读取本机 JackVoice 待办备忘——用户说出来的、面板里手打的、从剪贴板收进来的都在一起。用户问「我还有什么没做」「待办里有什么」时用。只读，不改待办。
+description: 读取本机 JackVoice 待办事项——用户说出来的、面板里手打的、从剪贴板收进来的都在一起。用户问「我还有什么没做」「待办里有什么」时用。只读，不改待办。
 ---
 
-# JackVoice 待办备忘
+# JackVoice 待办事项
 
 用户没有点名 JackVoice、待办或备忘时，不要调用下面的工具。
 

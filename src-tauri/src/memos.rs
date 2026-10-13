@@ -167,6 +167,38 @@ pub fn delete_memo(app: &AppHandle, id: &str) -> Result<Vec<MemoItem>, String> {
     Ok(memos)
 }
 
+/// 撤销删除：把整条待办按原时间戳插回列表原位。
+///
+/// 删除不可恢复，误触代价太高。前端在删除后留一份数据，撤销时原样送回来；
+/// createdAtMs 不变，所以位置也回到原处，而不是跑到列表最前面。
+pub fn restore_memo(app: &AppHandle, memo: MemoItem) -> Result<Vec<MemoItem>, String> {
+    let state = app.state::<crate::session::AppState>();
+    let dir = state.data_dir();
+    // 文本和来源都过一遍规范化：这条数据在前端绕了一圈，不能默认它没被动过。
+    let memo = MemoItem {
+        text: normalize_memo_text(&memo.text)?,
+        source: normalize_source(&memo.source),
+        ..memo
+    };
+    let memos = with_memos_lock(|| {
+        let mut memos = load_memos(&dir);
+        // 已经在了就算成功：连点两次撤销不会插出重复条目。
+        if !memos.iter().any(|m| m.id == memo.id) {
+            memos.push(memo.clone());
+            memos.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+            save_memos(&dir, &memos)?;
+        }
+        Ok(memos)
+    })?;
+    let _ = app.emit(MEMOS_CHANGED_EVENT, &memos);
+    refresh_tray_badge(app, &memos);
+    Ok(memos)
+}
+
+/// 清空已完成。
+///
+/// 界面当前不暴露这个入口：已完成的条目按「做过的事」归档处理，默认永久保留。
+/// 能力留着，是因为将来若要给归档区一个显式的清空动作，不必重写一遍。
 pub fn clear_completed_memos(app: &AppHandle) -> Result<Vec<MemoItem>, String> {
     let state = app.state::<crate::session::AppState>();
     let dir = state.data_dir();
