@@ -38,6 +38,7 @@ cpal = "0.16"
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 anyhow = "1"
+async-trait = "0.1"
 parking_lot = "0.12"
 fs2 = "0.4"
 chrono = { version = "0.4", features = ["clock", "serde"] }
@@ -47,6 +48,7 @@ base64 = "0.22"
 webrtc-audio-processing = { version = "~2.1", features = ["bundled"] }
 keyring = "4.1.6"
 jackvoice-agent-bridge = { path = "crates/jackvoice-agent-bridge" }
+ve-tos-rust-sdk = { version = "2.9.20", features = ["asynchronous", "tokio-runtime"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"

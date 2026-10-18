@@ -59,6 +59,20 @@ type ReplacementRule = {
   to: string;
 };
 
+type TosSyncStatus = {
+  hasCredentials: boolean;
+  bucket: string;
+  key: string;
+  hotwordCount: number;
+  replacementCount: number;
+};
+
+type TosSyncSummary = {
+  hotwordCount: number;
+  replacementCount: number;
+  updatedAt: string;
+};
+
 type HistoryRecord = {
   id: string;
   finishedAtMs: number;
@@ -2688,6 +2702,83 @@ function bindHome() {
   });
 }
 
+async function refreshTosSyncStatus() {
+  const statusEl = $("#tos-sync-status");
+  const keyInput = $("#tos-access-key") as HTMLInputElement | null;
+  const secretInput = $("#tos-secret-key") as HTMLInputElement | null;
+  try {
+    const status = await invoke<TosSyncStatus>("get_tos_sync_status");
+    if (statusEl) {
+      statusEl.textContent = status.hasCredentials
+        ? `已配置 · ${status.hotwordCount} 热词 / ${status.replacementCount} 替换词`
+        : "未配置";
+    }
+    if (keyInput) {
+      keyInput.value = "";
+      keyInput.placeholder = status.hasCredentials
+        ? "已配置；重新填写可替换"
+        : "AKLT...";
+    }
+    if (secretInput) {
+      secretInput.value = "";
+      secretInput.placeholder = status.hasCredentials
+        ? "已配置；重新填写可替换"
+        : "只在保存时写入本机";
+    }
+  } catch (error) {
+    console.error("load tos sync status failed", error);
+    if (statusEl) statusEl.textContent = "读取失败";
+  }
+}
+
+async function saveTosCredentials() {
+  const keyInput = $("#tos-access-key") as HTMLInputElement | null;
+  const secretInput = $("#tos-secret-key") as HTMLInputElement | null;
+  const accessKeyId = keyInput?.value.trim() ?? "";
+  const secretAccessKey = secretInput?.value.trim() ?? "";
+  if (!accessKeyId || !secretAccessKey) {
+    showToast("AccessKey ID 和 SecretKey 都要填写。", "error");
+    return;
+  }
+  try {
+    await invoke("save_tos_credentials", { accessKeyId, secretAccessKey });
+    await refreshTosSyncStatus();
+    showToast("TOS 凭据已保存。", "success");
+  } catch (error) {
+    showToast(`保存失败：${error instanceof Error ? error.message : String(error)}`, "error");
+  }
+}
+
+async function pullFromTos() {
+  if (!window.confirm("会用 TOS 里的 glossary.json 覆盖本机热词和替换词，继续？")) return;
+  try {
+    const result = await invoke<TosSyncSummary>("pull_glossary_from_tos");
+    await Promise.all([refreshHotwords(), refreshReplacements(), refreshTosSyncStatus()]);
+    await invoke("sync_volc_hotword_table").catch(() => undefined);
+    showToast(
+      `已拉取 ${result.hotwordCount} 条热词、${result.replacementCount} 条替换词。`,
+      "success",
+    );
+  } catch (error) {
+    showToast(`拉取失败：${error instanceof Error ? error.message : String(error)}`, "error");
+  }
+}
+
+async function pushToTos() {
+  if (!window.confirm("会用本机词库覆盖 TOS 里的 glossary.json，继续？")) return;
+  try {
+    const result = await invoke<TosSyncSummary>("push_glossary_to_tos");
+    await refreshTosSyncStatus();
+    await invoke("sync_volc_hotword_table").catch(() => undefined);
+    showToast(
+      `已推送 ${result.hotwordCount} 条热词、${result.replacementCount} 条替换词。`,
+      "success",
+    );
+  } catch (error) {
+    showToast(`推送失败：${error instanceof Error ? error.message : String(error)}`, "error");
+  }
+}
+
 function bindDict() {
   $("#hotwords-input")?.addEventListener("input", syncEditorButtons);
   $("#hotwords-save")?.addEventListener("click", () => void saveHotwordsFromEditor());
@@ -2728,6 +2819,9 @@ function bindDict() {
       input.value = "";
     }
   });
+  $("#tos-save")?.addEventListener("click", () => void saveTosCredentials());
+  $("#tos-pull")?.addEventListener("click", () => void pullFromTos());
+  $("#tos-push")?.addEventListener("click", () => void pushToTos());
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
@@ -2751,7 +2845,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   await initTodos();
 
   await refreshState();
-  await Promise.all([refreshHistory(), refreshHotwords(), refreshReplacements()]);
+  await Promise.all([
+    refreshHistory(),
+    refreshHotwords(),
+    refreshReplacements(),
+    refreshTosSyncStatus(),
+  ]);
 
   await listen<UiState>("jackvoice://state", (event) => applyState(event.payload));
   await listen<number>("jackvoice://level", (event) => {

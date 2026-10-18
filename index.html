@@ -100,6 +100,36 @@
             </div>
           </header>
 
+          <section class="dict-panel" id="panel-tos-sync" style="grid-column: 1 / -1; margin-bottom: 16px">
+            <div class="dict-panel-head">
+              <div>
+                <h2 class="dict-panel-title">云同步</h2>
+                <p class="dict-panel-desc">手机和这台 Mac 共用火山 TOS 里的 glossary.json；热词和替换词一起同步。</p>
+              </div>
+              <div class="dict-panel-actions">
+                <span id="tos-sync-status" class="dict-count">未配置</span>
+              </div>
+            </div>
+            <div class="replacement-fields" style="grid-template-columns: 1fr 1fr">
+              <label class="replacement-field" for="tos-access-key">
+                <span>AccessKey ID</span>
+                <input id="tos-access-key" type="text" autocomplete="off" placeholder="AKLT..." />
+              </label>
+              <label class="replacement-field" for="tos-secret-key">
+                <span>SecretKey</span>
+                <input id="tos-secret-key" type="password" autocomplete="off" placeholder="只在保存时写入本机" />
+              </label>
+            </div>
+            <div class="replacement-form-foot">
+              <span id="tos-sync-message"></span>
+              <div class="dict-panel-actions">
+                <button id="tos-save" class="btn ghost" type="button">保存凭据</button>
+                <button id="tos-pull" class="btn ghost" type="button">从 TOS 拉取</button>
+                <button id="tos-push" class="btn dark" type="button">推送到 TOS</button>
+              </div>
+            </div>
+          </section>
+
           <div class="dict-panels">
             <!-- 热词 -->
             <section class="dict-panel" id="panel-hotwords">
