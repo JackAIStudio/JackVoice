@@ -65,11 +65,26 @@ type TosSyncStatus = {
   key: string;
   hotwordCount: number;
   replacementCount: number;
+  lastSyncedAt?: string | null;
+  localChangedAt?: string | null;
+  lastError?: string | null;
+  lastConflicts: number;
 };
 
 type TosSyncSummary = {
   hotwordCount: number;
   replacementCount: number;
+  updatedAt: string;
+};
+
+type TosSyncReport = {
+  hotwordCount: number;
+  replacementCount: number;
+  pulled: boolean;
+  pushed: boolean;
+  conflicts: number;
+  hotwordsChanged: boolean;
+  syncedAt: string;
   updatedAt: string;
 };
 
@@ -124,6 +139,9 @@ let hotwords: string[] = [];
 let hotwordFilter = "";
 let replacements: ReplacementRule[] = [];
 let replacementFilter = "";
+let glossarySyncInFlight = false;
+let glossarySyncQueued = false;
+let glossarySyncTimer: number | undefined;
 let editingReplacementSource: string | null = null;
 let recordingShortcut: ShortcutTarget | null = null;
 let historyRecords: HistoryRecord[] = [];
@@ -620,7 +638,7 @@ function applyState(state: UiState) {
     syncBtn.classList.toggle("hidden", !canSync);
     syncBtn.disabled = !canSync;
     syncBtn.title = canSync
-      ? "手动同步热词表到云端（替换词仅本地）"
+      ? "把本地热词整体覆盖到火山识别热词表（不影响手机/Mac 词库同步）"
       : "需要先连接豆包语音并配置云端热词表";
   }
 
@@ -1451,7 +1469,11 @@ async function persistHotwords(
   }
   if (result.syncError) {
     console.warn("auto sync volc hotwords failed:", result.syncError);
+    if (result.words.length === 0) {
+      showToast("热词已清空；火山热词表不支持空表，云端旧表未清空。", "error");
+    }
   }
+  scheduleGlossarySync();
   return result;
 }
 
@@ -1485,12 +1507,12 @@ async function syncVolcHotwordTable() {
     if (result.synced) {
       const state = await invoke<UiState>("get_state");
       applyState(state);
-      window.alert(result.message || "已同步到云端。");
+      window.alert(result.message || "已同步到火山识别热词表。");
       return;
     }
     const state = await invoke<UiState>("sync_volc_hotword_table");
     applyState(state);
-    window.alert(state.status || "已同步到云端。");
+    window.alert(state.status || "已同步到火山识别热词表。");
   } catch (error) {
     console.error("sync volc hotword table failed", error);
     window.alert(`同步失败：${error}`);
@@ -1721,6 +1743,7 @@ async function persistReplacements(rules: ReplacementRule[]) {
   if (result.syncError) {
     console.warn("auto sync replacements failed:", result.syncError);
   }
+  scheduleGlossarySync();
   return result;
 }
 
@@ -2702,25 +2725,42 @@ function bindHome() {
   });
 }
 
+function relativeSyncTime(raw?: string | null): string {
+  if (!raw) return "";
+  const time = Date.parse(raw);
+  if (!Number.isFinite(time)) return "";
+  const diff = Math.max(0, Date.now() - time);
+  if (diff < 60_000) return "刚刚";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+  return `${Math.floor(diff / 86_400_000)} 天前`;
+}
+
+function tosStatusText(status: TosSyncStatus): string {
+  const counts = `${status.hotwordCount} 热词 / ${status.replacementCount} 替换词`;
+  if (!status.hasCredentials) return "未配置";
+  if (status.lastError) return `同步失败 · ${status.lastError.slice(0, 36)}`;
+  const localChanged = !!status.localChangedAt &&
+    (!status.lastSyncedAt || Date.parse(status.localChangedAt) > Date.parse(status.lastSyncedAt));
+  if (localChanged) return `有未同步改动 · ${counts}`;
+  if (!status.lastSyncedAt) return `等待首次同步 · ${counts}`;
+  const base = `已同步 · ${relativeSyncTime(status.lastSyncedAt)} · ${counts}`;
+  return status.lastConflicts > 0 ? `${base} · 合并 ${status.lastConflicts} 条冲突` : base;
+}
+
 async function refreshTosSyncStatus() {
   const statusEl = $("#tos-sync-status");
   const keyInput = $("#tos-access-key") as HTMLInputElement | null;
   const secretInput = $("#tos-secret-key") as HTMLInputElement | null;
   try {
     const status = await invoke<TosSyncStatus>("get_tos_sync_status");
-    if (statusEl) {
-      statusEl.textContent = status.hasCredentials
-        ? `已配置 · ${status.hotwordCount} 热词 / ${status.replacementCount} 替换词`
-        : "未配置";
-    }
+    if (statusEl) statusEl.textContent = tosStatusText(status);
     if (keyInput) {
-      keyInput.value = "";
       keyInput.placeholder = status.hasCredentials
         ? "已配置；重新填写可替换"
         : "AKLT...";
     }
     if (secretInput) {
-      secretInput.value = "";
       secretInput.placeholder = status.hasCredentials
         ? "已配置；重新填写可替换"
         : "只在保存时写入本机";
@@ -2729,6 +2769,54 @@ async function refreshTosSyncStatus() {
     console.error("load tos sync status failed", error);
     if (statusEl) statusEl.textContent = "读取失败";
   }
+}
+
+async function syncGlossaryQuietly(manual = false) {
+  if (glossarySyncInFlight) {
+    glossarySyncQueued = true;
+    return;
+  }
+  glossarySyncInFlight = true;
+  try {
+    const status = await invoke<TosSyncStatus>("get_tos_sync_status");
+    if (!status.hasCredentials) {
+      if (manual) showToast("先填写 TOS AccessKey 和 SecretKey。", "error");
+      return;
+    }
+    const report = await invoke<TosSyncReport>("sync_glossary");
+    if (report.pulled || report.pushed) {
+      await Promise.all([refreshHotwords(), refreshReplacements()]);
+    }
+    await refreshTosSyncStatus();
+    if (manual) {
+      const extra = report.conflicts > 0 ? `，合并了 ${report.conflicts} 条冲突` : "";
+      showToast(
+        `已同步 ${report.hotwordCount} 条热词、${report.replacementCount} 条替换词${extra}。`,
+        "success",
+      );
+    }
+  } catch (error) {
+    if (manual) {
+      showToast(`同步失败：${error instanceof Error ? error.message : String(error)}`, "error");
+    } else {
+      console.warn("auto glossary sync failed", error);
+    }
+    await refreshTosSyncStatus().catch(() => undefined);
+  } finally {
+    glossarySyncInFlight = false;
+    if (glossarySyncQueued) {
+      glossarySyncQueued = false;
+      void syncGlossaryQuietly(false);
+    }
+  }
+}
+
+function scheduleGlossarySync(delayMs = 800) {
+  if (glossarySyncTimer !== undefined) window.clearTimeout(glossarySyncTimer);
+  glossarySyncTimer = window.setTimeout(() => {
+    glossarySyncTimer = undefined;
+    void syncGlossaryQuietly(false);
+  }, delayMs);
 }
 
 async function saveTosCredentials() {
@@ -2742,8 +2830,11 @@ async function saveTosCredentials() {
   }
   try {
     await invoke("save_tos_credentials", { accessKeyId, secretAccessKey });
+    if (keyInput) keyInput.value = "";
+    if (secretInput) secretInput.value = "";
     await refreshTosSyncStatus();
     showToast("TOS 凭据已保存。", "success");
+    scheduleGlossarySync(300);
   } catch (error) {
     showToast(`保存失败：${error instanceof Error ? error.message : String(error)}`, "error");
   }
@@ -2754,7 +2845,6 @@ async function pullFromTos() {
   try {
     const result = await invoke<TosSyncSummary>("pull_glossary_from_tos");
     await Promise.all([refreshHotwords(), refreshReplacements(), refreshTosSyncStatus()]);
-    await invoke("sync_volc_hotword_table").catch(() => undefined);
     showToast(
       `已拉取 ${result.hotwordCount} 条热词、${result.replacementCount} 条替换词。`,
       "success",
@@ -2769,7 +2859,6 @@ async function pushToTos() {
   try {
     const result = await invoke<TosSyncSummary>("push_glossary_to_tos");
     await refreshTosSyncStatus();
-    await invoke("sync_volc_hotword_table").catch(() => undefined);
     showToast(
       `已推送 ${result.hotwordCount} 条热词、${result.replacementCount} 条替换词。`,
       "success",
@@ -2820,6 +2909,7 @@ function bindDict() {
     }
   });
   $("#tos-save")?.addEventListener("click", () => void saveTosCredentials());
+  $("#tos-sync-now")?.addEventListener("click", () => void syncGlossaryQuietly(true));
   $("#tos-pull")?.addEventListener("click", () => void pullFromTos());
   $("#tos-push")?.addEventListener("click", () => void pushToTos());
 }
@@ -2851,6 +2941,14 @@ window.addEventListener("DOMContentLoaded", async () => {
     refreshReplacements(),
     refreshTosSyncStatus(),
   ]);
+  void syncGlossaryQuietly(false);
+  window.addEventListener("focus", () => scheduleGlossarySync(0));
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) scheduleGlossarySync(0);
+  });
+  window.setInterval(() => {
+    if (!document.hidden) scheduleGlossarySync(0);
+  }, 60_000);
 
   await listen<UiState>("jackvoice://state", (event) => applyState(event.payload));
   await listen<number>("jackvoice://level", (event) => {

@@ -96,7 +96,7 @@
               <span class="page-sub">热词负责听准；替换词负责把结果改成你想要的写法</span>
             </div>
             <div class="dict-actions">
-              <button id="hotwords-sync-volc" class="btn ghost hidden" type="button">同步云端</button>
+              <button id="hotwords-sync-volc" class="btn ghost hidden" type="button">同步识别热词表</button>
             </div>
           </header>
 
@@ -104,7 +104,7 @@
             <div class="dict-panel-head">
               <div>
                 <h2 class="dict-panel-title">云同步</h2>
-                <p class="dict-panel-desc">手机和这台 Mac 共用火山 TOS 里的 glossary.json；热词和替换词一起同步。</p>
+                <p class="dict-panel-desc">手机和这台 Mac 共用火山 TOS 里的 glossary.json；热词和替换词一起同步。打开时自动拉取，改动后自动推送。</p>
               </div>
               <div class="dict-panel-actions">
                 <span id="tos-sync-status" class="dict-count">未配置</span>
@@ -124,8 +124,9 @@
               <span id="tos-sync-message"></span>
               <div class="dict-panel-actions">
                 <button id="tos-save" class="btn ghost" type="button">保存凭据</button>
+                <button id="tos-sync-now" class="btn dark" type="button">立即同步</button>
                 <button id="tos-pull" class="btn ghost" type="button">从 TOS 拉取</button>
-                <button id="tos-push" class="btn dark" type="button">推送到 TOS</button>
+                <button id="tos-push" class="btn ghost" type="button">推送到 TOS</button>
               </div>
             </div>
           </section>

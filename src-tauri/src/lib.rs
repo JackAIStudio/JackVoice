@@ -189,7 +189,7 @@ async fn save_replacements(
 
 #[tauri::command]
 fn get_tos_sync_status(state: tauri::State<'_, AppState>) -> tos_sync::TosSyncStatus {
-    tos_sync::status(&state.data_dir())
+    state.glossary_sync_status()
 }
 
 #[tauri::command]
@@ -205,16 +205,21 @@ fn save_tos_credentials(
 async fn pull_glossary_from_tos(
     state: tauri::State<'_, AppState>,
 ) -> Result<tos_sync::SyncSummary, String> {
-    let dir = state.data_dir();
-    tos_sync::pull(&dir).await
+    state.force_pull_glossary().await
 }
 
 #[tauri::command]
 async fn push_glossary_to_tos(
     state: tauri::State<'_, AppState>,
 ) -> Result<tos_sync::SyncSummary, String> {
-    let dir = state.data_dir();
-    tos_sync::push(&dir).await
+    state.force_push_glossary().await
+}
+
+#[tauri::command]
+async fn sync_glossary(
+    state: tauri::State<'_, AppState>,
+) -> Result<tos_sync::SyncReport, String> {
+    state.sync_glossary().await
 }
 
 /// 把本地词典同步到当前配置的火山热词表（整表覆盖，权重统一 10）。
@@ -874,6 +879,7 @@ pub fn run() {
             save_tos_credentials,
             pull_glossary_from_tos,
             push_glossary_to_tos,
+            sync_glossary,
             sync_volc_hotword_table,
             update_shortcut,
             update_capture_shortcut,

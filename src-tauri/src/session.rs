@@ -218,6 +218,8 @@ pub struct AppState {
     retrying_records: Mutex<HashSet<String>>,
     /// File transcription shares one ASR connection at a time.
     retry_gate: tokio::sync::Mutex<()>,
+    /// Serializes TOS glossary sync so a focus refresh cannot race a save-triggered sync.
+    glossary_sync_gate: tokio::sync::Mutex<()>,
     /// Bumped whenever a dictation session starts, so a scheduled
     /// "hide the error capsule" task never hides a newer session's capsule.
     session_epoch: AtomicU64,
@@ -314,6 +316,7 @@ impl AppState {
             retry_in_flight: AtomicBool::new(false),
             retrying_records: Mutex::new(HashSet::new()),
             retry_gate: tokio::sync::Mutex::new(()),
+            glossary_sync_gate: tokio::sync::Mutex::new(()),
             session_epoch: AtomicU64::new(0),
             session_pinned: AtomicBool::new(false),
         })
@@ -766,7 +769,13 @@ impl AppState {
         words: Vec<String>,
     ) -> Result<SaveHotwordsResult, String> {
         let cleaned = crate::hotwords::sanitize(&words);
+        let previous = crate::hotwords::sanitize(&crate::hotwords::load(&self.shared_data_dir));
         crate::hotwords::save(&self.shared_data_dir, &cleaned)?;
+        if previous != cleaned {
+            if let Err(error) = crate::tos_sync::mark_local_change(&self.shared_data_dir) {
+                eprintln!("[glossary-sync] 记录本地改动失败：{error}");
+            }
+        }
 
         let settings = self.settings.lock().clone();
         let should_sync = !settings.volc_api_key.trim().is_empty()
@@ -868,7 +877,15 @@ impl AppState {
         rules: Vec<crate::hotwords::ReplacementRule>,
     ) -> Result<SaveHotwordsResult, String> {
         let cleaned = crate::hotwords::sanitize_replacements(&rules);
+        let previous = crate::hotwords::sanitize_replacements(&crate::hotwords::load_replacements(
+            &self.shared_data_dir,
+        ));
         crate::hotwords::save_replacements(&self.shared_data_dir, &cleaned)?;
+        if previous != cleaned {
+            if let Err(error) = crate::tos_sync::mark_local_change(&self.shared_data_dir) {
+                eprintln!("[glossary-sync] 记录本地改动失败：{error}");
+            }
+        }
 
         let message = format!("替换词已保存（{} 条）；听写时本地生效。", cleaned.len());
         let mut ui = self.ui.lock();
@@ -946,6 +963,40 @@ impl AppState {
         apply_settings_to_ui(&mut ui, &settings);
         ui.status = format!("已同步：{}", parts.join("；"));
         Ok(ui.clone())
+    }
+
+    /// 手机 ↔ Mac 的词库自动同步。TOS 是整份快照，合并逻辑在 tos_sync 里。
+    pub async fn sync_glossary(&self) -> Result<crate::tos_sync::SyncReport, String> {
+        let _guard = self.glossary_sync_gate.lock().await;
+        let report = crate::tos_sync::sync(&self.shared_data_dir).await?;
+        if report.hotwords_changed {
+            if let Err(error) = self.sync_volc_hotword_table().await {
+                eprintln!("[glossary-sync] 热词表同步失败：{error}");
+            }
+        }
+        Ok(report)
+    }
+
+    pub async fn force_pull_glossary(&self) -> Result<crate::tos_sync::SyncSummary, String> {
+        let _guard = self.glossary_sync_gate.lock().await;
+        let summary = crate::tos_sync::force_pull(&self.shared_data_dir).await?;
+        if let Err(error) = self.sync_volc_hotword_table().await {
+            eprintln!("[glossary-sync] 热词表同步失败：{error}");
+        }
+        Ok(summary)
+    }
+
+    pub async fn force_push_glossary(&self) -> Result<crate::tos_sync::SyncSummary, String> {
+        let _guard = self.glossary_sync_gate.lock().await;
+        let summary = crate::tos_sync::force_push(&self.shared_data_dir).await?;
+        if let Err(error) = self.sync_volc_hotword_table().await {
+            eprintln!("[glossary-sync] 热词表同步失败：{error}");
+        }
+        Ok(summary)
+    }
+
+    pub fn glossary_sync_status(&self) -> crate::tos_sync::TosSyncStatus {
+        crate::tos_sync::status(&self.shared_data_dir)
     }
 
     pub fn set_input_gain(&self, gain_db: f32) -> Result<UiState, String> {
