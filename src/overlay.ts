@@ -433,7 +433,19 @@ async function persistPosition() {
   }
 }
 
+/**
+ * 胶囊自己会把 JackVoice 激活到前台，macOS 随后补发一个 Reopen（相当于
+ * 点了程序坞图标）。把「刚刚是胶囊被点」这件事告诉后端，它才只吞掉紧跟着
+ * 的那一次 Reopen，而不是把所有 Dock 点击都当成自己人。
+ */
+function noteInteraction() {
+  void invoke("note_overlay_interaction").catch(() => {
+    // 记录失败不影响胶囊功能。
+  });
+}
+
 window.addEventListener("DOMContentLoaded", async () => {
+  document.querySelector("#capsule")?.addEventListener("mousedown", noteInteraction, true);
   document.querySelector("#cancel-btn")?.addEventListener("click", (e) => {
     e.stopPropagation();
     if (resultActive) {

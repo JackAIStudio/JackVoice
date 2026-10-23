@@ -12,23 +12,52 @@ const SHORTCUT_MODIFIER_MASK: u64 =
 #[cfg(target_os = "macos")]
 static FN_SHORTCUT_MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
 
+/// 录制状态自带过期时间：用户点了“录制快捷键”然后直接关掉设置窗口时，
+/// 前端不会再调 `cancel_shortcut_recording`。没有超时的话，全系统 tap 会
+/// 一直把 Fn 组合吞掉，用户只会觉得“键盘坏了”。
+const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Default)]
 pub struct ShortcutCaptureState {
     recording: AtomicBool,
+    /// 开始录制的时刻（毫秒，0 表示未录制）。用原子值而不是锁：这个判定
+    /// 跑在系统级键盘 tap 的回调里，每按一次键都会经过。
+    started_at_ms: std::sync::atomic::AtomicU64,
 }
 
 impl ShortcutCaptureState {
     pub fn start(&self) {
+        self.started_at_ms
+            .store(elapsed_ms_since_epoch(), Ordering::Release);
         self.recording.store(true, Ordering::Release);
     }
 
     pub fn stop(&self) {
         self.recording.store(false, Ordering::Release);
+        self.started_at_ms.store(0, Ordering::Release);
     }
 
     fn is_recording(&self) -> bool {
-        self.recording.load(Ordering::Acquire)
+        if !self.recording.load(Ordering::Acquire) {
+            return false;
+        }
+        let started_at_ms = self.started_at_ms.load(Ordering::Acquire);
+        let expired = started_at_ms != 0
+            && elapsed_ms_since_epoch().saturating_sub(started_at_ms)
+                >= CAPTURE_TIMEOUT.as_millis() as u64;
+        if expired {
+            self.stop();
+            return false;
+        }
+        true
     }
+}
+
+fn elapsed_ms_since_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Serialize)]
@@ -53,8 +82,13 @@ pub fn uses_fn_modifier(accelerator: &str) -> bool {
 pub fn should_install_fn_monitor_at_startup(
     onboarding_completed: bool,
     accessibility_trusted: bool,
+    configured_shortcut: &str,
 ) -> bool {
-    onboarding_completed && accessibility_trusted
+    // 只有真的配置了 Fn 组合才需要这个全系统键盘 tap。为普通快捷键
+    // （Alt+Space 等）常驻一个 active event tap，等于让每一次按键都绕一圈
+    // 我们的回调；tap 一旦超时被系统停用，键序就会错乱，用户看到的是
+    // “空格键突然没用了”。
+    onboarding_completed && accessibility_trusted && uses_fn_modifier(configured_shortcut)
 }
 
 pub fn validate_fn_shortcut(accelerator: &str) -> Result<(), String> {
@@ -364,8 +398,12 @@ pub fn install_fn_shortcut_monitor(app: AppHandle) {
                                     let _ = state.toggle(toggle_app.clone()).await;
                                 }
                             });
+                            // 只吞 keyDown：把 keyUp 也吞掉会让系统认为这个键
+                            // 一直没有松开（tap 中途被停用时尤其明显），
+                            // 之后按空格、方向键都会表现异常。
+                            return CallbackResult::Drop;
                         }
-                        CallbackResult::Drop
+                        CallbackResult::Keep
                     },
                     || {
                         waiting_for_permission_logged = false;
@@ -455,9 +493,47 @@ mod tests {
 
     #[test]
     fn native_monitor_never_starts_before_onboarding_or_permission() {
-        assert!(!should_install_fn_monitor_at_startup(false, false));
-        assert!(!should_install_fn_monitor_at_startup(false, true));
-        assert!(!should_install_fn_monitor_at_startup(true, false));
-        assert!(should_install_fn_monitor_at_startup(true, true));
+        assert!(!should_install_fn_monitor_at_startup(
+            false, false, "Fn+Space"
+        ));
+        assert!(!should_install_fn_monitor_at_startup(
+            false, true, "Fn+Space"
+        ));
+        assert!(!should_install_fn_monitor_at_startup(
+            true, false, "Fn+Space"
+        ));
+        assert!(should_install_fn_monitor_at_startup(true, true, "Fn+Space"));
+    }
+
+    /// 普通快捷键不需要全系统键盘 tap：常驻一个 active tap 会让每次按键
+    /// 都多绕一圈回调，tap 被系统停用后键序会错乱。
+    #[test]
+    fn plain_shortcuts_do_not_install_the_system_wide_tap() {
+        assert!(!should_install_fn_monitor_at_startup(
+            true,
+            true,
+            "Alt+Space"
+        ));
+        assert!(!should_install_fn_monitor_at_startup(
+            true,
+            true,
+            "CommandOrControl+Shift+K"
+        ));
+        assert!(should_install_fn_monitor_at_startup(true, true, "Fn+K"));
+    }
+
+    /// 录制状态必须自己过期，否则关掉设置窗口后 tap 会一直吞 Fn 组合。
+    #[test]
+    fn capture_state_expires_on_its_own() {
+        let state = ShortcutCaptureState::default();
+        state.start();
+        assert!(state.is_recording());
+        // 手动把开始时间推早，模拟超时。
+        state.started_at_ms.store(
+            elapsed_ms_since_epoch().saturating_sub(CAPTURE_TIMEOUT.as_millis() as u64 + 1_000),
+            Ordering::Release,
+        );
+        assert!(!state.is_recording());
+        assert!(!state.is_recording());
     }
 }

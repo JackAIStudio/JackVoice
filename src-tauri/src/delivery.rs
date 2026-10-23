@@ -2,7 +2,16 @@ use tauri::{AppHandle, Runtime};
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
-const CLIPBOARD_RESTORE_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+/// 临时写入的听写文字必须在目标应用真正读取之后再换回原剪贴板。
+/// Electron / 大段文本读取剪贴板可能晚于 500ms，恢复得太早会把听写文字
+/// 换成旧内容，表现为“光标在闪却粘贴不进去”。
+const CLIPBOARD_RESTORE_DELAY: std::time::Duration = std::time::Duration::from_millis(900);
+/// 用户按完 Option+Space 后可能还按着修饰键，此时合成的 Cmd+V 会变成
+/// ⌥⌘V，多数应用不会粘贴。等修饰键松开再发按键。
+const MODIFIER_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(900);
+/// 激活目标应用是异步的：必须等它真的回到前台再粘贴，否则 Cmd+V 会落到
+/// 别的应用（甚至 JackVoice 自己）。
+const FRONTMOST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(900);
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,10 +48,15 @@ pub(crate) fn choose_delivery_target<T>(
 
 /// Roles that represent a real text insertion point (native controls and
 /// Chromium-exposed web text fields).
-const TEXT_ROLES: &[&str] = &["AXTextField", "AXTextArea", "AXComboBox"];
+const TEXT_ROLES: &[&str] = &["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"];
 
 /// Roles that definitely represent non-text, read-only system or UI controls
 /// where Cmd+V paste makes no sense and should be skipped.
+///
+/// 这张表只能放「确定不是输入位置」的控件。窗口、滚动区、WebArea、Group 这类
+/// 容器角色必须排除：浏览器 contenteditable、Electron 自定义编辑器、笔记类
+/// 应用都会把真实光标报告成这些容器角色。把它们判成不可输入，就会出现
+/// 「光标明明在闪，JackVoice 却说不没检测到输入焦点」。
 const DEFINITELY_NON_TEXT_ROLES: &[&str] = &[
     "AXMenuBar",
     "AXMenuBarItem",
@@ -57,27 +71,42 @@ const DEFINITELY_NON_TEXT_ROLES: &[&str] = &[
     "AXProgressIndicator",
     "AXSlider",
     "AXColorWell",
+    "AXStaticText",
+];
+
+/// 容器 / 结构性角色：可能包着真实光标（网页 contenteditable、Electron 编辑器），
+/// 也可能只是窗口本身。没有别的证据时按 Unknown 处理，允许 best-effort 粘贴。
+const AMBIGUOUS_CONTAINER_ROLES: &[&str] = &[
+    "AXWindow",
+    "AXSheet",
+    "AXDrawer",
+    "AXScrollArea",
+    "AXWebArea",
+    "AXGroup",
     "AXToolbar",
     "AXTabGroup",
-    "AXStaticText",
     "AXTable",
     "AXList",
     "AXOutline",
-    "AXWindow",
-    "AXScrollArea",
-    "AXWebArea",
     "AXLink",
     "AXHeading",
     "AXCell",
     "AXRow",
     "AXColumn",
-    "AXGroup",
+    "AXUnknown",
+    "AXLayoutArea",
+    "AXLayoutItem",
 ];
 
-pub async fn deliver_text<R: Runtime>(
+/// 把文字投递到 `target_pid` 指向的应用（`None` 表示只按当前前台应用处理）。
+///
+/// 顺序很重要：先等用户松开 Option/Space，再确认目标应用真的回到前台，
+/// 最后才写剪贴板并合成 Cmd+V。任何一个环节提前，按键都会落到错误的应用。
+pub async fn deliver_text_to<R: Runtime>(
     app: &AppHandle<R>,
     text: &str,
     probe: InsertionProbe,
+    target_pid: Option<i32>,
 ) -> DeliveryResult {
     let text = text.trim();
     if text.is_empty() {
@@ -97,6 +126,18 @@ pub async fn deliver_text<R: Runtime>(
         };
     }
 
+    wait_for_shortcut_modifiers_released(MODIFIER_RELEASE_TIMEOUT).await;
+    if let Some(pid) = target_pid {
+        if !wait_until_frontmost(pid, FRONTMOST_TIMEOUT).await {
+            // 目标应用没有回到前台时粘贴必然落到别处，宁可让用户手动重试。
+            return DeliveryResult {
+                pasted: false,
+                copied: false,
+                message: "目标应用没有回到前台，本次未自动插入；可点击“重试”或手动复制。".into(),
+            };
+        }
+    }
+
     // Keep the insertion mechanism identical to the original working path:
     // write the transcript to the pasteboard and post Cmd+V. Clipboard
     // preservation is an outer transaction only; it must never replace the
@@ -106,7 +147,7 @@ pub async fn deliver_text<R: Runtime>(
     let owned_text = text.to_string();
     let prepared = run_on_main_thread(app, move || {
         let transaction = ClipboardTransaction::begin(&app_handle, &owned_text)?;
-        let paste_triggered = simulate_paste_main_thread();
+        let paste_triggered = simulate_paste();
         Ok::<_, String>((transaction, paste_triggered))
     })
     .await;
@@ -115,15 +156,33 @@ pub async fn deliver_text<R: Runtime>(
         Ok(Ok(value)) => value,
         Ok(Err(error)) | Err(error) => {
             eprintln!("[delivery] 无法建立透明剪贴板事务：{error}");
+            // 保留原剪贴板失败时也要让文字落地：退化成直接写入听写文字并粘贴，
+            // 用户至少拿得到结果，而不是既没粘贴又丢了剪贴板。
+            let fallback_text = text.to_string();
+            let app_handle = app.clone();
+            let fallback = run_on_main_thread(app, move || {
+                write_temporary_text_ignoring_previous(&app_handle, &fallback_text)
+            })
+            .await;
+            if fallback.is_err() {
+                return DeliveryResult {
+                    pasted: false,
+                    copied: false,
+                    message: "本次未自动粘贴，也无法写入剪贴板。听写文字仍可从历史记录找回。"
+                        .into(),
+                };
+            }
+            let paste_triggered = simulate_paste();
+            if paste_triggered {
+                tokio::time::sleep(CLIPBOARD_RESTORE_DELAY).await;
+            }
             return DeliveryResult {
-                pasted: false,
+                pasted: paste_triggered,
                 copied: false,
-                message: if error.contains("恢复原剪贴板也失败") {
-                    "本次未自动粘贴，但原剪贴板恢复失败。请立即检查剪贴板；听写文字仍可从历史记录找回。"
-                        .into()
+                message: if paste_triggered {
+                    "已插入到当前输入位置；原剪贴板未能保留，现在剪贴板里是本次听写文字。".into()
                 } else {
-                    "为避免覆盖原剪贴板，本次未自动粘贴。可重新选择输入位置后重试，或明确点击“复制”。"
-                        .into()
+                    "未能触发自动粘贴；听写文字已放入剪贴板，可直接粘贴。".into()
                 },
             };
         }
@@ -191,6 +250,69 @@ where
     })
     .map_err(|error| format!("无法切换到主线程：{error}"))?;
     rx.await.map_err(|_| "主线程任务意外结束".to_string())
+}
+
+/// 等用户把快捷键的修饰键都松开。Option 还按着时合成的 Cmd+V 会被目标
+/// 应用当成 ⌥⌘V（“粘贴并匹配样式”或直接无反应），这是“有时候粘不进去”
+/// 最常见的成因。
+async fn wait_for_shortcut_modifiers_released(timeout: std::time::Duration) {
+    #[cfg(target_os = "macos")]
+    {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if !macos_modifier_keys_down() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        eprintln!("[delivery] 修饰键在超时内没有松开，仍然尝试粘贴");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = timeout;
+    }
+}
+
+/// 等目标应用真正回到前台。激活是异步的，提前发 Cmd+V 会落进别的应用。
+async fn wait_until_frontmost(pid: i32, timeout: std::time::Duration) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if crate::overlay::frontmost_pid() == Some(pid) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (pid, timeout);
+        true
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_modifier_keys_down() -> bool {
+    const SHORTCUT_MODIFIER_MASK: u64 = 0x0002_0000 // shift
+        | 0x0004_0000 // control
+        | 0x0008_0000 // option
+        | 0x0010_0000 // command
+        | 0x0080_0000; // fn
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        /// `CGEventSourceFlagsState(CGEventSourceStateID)`，0 表示合并会话状态。
+        fn CGEventSourceFlagsState(state_id: i32) -> u64;
+    }
+
+    let flags = unsafe { CGEventSourceFlagsState(0) };
+    flags & SHORTCUT_MODIFIER_MASK != 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -611,8 +733,10 @@ pub fn probe_insertion_target(target: Option<&crate::overlay::FrontmostApp>) -> 
     #[cfg(target_os = "macos")]
     {
         let Some(target) = target else {
-            eprintln!("[delivery] no frontmost target app; treating as NotInsertable");
-            return InsertionProbe::NotInsertable;
+            // 没有可识别的目标应用时不要断言「不可输入」：胶囊可能刚抢过焦点，
+            // 而用户的光标其实还在原应用里。按 Unknown 放行 best-effort 粘贴。
+            eprintln!("[delivery] no frontmost target app; treating as Unknown");
+            return InsertionProbe::Unknown;
         };
 
         let selector = process_selector(Some(target));
@@ -620,6 +744,9 @@ pub fn probe_insertion_target(target: Option<&crate::overlay::FrontmostApp>) -> 
         // point. Chrome exposes a focused <textarea> as AXGroup, and some
         // Electron/web surfaces only expose AXWebArea — role alone is not
         // enough to tell a blinking caret from page-level focus.
+        //
+        // AXSelectedTextRange 是比 AXSelectedText 更可靠的「有光标」证据：
+        // 没有选中任何文字时 AXSelectedText 是空串，但 range 依然存在。
         let script = format!(
             concat!(
                 "tell application \"System Events\"\n",
@@ -641,7 +768,12 @@ pub fn probe_insertion_target(target: Option<&crate::overlay::FrontmostApp>) -> 
                 "\t\ttry\n",
                 "\t\t\tset ins to (value of attribute \"AXInsertionPointLineNumber\" of el) as string\n",
                 "\t\tend try\n",
-                "\t\treturn actualName & \"|\" & r & \"|\" & sel & \"|\" & ins\n",
+                "\t\tset rng to \"absent\"\n",
+                "\t\ttry\n",
+                "\t\t\tset rangeVal to value of attribute \"AXSelectedTextRange\" of el\n",
+                "\t\t\tif rangeVal is not missing value then set rng to \"present\"\n",
+                "\t\tend try\n",
+                "\t\treturn actualName & \"|\" & r & \"|\" & sel & \"|\" & ins & \"|\" & rng\n",
                 "\ton error\n",
                 "\t\treturn \"__error__\"\n",
                 "\tend try\n",
@@ -732,23 +864,21 @@ fn parse_probe_output(line: &str) -> InsertionProbe {
 
     if let Some((app_name, rest)) = line.split_once('|') {
         if rest == "__missing__" {
-            return if is_unsupported_ax_app(Some(app_name)) {
-                eprintln!(
-                    "[delivery] target app {app_name} returned __missing__ but is known unsupported AX app; treating as Unknown"
-                );
-                InsertionProbe::Unknown
-            } else {
-                eprintln!(
-                    "[delivery] target app {app_name} returned __missing__; treating as NotInsertable"
-                );
-                InsertionProbe::NotInsertable
-            };
+            // 「应用没有暴露 AXFocusedUIElement」不等于「没有光标」：
+            // 大量 Electron / 自绘 / 沙盒应用都拿不到焦点元素，但 Cmd+V
+            // 依然能落进它们自己的输入框。这里只能按 Unknown 处理，
+            // 真正确定不可粘贴的情况交给 classify_probe_line 的控件角色判断。
+            let known_unsupported = is_unsupported_ax_app(Some(app_name));
+            eprintln!(
+                "[delivery] target app {app_name} returned __missing__ (known unsupported AX app: {known_unsupported}); treating as Unknown"
+            );
+            return InsertionProbe::Unknown;
         }
         return classify_probe_line(app_name, rest);
     }
 
     match line {
-        "__missing__" => InsertionProbe::NotInsertable,
+        "__missing__" => InsertionProbe::Unknown,
         _ => classify_probe_line("", line),
     }
 }
@@ -757,60 +887,93 @@ fn parse_probe_output(line: &str) -> InsertionProbe {
 ///
 /// Insertable when the focused element is a known text role, or when it
 /// exposes a sane `AXInsertionPointLineNumber` (a live caret) or AXSelectedTextRange.
-/// Definitely non-text elements (such as buttons, menus, dock, sliders, windows, outlines) without
-/// a caret are classified as NotInsertable.
+/// Definitely non-text elements (such as buttons, menus, dock, sliders, static text) without
+/// a caret are classified as NotInsertable. Container roles stay Unknown so a
+/// web / Electron caret is never mistaken for "no focus".
 #[cfg(target_os = "macos")]
 fn classify_probe_line(app_name: &str, rest: &str) -> InsertionProbe {
     let mut parts = rest.split('|');
     let role = parts.next().unwrap_or("").trim();
     let sel = parts.next().unwrap_or("").trim();
     let ins = parts.next().unwrap_or("").trim();
+    let range = parts.next().unwrap_or("").trim();
 
     let ins_line = ins.parse::<f64>().ok();
     let has_caret = matches!(ins_line, Some(v) if (0.0..1_000_000_000.0).contains(&v));
     let has_selection = sel == "present";
-    // 角色本身可插入、光标行号有效，或已选中文本且角色不是明确的非文本控件，都按可插入处理。
-    let insertable = TEXT_ROLES.contains(&role)
-        || has_caret
-        || (has_selection && !DEFINITELY_NON_TEXT_ROLES.contains(&role));
+    // AXSelectedTextRange 是真正的「有插入点」证据：文本控件即使没有选中内容，
+    // 也会暴露一个合法 range；网页 contenteditable 同样如此。
+    let has_text_range = range == "present";
+
+    let is_text_role = TEXT_ROLES.contains(&role);
+    let is_non_text_role = DEFINITELY_NON_TEXT_ROLES.contains(&role);
+    let is_ambiguous_container = AMBIGUOUS_CONTAINER_ROLES.contains(&role) || role.is_empty();
+
+    let insertable =
+        is_text_role || has_caret || has_text_range || (has_selection && !is_non_text_role);
     let probe = if insertable {
         InsertionProbe::Insertable
-    } else {
+    } else if is_non_text_role {
         InsertionProbe::NotInsertable
+    } else {
+        // 容器 / 未知角色无法证明「没有光标」，按 Unknown 放行 best-effort
+        // 粘贴：宁可多试一次 Cmd+V，也不要对着闪烁的光标说没焦点。
+        let _ = is_ambiguous_container;
+        InsertionProbe::Unknown
     };
 
     eprintln!(
-        "[delivery] probe app={app_name} role={role} selectedTextRange={sel} insertionPointLine={ins} -> {probe:?}"
+        "[delivery] probe app={app_name} role={role} selectedText={sel} insertionPointLine={ins} selectedTextRange={range} -> {probe:?}"
     );
     probe
 }
 
 /// Best-effort paste trigger used only inside a guarded clipboard transaction.
 /// The caller restores the original clipboard unless newer user data has replaced it.
-fn simulate_paste_main_thread() -> bool {
+///
+/// This runs on the main thread and must never block on a subprocess: a hung
+/// `osascript` freezes the whole app (global shortcut, Dock reopen, capsule)
+/// until it exits. Core Graphics posting is synchronous and cannot hang.
+fn simulate_paste() -> bool {
     #[cfg(target_os = "macos")]
     {
-        use std::process::Command;
-        // osascript runs outside our worker-thread constraints and is more stable
-        // than driving HIToolbox key mapping ourselves.
-        // It posts Cmd+V to the frontmost app.
-        let status = Command::new("osascript")
+        if post_paste_via_cgevent() {
+            return true;
+        }
+
+        // Fallback: osascript can still succeed where direct posting is
+        // rejected, but it must never be allowed to block the main thread.
+        // A watchdog kills it instead of waiting forever.
+        use std::process::{Command, Stdio};
+        let mut child = match Command::new("osascript")
             .args([
                 "-e",
                 r#"tell application "System Events" to keystroke "v" using command down"#,
             ])
-            .status();
-        if matches!(status, Ok(s) if s.success()) {
-            return true;
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return false,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1200);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        eprintln!("[delivery] osascript 粘贴触发超时，已终止");
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                Err(_) => return false,
+            }
         }
-
-        // Fallback for dev builds: osascript's keystroke can be rejected by
-        // TCC with "osascript is not allowed to send keystrokes" even when the
-        // hosting terminal app is trusted (e.g. embedded terminals like the
-        // ChatGPT desktop app). Posting the key event directly from this
-        // process uses the responsible app's trust instead of requiring
-        // /usr/bin/osascript to be added to Accessibility separately.
-        post_paste_via_cgevent()
     }
 
     #[cfg(target_os = "windows")]
@@ -833,13 +996,46 @@ fn simulate_paste_main_thread() -> bool {
     }
 }
 
+/// 剪贴板事务建立失败时的兜底：只把听写文字写进去，不尝试保留原内容。
+#[cfg(target_os = "macos")]
+fn write_temporary_text_ignoring_previous<R: Runtime>(
+    _app: &AppHandle<R>,
+    text: &str,
+) -> Result<(), String> {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+    use objc2_foundation::NSString;
+
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let string = NSString::from_str(text);
+    pasteboard.clearContents();
+    if pasteboard.setString_forType(&string, unsafe { NSPasteboardTypeString }) {
+        Ok(())
+    } else {
+        Err("系统拒绝写入剪贴板".into())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_temporary_text_ignoring_previous<R: Runtime>(
+    app: &AppHandle<R>,
+    text: &str,
+) -> Result<(), String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    app.clipboard()
+        .write_text(text.to_string())
+        .map_err(|error| format!("无法写入剪贴板：{error}"))
+}
+
 /// Post Cmd+V directly through Core Graphics.
+///
+/// 用 `Private` 事件源：`HIDSystemState` 会把当前物理按键状态合并进事件，
+/// 用户还按着 Option 时合成的就是 ⌥⌘V。Private 源只带我们显式设置的 ⌘。
 #[cfg(target_os = "macos")]
 fn post_paste_via_cgevent() -> bool {
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, KeyCode};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
-    let source = match CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
+    let source = match CGEventSource::new(CGEventSourceStateID::Private) {
         Ok(source) => source,
         Err(()) => return false,
     };
@@ -855,6 +1051,8 @@ fn post_paste_via_cgevent() -> bool {
     key_down.set_flags(CGEventFlags::CGEventFlagCommand);
     key_up.set_flags(CGEventFlags::CGEventFlagCommand);
     key_down.post(CGEventTapLocation::HID);
+    // 少数应用（Electron / 远程桌面）会丢弃零间隔的按键对。
+    std::thread::sleep(std::time::Duration::from_millis(12));
     key_up.post(CGEventTapLocation::HID);
     true
 }
@@ -895,10 +1093,11 @@ mod clipboard_transaction_tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn probe_output_parsing_handles_unsupported_ax_apps() {
+    fn probe_output_parsing_never_blocks_a_live_caret() {
         use super::{parse_probe_output, InsertionProbe};
 
-        // WeChat and JackDSH expose no AXFocusedUIElement, should be treated as Unknown (best-effort paste)
+        // 拿不到焦点元素不等于没有光标：Electron / 自绘 / 沙盒应用都这样。
+        // 这些情况必须放行 best-effort 粘贴，否则就是「光标在闪却不粘」。
         assert_eq!(
             parse_probe_output("WeChat|__missing__"),
             InsertionProbe::Unknown
@@ -911,63 +1110,70 @@ mod clipboard_transaction_tests {
             parse_probe_output("JackDSH|__missing__"),
             InsertionProbe::Unknown
         );
-        // Chrome installed PWAs report no focused element even with a live caret.
         assert_eq!(
             parse_probe_output("app_mode_loader|__missing__"),
             InsertionProbe::Unknown
         );
-
-        // Standard apps that report __missing__ without an input host are genuinely not insertable
         assert_eq!(
             parse_probe_output("Finder|__missing__"),
+            InsertionProbe::Unknown
+        );
+
+        // 明确是文本控件：可插入
+        assert_eq!(
+            parse_probe_output("Terminal|AXTextArea|present|0|present"),
+            InsertionProbe::Insertable
+        );
+        assert_eq!(
+            parse_probe_output("Notes|AXTextArea|absent|12|present"),
+            InsertionProbe::Insertable
+        );
+        // 网页 contenteditable：角色是容器，但 AXSelectedTextRange 存在，
+        // 说明有真实插入点。
+        assert_eq!(
+            parse_probe_output("Google Chrome|AXGroup|absent|missing|present"),
+            InsertionProbe::Insertable
+        );
+        assert_eq!(
+            parse_probe_output("Google Chrome|AXWebArea|absent|missing|present"),
+            InsertionProbe::Insertable
+        );
+        assert_eq!(
+            parse_probe_output("Slack|AXGroup|absent|missing|present"),
+            InsertionProbe::Insertable
+        );
+        // 只有光标行号、没有 range 也算有光标
+        assert_eq!(
+            parse_probe_output("Code|AXTextArea|absent|0|absent"),
+            InsertionProbe::Insertable
+        );
+
+        // 确定不是输入位置的控件：跳过粘贴
+        assert_eq!(
+            parse_probe_output("System Settings|AXButton|absent|missing|absent"),
+            InsertionProbe::NotInsertable
+        );
+        assert_eq!(
+            parse_probe_output("Finder|AXMenuBarItem|absent|missing|absent"),
+            InsertionProbe::NotInsertable
+        );
+        assert_eq!(
+            parse_probe_output("Finder|AXStaticText|absent|missing|absent"),
             InsertionProbe::NotInsertable
         );
 
-        // Standard apps with valid caret or text role are insertable
+        // 容器角色但没有光标证据：不能断言不可粘贴，按 Unknown 放行。
         assert_eq!(
-            parse_probe_output("Terminal|AXTextArea|present|0"),
-            InsertionProbe::Insertable
+            parse_probe_output("Google Chrome|AXWebArea|absent|9.223372036855E+18|absent"),
+            InsertionProbe::Unknown
         );
         assert_eq!(
-            parse_probe_output("Notes|AXTextArea|present|12"),
-            InsertionProbe::Insertable
-        );
-
-        // Explicitly non-text UI elements without a caret are NotInsertable
-        assert_eq!(
-            parse_probe_output("System Settings|AXButton|absent|missing"),
-            InsertionProbe::NotInsertable
+            parse_probe_output("Notes|AXWindow|absent|missing|absent"),
+            InsertionProbe::Unknown
         );
         assert_eq!(
-            parse_probe_output("Finder|AXOutline|absent|missing"),
-            InsertionProbe::NotInsertable
-        );
-        assert_eq!(
-            parse_probe_output("Finder|AXMenuBarItem|absent|missing"),
-            InsertionProbe::NotInsertable
-        );
-        assert_eq!(
-            parse_probe_output("Notes|AXWindow|absent|missing"),
-            InsertionProbe::NotInsertable
-        );
-        // Browser web pages without a live caret are NotInsertable
-        assert_eq!(
-            parse_probe_output("Google Chrome|AXWebArea|absent|9.223372036855E+18"),
-            InsertionProbe::NotInsertable
-        );
-        assert_eq!(
-            parse_probe_output("Google Chrome|AXWebArea|present|9.223372036855E+18"),
-            InsertionProbe::NotInsertable
-        );
-        // Editor non-text UI (outline, file tree) without caret is NotInsertable
-        assert_eq!(
-            parse_probe_output("Code|AXOutline|absent|9.223372036855E+18"),
-            InsertionProbe::NotInsertable
-        );
-        // Editor text area with caret is Insertable
-        assert_eq!(
-            parse_probe_output("Code|AXTextArea|absent|0"),
-            InsertionProbe::Insertable
+            parse_probe_output("Code|AXOutline|absent|9.223372036855E+18|absent"),
+            InsertionProbe::Unknown
         );
 
         // Error or empty string falls back to Unknown
@@ -985,6 +1191,45 @@ mod clipboard_transaction_tests {
             for original_representation in original_item {
                 assert!(captured_item.contains(original_representation));
             }
+        }
+    }
+
+    /// 「应用没暴露 AXFocusedUIElement」不能被当成「没有输入焦点」。
+    /// 微信 / Electron / PWA 都这样，误判会让用户看着闪烁的光标却粘不进去。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn missing_focused_element_never_blocks_the_paste() {
+        use super::{parse_probe_output, InsertionProbe};
+        for app in [
+            "WeChat",
+            "微信",
+            "Cursor",
+            "ChatGPT",
+            "Feishu",
+            "Notes",
+            "Finder",
+            "Some App Nobody Has Heard Of",
+        ] {
+            assert_eq!(
+                parse_probe_output(&format!("{app}|__missing__")),
+                InsertionProbe::Unknown,
+                "{app} 拿不到焦点元素时应该放行 best-effort 粘贴"
+            );
+        }
+    }
+
+    /// 网页 / Electron 的 contenteditable 常被暴露成 AXGroup / AXWebArea。
+    /// 只要 AXSelectedTextRange 在，就必须认定有光标。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn container_roles_with_a_text_range_count_as_insertable() {
+        use super::{parse_probe_output, InsertionProbe};
+        for role in ["AXGroup", "AXWebArea", "AXScrollArea", "AXWindow"] {
+            assert_eq!(
+                parse_probe_output(&format!("Google Chrome|{role}|absent|missing|present")),
+                InsertionProbe::Insertable,
+                "{role} + AXSelectedTextRange 说明有真实插入点"
+            );
         }
     }
 

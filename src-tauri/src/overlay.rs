@@ -142,7 +142,32 @@ pub fn show_overlay(app: &AppHandle) {
         remember_frontmost_app(app);
         let _ = window.show();
         let _ = window.set_always_on_top(true);
+        // `show()` 在 macOS 上是 makeKeyAndOrderFront：胶囊会变成 key window，
+        // JackVoice 被激活，用户正在打字的窗口丢掉焦点。收尾时虽然会再激活
+        // 目标应用，但中间整段听写期间光标都不在原处，粘贴时机稍有偏差就会
+        // 落空。这里把焦点还回去。
+        restore_focus_after_overlay_show();
     }
+}
+
+/// 胶囊只是提示层，不该抢走用户正在编辑的窗口焦点。
+fn restore_focus_after_overlay_show() {
+    let snapshot = focus_snapshot().lock();
+    let remembered = snapshot.app.clone();
+    let main_was_visible = snapshot.main_was_visible;
+    drop(snapshot);
+
+    // 用户本来就在 JackVoice 设置窗口里时不要把他踢走。
+    if main_was_visible {
+        return;
+    }
+    let Some(target) = remembered else {
+        return;
+    };
+    if frontmost_pid() != Some(std::process::id() as i32) {
+        return;
+    }
+    activate_running_process(target.pid);
 }
 
 pub fn hide_overlay(app: &AppHandle) {
@@ -197,29 +222,6 @@ pub(crate) fn is_self_app(app: &FrontmostApp, self_pid: u32) -> bool {
     app.pid == self_pid as i32 || is_jackvoice_process_name(&app.name)
 }
 
-/// System Events output: `{unix id}\t{process name}`.
-pub(crate) fn parse_frontmost_process_line(raw: &str, self_pid: u32) -> Option<FrontmostApp> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let (pid_str, name) = raw.split_once('\t')?;
-    let pid = pid_str.trim().parse::<i32>().ok()?;
-    if pid <= 0 {
-        return None;
-    }
-    let name = name.trim().to_string();
-    if name.is_empty() {
-        return None;
-    }
-    let app = FrontmostApp { pid, name };
-    if is_self_app(&app, self_pid) {
-        None
-    } else {
-        Some(app)
-    }
-}
-
 /// Restore the remembered process only when JackVoice currently owns the
 /// foreground. `tell application "Name" to activate` is forbidden: Launch
 /// Services resolves by product name and can launch a different install of
@@ -258,40 +260,44 @@ pub(crate) fn restore_process_script(pid: i32) -> String {
     )
 }
 
+/// 当前前台进程的 PID（包含 JackVoice 自己）。
+///
+/// 只走 NSWorkspace：这是同步的进程内调用。之前前台应用是 JackVoice 时会
+/// 回退到 `osascript`，而那条路径没有任何超时；System Events 忙或弹出
+/// 自动化授权框时，调用线程会被无限期挂住。
+#[cfg(target_os = "macos")]
+pub fn frontmost_pid() -> Option<i32> {
+    use objc2_app_kit::NSWorkspace;
+    let workspace = NSWorkspace::sharedWorkspace();
+    let front = workspace.frontmostApplication()?;
+    let pid = front.processIdentifier();
+    (pid > 0).then_some(pid)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn frontmost_pid() -> Option<i32> {
+    None
+}
+
 #[cfg(target_os = "macos")]
 fn read_frontmost_app() -> Option<FrontmostApp> {
-    {
-        use objc2_app_kit::NSWorkspace;
-        let workspace = NSWorkspace::sharedWorkspace();
-        if let Some(front) = workspace.frontmostApplication() {
-            let pid = front.processIdentifier();
-            if pid > 0 {
-                let name = front
-                    .localizedName()
-                    .map(|n| n.to_string())
-                    .unwrap_or_default();
-                let app = FrontmostApp { pid, name };
-                if !is_self_app(&app, std::process::id()) {
-                    return Some(app);
-                }
-            }
-        }
-    }
-    use std::process::Command;
-    let out = Command::new("osascript")
-        .arg("-e")
-        .arg(concat!(
-            "tell application \"System Events\"\n",
-            "set p to first application process whose frontmost is true\n",
-            "return (unix id of p as string) & tab & (name of p as string)\n",
-            "end tell"
-        ))
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    use objc2_app_kit::NSWorkspace;
+    let workspace = NSWorkspace::sharedWorkspace();
+    let front = workspace.frontmostApplication()?;
+    let pid = front.processIdentifier();
+    if pid <= 0 {
         return None;
     }
-    parse_frontmost_process_line(&String::from_utf8_lossy(&out.stdout), std::process::id())
+    let name = front
+        .localizedName()
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+    let app = FrontmostApp { pid, name };
+    if is_self_app(&app, std::process::id()) {
+        None
+    } else {
+        Some(app)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -304,11 +310,14 @@ pub(crate) fn activate_running_process(pid: i32) {
     // bug where multiple processes sharing a binary name (e.g. WorkBuddy and
     // WorkBuddy AI both having Mach-O name "Electron") cause
     // `whose unix id is {pid}` to incorrectly resolve to the first matching name.
+    //
+    // 不要带 ActivateAllWindows：它会把目标应用的每个窗口都提到最前，多窗口
+    // 应用（Chrome / Finder / 编辑器）里当前那个带光标的窗口会被顶掉，随后
+    // 的 Cmd+V 就粘进了另一个窗口。只把应用带回前台即可。
     use objc2_app_kit::NSRunningApplication;
     if let Some(target) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
         #[allow(deprecated)]
-        let options = objc2_app_kit::NSApplicationActivationOptions::ActivateIgnoringOtherApps
-            | objc2_app_kit::NSApplicationActivationOptions::ActivateAllWindows;
+        let options = objc2_app_kit::NSApplicationActivationOptions::ActivateIgnoringOtherApps;
         if target.activateWithOptions(options) {
             return;
         }
@@ -317,10 +326,34 @@ pub(crate) fn activate_running_process(pid: i32) {
     use std::process::Command;
     // Block until System Events flips `frontmost` so a subsequent Cmd+V lands
     // in this exact process, not a newly launched bundle of the same name.
-    let _ = Command::new("osascript")
+    // Bounded: a hung System Events must not freeze dictation forever.
+    let mut child = match Command::new("osascript")
         .arg("-e")
         .arg(restore_process_script(pid))
-        .status();
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return,
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!("[overlay] 激活目标应用超时，已放弃 osascript 兜底");
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -343,19 +376,44 @@ fn conceal_main_if_unwanted(app: &AppHandle) {
     }
 }
 
+/// 胶囊自己刚被点过的时间。点击胶囊会让 JackVoice 变成前台应用，macOS
+/// 随即补发一个 `Reopen`（无边框 skip-taskbar 面板不算“标准窗口”）。
+/// 只有紧跟着胶囊交互的那个 Reopen 才该被吞掉。
+static LAST_OVERLAY_INTERACTION: std::sync::OnceLock<
+    parking_lot::Mutex<Option<std::time::Instant>>,
+> = std::sync::OnceLock::new();
+
+fn overlay_interaction_slot() -> &'static parking_lot::Mutex<Option<std::time::Instant>> {
+    LAST_OVERLAY_INTERACTION.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+/// 前端在胶囊上按下鼠标 / 点击按钮时调用，用来标记「这次 Reopen 是自己人」。
+pub fn note_overlay_interaction() {
+    *overlay_interaction_slot().lock() = Some(std::time::Instant::now());
+}
+
+/// 胶囊交互后的抑制窗口。真实 Dock 点击一般发生在胶囊出现后很久，
+/// 不会被这个窗口误伤。
+const OVERLAY_REOPEN_SUPPRESS_WINDOW: std::time::Duration = std::time::Duration::from_millis(700);
+
 /// Capsule clicks activate JackVoice. macOS then sends `Reopen` as if the
 /// Dock icon was clicked, because a borderless skip-taskbar panel is not a
-/// standard visible window. Suppress that so cancel/confirm never open
-/// settings. A genuine Dock click while the capsule is merely on-screen
-/// (not focused) still presents settings.
-pub fn suppress_reopen_for_overlay(app: &AppHandle) -> bool {
-    app.get_webview_window(OVERLAY_LABEL)
-        .map(|window| {
-            let visible = window.is_visible().ok().unwrap_or(false);
-            let focused = window.is_focused().ok().unwrap_or(false);
-            visible && focused
-        })
-        .unwrap_or(false)
+/// standard visible window. Suppress only that immediate follow-up.
+///
+/// 之前的实现是「胶囊可见且聚焦就一律忽略 Reopen」，于是只要结果胶囊还挂在
+/// 屏幕上（未插入时的复制提示会停留 12 秒），用户点程序坞图标就永远没反应。
+pub fn suppress_reopen_for_overlay(_app: &AppHandle) -> bool {
+    let last = *overlay_interaction_slot().lock();
+    should_suppress_reopen(last, std::time::Instant::now())
+}
+
+/// 纯判定：只有「距离胶囊交互不超过窗口」的那次 Reopen 才算自己人。
+fn should_suppress_reopen(
+    last_interaction: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    last_interaction
+        .is_some_and(|last| now.saturating_duration_since(last) < OVERLAY_REOPEN_SUPPRESS_WINDOW)
 }
 
 /// Remember which app the user was working in, before the capsule shows.
@@ -409,6 +467,63 @@ pub fn ensure_main_stays_in_background(app: &AppHandle) {
         }
     }
     conceal_main_if_unwanted(app);
+    release_windowless_foreground(app);
+}
+
+/// 最后一个可见窗口关掉后，macOS 会让应用继续「前台但无窗口」，此时所有
+/// 按键都投给一个没有 key window 的应用 —— 表现就是空格键、打字全都没反应，
+/// 直到用户手动点一下别的应用。JackVoice 是后台常驻工具，遇到这种情况
+/// 必须主动把前台还给上一个应用。
+pub fn release_windowless_foreground<R: tauri::Runtime>(app: &AppHandle<R>) {
+    #[cfg(target_os = "macos")]
+    {
+        if !has_visible_windows(app) {
+            // 自己不是前台就什么都不用做。
+            if frontmost_pid() != Some(std::process::id() as i32) {
+                return;
+            }
+            if let Some(target) = remembered_frontmost_app() {
+                activate_running_process(target.pid);
+                if frontmost_pid() != Some(std::process::id() as i32) {
+                    return;
+                }
+            }
+            // 没有可恢复的目标时，只能把整个应用隐藏起来：macOS 会把激活权
+            // 交还给上一个应用。`deactivate()` 在 macOS 14+ 不会归还激活，
+            // 实测前台仍停在一个没有窗口的应用上，按键全部丢失。
+            use objc2::MainThreadMarker;
+            use objc2_app_kit::NSApplication;
+            if let Some(mtm) = MainThreadMarker::new() {
+                let app = NSApplication::sharedApplication(mtm);
+                app.hide(None);
+                // 隐藏之后要能被下次 Dock 点击重新唤起；unhide 由
+                // show_main_window 负责，这里不做额外处理。
+            }
+        }
+    }
+}
+
+/// 是否还有「能让用户继续打字」的窗口。
+///
+/// 只看 Tauri 自己的窗口列表：AppKit 的 `windows()` 会把已经 orderOut 的
+/// 窗口以及各种内部面板都算进来，用它判断几乎永远是“有窗口”。
+#[cfg(target_os = "macos")]
+fn has_visible_windows<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
+    for (label, window) in app.webview_windows() {
+        if label == OVERLAY_LABEL {
+            // 胶囊是提示层，不能替用户接收键盘。
+            continue;
+        }
+        if window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn has_visible_windows<R: tauri::Runtime>(_app: &AppHandle<R>) -> bool {
+    true
 }
 
 /// Called from frontend drag end to persist capsule position.
@@ -454,15 +569,25 @@ mod tests {
         assert!(!is_self_app(&app(99, "Cursor"), 1));
     }
 
+    /// Reopen 抑制只认「刚刚发生的胶囊交互」。胶囊挂在屏幕上、或者听写
+    /// 还没结束，都不该让程序坞点击失效 —— 那正是「点图标没反应」的成因。
     #[test]
-    fn parses_pid_and_keeps_apps_with_no_reported_windows() {
-        let parsed = parse_frontmost_process_line("12345\tJackAICut for DaVinci Resolve Studio", 1)
-            .expect("target app");
-        assert_eq!(parsed.pid, 12345);
-        assert_eq!(parsed.name, "JackAICut for DaVinci Resolve Studio");
-        assert!(parse_frontmost_process_line("1\tJackVoice", 99).is_none());
-        assert!(parse_frontmost_process_line("99\tCursor", 99).is_none());
-        assert!(parse_frontmost_process_line("", 1).is_none());
+    fn reopen_is_only_suppressed_right_after_a_capsule_interaction() {
+        let now = std::time::Instant::now();
+        assert!(!should_suppress_reopen(None, now));
+        assert!(should_suppress_reopen(Some(now), now));
+        assert!(should_suppress_reopen(
+            Some(now - OVERLAY_REOPEN_SUPPRESS_WINDOW / 2),
+            now
+        ));
+        assert!(!should_suppress_reopen(
+            Some(now - OVERLAY_REOPEN_SUPPRESS_WINDOW),
+            now
+        ));
+        assert!(!should_suppress_reopen(
+            Some(now - OVERLAY_REOPEN_SUPPRESS_WINDOW - std::time::Duration::from_secs(5)),
+            now
+        ));
     }
 
     #[test]

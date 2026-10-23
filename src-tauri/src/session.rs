@@ -103,8 +103,9 @@ pub struct UiState {
 }
 
 impl UiState {
-    /// Live capture / recognition lifecycle. Overlay clicks during these
-    /// phases must not present the settings window.
+    /// Live capture / recognition lifecycle. Kept as the single definition of
+    /// "a dictation is running" so UI code cannot drift from the phase names.
+    #[allow(dead_code)]
     pub fn is_live_dictation(&self) -> bool {
         matches!(
             self.phase.as_str(),
@@ -165,6 +166,9 @@ struct ActiveSession {
     output_mute: Option<OutputMuteGuard>,
     started_at: Option<Instant>,
     stopping: bool,
+    /// 开始收尾的时刻。收尾链路上任何一步卡住（ASR 不返回、主线程被
+    /// 子进程挂住）都会让 active 永远不释放，此后快捷键就变成“按了没反应”。
+    stopping_since: Option<Instant>,
 }
 
 struct RecordingSession {
@@ -200,6 +204,14 @@ struct MicFallbackState {
     /// same preferred device is absent must not repeat the same toast.
     unavailable_preference_id: Option<String>,
     lost_active_device_id: Option<String>,
+}
+
+/// 收尾链路的硬上限。超过这个时间还没结束，就认为会话已经卡死。
+const STUCK_STOP_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// 纯判定，便于测试：收尾耗时超过上限即视为卡死。
+fn stop_is_stuck(stopping_for: Duration) -> bool {
+    stopping_for >= STUCK_STOP_TIMEOUT
 }
 
 pub struct AppState {
@@ -1410,7 +1422,62 @@ impl AppState {
         let _ = app.emit("jackvoice://history", true);
     }
 
+    /// 收尾阶段卡死时强制复位。
+    ///
+    /// `run_recording_session` 会等 ASR 收尾、投递结果、写历史；其中任何一步
+    /// 被网络或子进程挂住，`active` 就永远不会释放。此后每次按快捷键都只是
+    /// 对同一个死会话再喊一次 stop —— 表现就是“Option+Space 没反应了”。
+    /// 这里给收尾一个硬上限，超时就丢弃旧会话，让下一次按键能重新开始。
+    fn recover_stuck_session(&self, app: &AppHandle) -> bool {
+        let stale: Option<Option<OutputMuteGuard>> = {
+            let mut active = self.active.lock();
+            match active.as_mut() {
+                Some(session) if session.stopping => {
+                    let since = session.stopping_since.get_or_insert_with(Instant::now);
+                    if stop_is_stuck(since.elapsed()) {
+                        Some(
+                            active
+                                .take()
+                                .and_then(|mut session| session.output_mute.take()),
+                        )
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+
+        // None 表示没有卡死；Some(guard) 表示已经复位，guard 可能为空。
+        let Some(guard) = stale else {
+            return false;
+        };
+
+        eprintln!(
+            "[session] 收尾超过 {} 秒仍未完成，强制复位听写状态",
+            STUCK_STOP_TIMEOUT.as_secs()
+        );
+        restore_output_mute(guard);
+        {
+            let mut ui = self.ui.lock();
+            ui.phase = "idle".into();
+            ui.recognition_phase = "idle".into();
+            ui.audio_level = 0.0;
+            ui.needs_copy_prompt = false;
+            ui.status = "上一次听写收尾超时，已复位；可以重新开始。".into();
+            let _ = app.emit("jackvoice://level", 0.0_f32);
+            let _ = app.emit("jackvoice://state", ui.clone());
+        }
+        crate::overlay::hide_overlay(app);
+        true
+    }
+
     pub async fn toggle(&self, app: AppHandle) -> Result<UiState, String> {
+        if self.recover_stuck_session(&app) {
+            // 上一次听写的收尾卡死了。这一下按键只用来把状态清干净，
+            // 用户再按一次就能正常开始新听写。
+            return Ok(self.snapshot());
+        }
         let is_active = self.active.lock().is_some();
         if is_active {
             self.stop(app).await
@@ -1456,6 +1523,7 @@ impl AppState {
                 output_mute: None,
                 started_at: None,
                 stopping: false,
+                stopping_since: None,
             });
         }
 
@@ -1672,18 +1740,20 @@ impl AppState {
     }
 
     async fn stop(&self, app: AppHandle) -> Result<UiState, String> {
-        let (stop_tx, audio_stop_tx, output_mute) = {
+        let (stop_tx, audio_stop_tx, output_mute, had_session) = {
             let mut active = self.active.lock();
             match active.as_mut() {
                 Some(session) => {
                     session.stopping = true;
+                    session.stopping_since.get_or_insert_with(Instant::now);
                     (
                         session.stop_tx.take(),
                         session.audio_stop_tx.take(),
                         session.output_mute.take(),
+                        true,
                     )
                 }
-                None => (None, None, None),
+                None => (None, None, None, false),
             }
         };
 
@@ -1691,6 +1761,13 @@ impl AppState {
             let _ = tx.send(());
         }
         restore_output_mute(output_mute);
+
+        // 没有活动会话时不要把界面钉死在 finalizing：那会让胶囊一直显示
+        // “收尾中”，同时 is_live_dictation() 永远为真，程序坞点击被吞掉。
+        if !had_session {
+            let ui = self.snapshot();
+            return Ok(ui);
+        }
 
         {
             let mut ui = self.ui.lock();
@@ -2212,14 +2289,24 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
                 });
                 crate::overlay::set_remembered_frontmost_app(target.clone());
                 crate::overlay::hide_overlay_for_delivery(&app, reactivate_target);
-                if let Some(target_app) = target.as_ref() {
-                    crate::overlay::activate_running_process(target_app.pid);
+                // 目标本来就是前台时不要再激活：NSRunningApplication 的激活
+                // 会重新排列该应用的窗口，多窗口应用里带光标的窗口会被顶掉。
+                if reactivate_target {
+                    if let Some(target_app) = target.as_ref() {
+                        crate::overlay::activate_running_process(target_app.pid);
+                    }
                 }
-                // Keep the delay for every delivery so physical Option/Space keys
-                // have time to be released by the user before posting Cmd+V.
-                tokio::time::sleep(Duration::from_millis(350)).await;
+                // Keep a short delay so physical Option/Space keys have time to
+                // be released; deliver_text waits for modifiers as well.
+                tokio::time::sleep(Duration::from_millis(120)).await;
                 let probe = delivery::probe_insertion_target(target.as_ref());
-                let delivery = delivery::deliver_text(&app, &final_text, probe).await;
+                let delivery = delivery::deliver_text_to(
+                    &app,
+                    &final_text,
+                    probe,
+                    target.as_ref().map(|target| target.pid),
+                )
+                .await;
                 needs_copy_prompt = !delivery.pasted;
                 delivery_result = Some(delivery);
             }
@@ -2650,9 +2737,9 @@ pub type SharedDelivery = DeliveryResult;
 mod volc_connection_error_tests {
     use super::{
         format_volc_connection_error, initial_volc_credential_status, route_finished_transcript,
-        sync_resolved_input_device, update_audio_device_state, AppSettings,
+        stop_is_stuck, sync_resolved_input_device, update_audio_device_state, AppSettings,
         FinishedTranscriptRoute, MicFallbackState, UiState, VolcCredentialStatus,
-        MAX_DICTATION_DURATION,
+        MAX_DICTATION_DURATION, STUCK_STOP_TIMEOUT,
     };
     use crate::audio::{ActiveInputDevice, AudioNotice, InputDeviceInfo, InputDevicePreference};
     use std::time::Duration;
@@ -2667,6 +2754,19 @@ mod volc_connection_error_tests {
             route_finished_transcript(false),
             FinishedTranscriptRoute::InsertOrPrompt
         );
+    }
+
+    /// 收尾卡死必须能被判出来：否则 active 永远不释放，快捷键就变成
+    /// “按了没反应”，程序坞点击也会因为 is_live_dictation 一直为真被吞掉。
+    #[test]
+    fn detects_a_stuck_finalization() {
+        assert!(!stop_is_stuck(Duration::from_secs(0)));
+        assert!(!stop_is_stuck(Duration::from_secs(5)));
+        assert!(!stop_is_stuck(
+            STUCK_STOP_TIMEOUT - Duration::from_millis(1)
+        ));
+        assert!(stop_is_stuck(STUCK_STOP_TIMEOUT));
+        assert!(stop_is_stuck(STUCK_STOP_TIMEOUT + Duration::from_secs(30)));
     }
 
     #[test]

@@ -40,6 +40,8 @@ pub fn ensure_main_window<R: Runtime>(app: &AppHandle<R>) -> Result<WebviewWindo
 pub fn show_main_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let window = ensure_main_window(app)?;
 
+    // unhide：用户可能用 ⌘H 把整个应用隐藏了，只 orderFront 窗口不会
+    // 让隐藏中的应用出现。
     #[cfg(target_os = "macos")]
     app.show()
         .map_err(|error| format!("无法显示 JackVoice 应用：{error}"))?;
@@ -73,6 +75,9 @@ pub fn handle_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) 
         if let Err(error) = window.hide() {
             eprintln!("[main-window] 隐藏主窗口失败：{error}");
         }
+        // 隐藏之后 JackVoice 仍然「前台但无窗口」，不归还前台的话，
+        // 用户接下来按的所有键（包括空格）都会投给一个没有 key window 的应用。
+        crate::overlay::release_windowless_foreground(window.app_handle());
     }
 }
 

@@ -319,6 +319,9 @@ fn start_shortcut_recording(
     // The native event tap is only useful for capturing Fn combinations.
     // Never create it before Accessibility has already been granted: doing so
     // makes macOS show a permission dialog before the onboarding UI is ready.
+    //
+    // 录制期间必须装着：用户可能正是要录一个 Fn 组合。它只在录制窗口
+    // 存续期间工作，`ShortcutCaptureState` 自带超时，不会长期驻留。
     if onboarding::accessibility_is_trusted() {
         shortcut::install_fn_shortcut_monitor(app);
     }
@@ -593,7 +596,13 @@ async fn retry_last_transcript(
 
     // The user explicitly requested retry from the capsule; trust their intent
     // and deliver via best-effort paste rather than gating behind AX probes.
-    let result = delivery::deliver_text(&app, &text, delivery::InsertionProbe::Unknown).await;
+    let result = delivery::deliver_text_to(
+        &app,
+        &text,
+        delivery::InsertionProbe::Unknown,
+        target.as_ref().map(|target| target.pid),
+    )
+    .await;
     let ui = state.apply_delivery_result(&result);
     let _ = app.emit("jackvoice://state", ui);
     let _ = app.emit("jackvoice://delivery", result.clone());
@@ -601,6 +610,13 @@ async fn retry_last_transcript(
         crate::overlay::show_overlay(&app);
     }
     Ok(result)
+}
+
+/// 胶囊上的任何鼠标交互都记一笔：它会让 macOS 补发一个 Reopen，
+/// 只有紧跟着这次交互的 Reopen 才应该被忽略。
+#[tauri::command]
+fn note_overlay_interaction() {
+    crate::overlay::note_overlay_interaction();
 }
 
 /// Hide the capsule from the frontend (e.g. after manual copy or timeout).
@@ -723,15 +739,6 @@ pub fn run() {
                 return;
             }
 
-            // 正在听写时不要抢焦点：否则自动粘贴的目标应用会被设置窗口顶掉。
-            let dictating = app
-                .try_state::<AppState>()
-                .map(|state| state.snapshot().is_live_dictation())
-                .unwrap_or(false);
-            if dictating {
-                eprintln!("[single-instance] 重复实例已忽略（正在听写中，不抢占焦点）");
-                return;
-            }
             eprintln!("[single-instance] 检测到重复实例，唤起已有 JackVoice 窗口");
             if let Err(error) = main_window::show_main_window(app) {
                 eprintln!("[single-instance] {error}");
@@ -804,6 +811,7 @@ pub fn run() {
             if shortcut::should_install_fn_monitor_at_startup(
                 initial_state.onboarding_completed,
                 accessibility_trusted,
+                &initial_state.shortcut,
             ) {
                 shortcut::install_fn_shortcut_monitor(app.handle().clone());
             }
@@ -909,6 +917,7 @@ pub fn run() {
             start_overlay_drag,
             copy_last_transcript,
             retry_last_transcript,
+            note_overlay_interaction,
             dismiss_overlay,
             toggle_session_pin,
             set_session_pin,
@@ -929,17 +938,18 @@ pub fn run() {
             tauri::RunEvent::Ready => {
                 dock_menu::setup(app);
             }
-            // Dock icon click opens settings, except when the live capsule
-            // itself caused this activation.
+            // Dock icon click opens settings, except when the capsule itself
+            // just caused this activation. A Dock click during dictation is an
+            // explicit user request: show the window instead of swallowing it
+            // (delivery re-activates its target before pasting anyway).
             tauri::RunEvent::Reopen { .. } => {
-                if overlay::suppress_reopen_for_overlay(app)
-                    || app
-                        .try_state::<AppState>()
-                        .is_some_and(|state| state.snapshot().is_live_dictation())
-                {
-                    eprintln!("[main-window] 忽略 Reopen：听写胶囊仍在前台，不打开设置窗口");
+                if overlay::suppress_reopen_for_overlay(app) {
+                    eprintln!("[main-window] 忽略 Reopen：来自胶囊自身的激活");
                     return;
                 }
+                // 程序坞点击时 AppKit 已经把应用激活了；这里只负责把窗口
+                // 显示出来并设成 key window。再调 activate() 会把用户刚点
+                // 进来的激活顺序打乱，反而可能落到别的窗口。
                 if let Err(error) = main_window::show_main_window(app) {
                     eprintln!("[main-window] Dock 唤起失败：{error}");
                 }
