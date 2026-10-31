@@ -21,6 +21,9 @@ dist-ssr
 /branding/recommended/
 /branding/recommended-v2/
 
+# 本地宣传片素材与成片：按需临时产出，不参与构建，留在本机备查即可。
+/promo/
+
 # 开发版只提交桌面构建配置实际引用的图标。其余平台尺寸由
 # `npm run icons` 从 branding/logo-v4-whisper-tx 的 SVG 随时再生。
 /src-tauri/icons-dev/*
