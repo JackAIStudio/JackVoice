@@ -1167,6 +1167,13 @@ mod clipboard_transaction_tests {
             parse_probe_output("Google Chrome|AXWebArea|absent|9.223372036855E+18|absent"),
             InsertionProbe::Unknown
         );
+        // X（Twitter）的回复框在 Chrome 里就是这样：AXWebArea、没有选中文本、
+        // 行号是 AXValueNotFound 的哨兵值，只有 AXSelectedTextRange 存在。
+        // 光标确实在闪，必须判为可插入。
+        assert_eq!(
+            parse_probe_output("Google Chrome|AXWebArea|absent|9.223372036855E+18|present"),
+            InsertionProbe::Insertable
+        );
         assert_eq!(
             parse_probe_output("Notes|AXWindow|absent|missing|absent"),
             InsertionProbe::Unknown
