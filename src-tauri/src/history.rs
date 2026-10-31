@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 
 pub const AUDIO_SAMPLE_RATE_HZ: u32 = 16_000;
 pub const AUDIO_CHANNELS: u16 = 1;
@@ -11,6 +12,17 @@ pub const AUDIO_BITS_PER_SAMPLE: u16 = 16;
 const WAV_HEADER_BYTES: u64 = 44;
 const AUDIO_DIR_NAME: &str = "audio";
 const MAX_RECORDS: usize = 500;
+
+/// history.json 是读-改-写。后台收尾、自动补转写、用户删记录可能同时发生，
+/// 交错一次就会丢掉刚写进去的那条。这里把所有写入串起来。
+static HISTORY_LOCK: Mutex<()> = Mutex::new(());
+
+fn with_history_lock<T>(action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let _guard = HISTORY_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    action()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -160,27 +172,29 @@ pub fn append(dir: &Path, entry: HistoryAppend<'_>) -> Result<(), String> {
         "completed"
     };
 
-    let mut records = load_records(dir);
-    records.push(HistoryRecord {
-        id: entry.id,
-        finished_at_ms: chrono::Utc::now().timestamp_millis(),
-        text: trimmed.to_string(),
-        duration_ms: entry.duration_ms,
-        char_count: trimmed.chars().filter(|c| !c.is_whitespace()).count() as u32,
-        audio: entry.audio,
-        recognition: entry.recognition,
-        recognition_status: recognition_status.into(),
-        recognition_error,
-        recording_error: entry.recording_error.unwrap_or_default(),
-        audio_missing: false,
-    });
+    with_history_lock(|| {
+        let mut records = load_records(dir);
+        records.push(HistoryRecord {
+            id: entry.id,
+            finished_at_ms: chrono::Utc::now().timestamp_millis(),
+            text: trimmed.to_string(),
+            duration_ms: entry.duration_ms,
+            char_count: trimmed.chars().filter(|c| !c.is_whitespace()).count() as u32,
+            audio: entry.audio,
+            recognition: entry.recognition,
+            recognition_status: recognition_status.into(),
+            recognition_error,
+            recording_error: entry.recording_error.unwrap_or_default(),
+            audio_missing: false,
+        });
 
-    if records.len() > MAX_RECORDS {
-        let excess = records.len() - MAX_RECORDS;
-        records.drain(0..excess);
-    }
+        if records.len() > MAX_RECORDS {
+            let excess = records.len() - MAX_RECORDS;
+            records.drain(0..excess);
+        }
 
-    persist_records(dir, &records)
+        persist_records(dir, &records)
+    })
 }
 
 fn persist_records(dir: &Path, records: &[HistoryRecord]) -> Result<(), String> {
@@ -201,15 +215,17 @@ fn remove_history_backup(dir: &Path) -> Result<(), String> {
 }
 
 pub fn delete_record(dir: &Path, record_id: &str) -> Result<(), String> {
-    let mut records = load_records(dir);
-    let index = records
-        .iter()
-        .position(|record| record.id == record_id)
-        .ok_or_else(|| "找不到这条历史记录。".to_string())?;
-    records.remove(index);
-    persist_records(dir, &records)?;
-    remove_history_backup(dir)?;
-    Ok(())
+    with_history_lock(|| {
+        let mut records = load_records(dir);
+        let index = records
+            .iter()
+            .position(|record| record.id == record_id)
+            .ok_or_else(|| "找不到这条历史记录。".to_string())?;
+        records.remove(index);
+        persist_records(dir, &records)?;
+        remove_history_backup(dir)?;
+        Ok(())
+    })
 }
 
 /// 更新一条已有记录的识别结果。录音文件、完成时间和记录 id 保持不变。
@@ -225,24 +241,26 @@ pub fn update_recognition(
     record_id: &str,
     patch: RecognitionPatch,
 ) -> Result<HistoryRecord, String> {
-    let mut records = load_records(dir);
-    let record = records
-        .iter_mut()
-        .find(|record| record.id == record_id)
-        .ok_or_else(|| "找不到这条历史记录。".to_string())?;
-    if let Some(text) = patch.text {
-        let trimmed = text.trim().to_string();
-        record.char_count = trimmed.chars().filter(|c| !c.is_whitespace()).count() as u32;
-        record.text = trimmed;
-    }
-    if let Some(recognition) = patch.recognition {
-        record.recognition = Some(recognition);
-    }
-    record.recognition_status = patch.recognition_status;
-    record.recognition_error = patch.recognition_error;
-    let updated = record.clone();
-    persist_records(dir, &records)?;
-    Ok(updated)
+    with_history_lock(|| {
+        let mut records = load_records(dir);
+        let record = records
+            .iter_mut()
+            .find(|record| record.id == record_id)
+            .ok_or_else(|| "找不到这条历史记录。".to_string())?;
+        if let Some(text) = patch.text {
+            let trimmed = text.trim().to_string();
+            record.char_count = trimmed.chars().filter(|c| !c.is_whitespace()).count() as u32;
+            record.text = trimmed;
+        }
+        if let Some(recognition) = patch.recognition {
+            record.recognition = Some(recognition);
+        }
+        record.recognition_status = patch.recognition_status;
+        record.recognition_error = patch.recognition_error;
+        let updated = record.clone();
+        persist_records(dir, &records)?;
+        Ok(updated)
+    })
 }
 
 pub fn record_by_id(dir: &Path, record_id: &str) -> Result<HistoryRecord, String> {
@@ -895,6 +913,49 @@ mod tests {
         let wav = fs::read(recovered).unwrap();
         assert_eq!(&wav[0..4], b"RIFF");
         assert_eq!(&wav[44..], pcm.as_slice());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 并发写历史不能互相覆盖。
+    ///
+    /// 收尾、自动补转写、用户删记录都是读-改-写：各自读到同一份旧列表，
+    /// 加完自己那条再整体写回，后来的会盖掉先写的。这里用多条线程同时追加
+    /// 验证锁生效——去掉 HISTORY_LOCK 这条测试会丢记录。
+    #[test]
+    fn concurrent_appends_do_not_drop_records() {
+        let dir = temp_dir();
+        let total = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(total));
+        let mut handles = Vec::new();
+
+        for index in 0..total {
+            let dir = dir.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                append(
+                    &dir,
+                    HistoryAppend {
+                        id: format!("record-{index}"),
+                        text: "并发写入",
+                        duration_ms: 10,
+                        audio: None,
+                        recognition: None,
+                        recording_error: None,
+                        recognition_error: None,
+                    },
+                )
+                .unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut ids: Vec<String> = load(&dir).records.into_iter().map(|r| r.id).collect();
+        ids.sort();
+        assert_eq!(ids.len(), total, "并发追加丢了记录：{ids:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 }
