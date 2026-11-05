@@ -33,19 +33,6 @@ pub enum InsertionProbe {
     Unknown,
 }
 
-/// Deliver to the app that is frontmost when dictation stops.
-///
-/// Falling back to the app captured at start is only safe when macOS cannot
-/// identify any current frontmost app. If the user deliberately switched apps
-/// and the new app has no caret, returning the old app here would reactivate it
-/// and paste into a stale insertion point instead of showing the copy prompt.
-pub(crate) fn choose_delivery_target<T>(
-    initial_target: Option<T>,
-    current_target: Option<T>,
-) -> Option<T> {
-    current_target.or(initial_target)
-}
-
 /// Roles that represent a real text insertion point (native controls and
 /// Chromium-exposed web text fields).
 const TEXT_ROLES: &[&str] = &["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"];
@@ -1057,9 +1044,43 @@ fn post_paste_via_cgevent() -> bool {
     true
 }
 
+/// 停表那一刻定格投递目标。
+///
+/// 优先读**当前**前台：用户完全可能在录音中途换过应用，那才是他真正想
+/// 写进去的地方。`remembered` 是胶囊弹出时记下的快照，听写全程不会更新，
+/// 所以只能在前台读不出来时兜底（macOS 拿不到 frontmostApplication，或
+/// 前台就是 JackVoice 自己）。
+///
+/// 反过来只用 `remembered` 会退化成「粘回开始听写时那个应用」：在 Chrome
+/// 开始说话、中途切到 Notes 再停表，文字会被拉回 Chrome——这正是
+/// bbf1d46「修复跨应用停止听写时误插入旧窗口」修掉的场景。
+///
+/// 之所以要在这里定格而不是等投递时再读：收尾已经转入后台，投递可能晚
+/// 几秒才发生，那时用户早就换窗口了，再读当前前台就会串台。
+pub(crate) fn freeze_delivery_target(
+    current: Option<crate::overlay::FrontmostApp>,
+    remembered: Option<crate::overlay::FrontmostApp>,
+) -> Option<crate::overlay::FrontmostApp> {
+    current.or(remembered)
+}
+
+/// 投递前要不要把目标应用重新带回前台。
+///
+/// `target` 是录音停止那一刻定格的输入目标，投递可能要在几秒后才发生；
+/// 目标本来就是前台时不能再激活一次，否则多窗口应用里带光标的窗口会被顶掉。
+pub(crate) fn needs_reactivation(
+    target: Option<&crate::overlay::FrontmostApp>,
+    current: Option<&crate::overlay::FrontmostApp>,
+) -> bool {
+    target.is_some_and(|selected| current.is_none_or(|current| current.pid != selected.pid))
+}
+
 #[cfg(test)]
 mod clipboard_transaction_tests {
-    use super::{choose_delivery_target, clipboard_is_still_temporary, is_unsupported_ax_app};
+    use super::{
+        clipboard_is_still_temporary, freeze_delivery_target, is_unsupported_ax_app,
+        needs_reactivation,
+    };
 
     #[test]
     fn recognizes_unsupported_ax_apps() {
@@ -1247,20 +1268,49 @@ mod clipboard_transaction_tests {
         assert!(!clipboard_is_still_temporary(42, 42, false));
     }
 
-    #[test]
-    fn app_switch_never_reactivates_the_original_dictation_target() {
-        assert_eq!(
-            choose_delivery_target(Some("Codex".to_string()), Some("Chrome".to_string())),
-            Some("Chrome".to_string())
-        );
+    fn app(pid: i32, name: &str) -> crate::overlay::FrontmostApp {
+        crate::overlay::FrontmostApp {
+            pid,
+            name: name.into(),
+        }
     }
 
     #[test]
-    fn original_target_is_only_used_when_current_app_is_unavailable() {
+    fn already_frontmost_target_is_not_reactivated() {
+        let target = app(1, "Codex");
+        assert!(!needs_reactivation(Some(&target), Some(&target)));
+    }
+
+    #[test]
+    fn target_is_reactivated_only_after_the_user_moved_away() {
+        let target = app(1, "Codex");
+        let elsewhere = app(2, "Chrome");
+        assert!(needs_reactivation(Some(&target), Some(&elsewhere)));
+        assert!(needs_reactivation(Some(&target), None));
+        assert!(!needs_reactivation(None, Some(&elsewhere)));
+    }
+
+    /// 停表时用户在哪个应用，文字就该落进哪个应用。
+    ///
+    /// 这是 bbf1d46 修过的场景，这次收尾转后台时必须继续保持：在 Chrome
+    /// 按快捷键开始说话，中途切到 Notes 再停表，目标必须是 Notes。
+    #[test]
+    fn app_switch_mid_dictation_delivers_to_the_app_frontmost_at_stop() {
+        let started_in = Some(app(1, "Chrome"));
+        let stopped_in = app(2, "Notes");
         assert_eq!(
-            choose_delivery_target(Some("Codex".to_string()), None),
-            Some("Codex".to_string())
+            freeze_delivery_target(Some(stopped_in), started_in),
+            Some(app(2, "Notes")),
+            "中途换了应用时，停表那一刻的前台才是投递目标"
         );
+    }
+
+    /// 读不到当前前台时才退回胶囊弹出时的快照。
+    #[test]
+    fn the_capsule_snapshot_is_only_a_fallback() {
+        let started_in = Some(app(1, "Chrome"));
+        assert_eq!(freeze_delivery_target(None, started_in.clone()), started_in);
+        assert_eq!(freeze_delivery_target(None, None), None);
     }
 
     #[test]

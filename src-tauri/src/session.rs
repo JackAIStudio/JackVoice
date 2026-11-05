@@ -103,14 +103,14 @@ pub struct UiState {
 }
 
 impl UiState {
-    /// Live capture / recognition lifecycle. Kept as the single definition of
-    /// "a dictation is running" so UI code cannot drift from the phase names.
+    /// 麦克风还开着、文字还在往外冒的那一段。
+    ///
+    /// `finalizing` 故意不算在内：录音一停麦克风就放了手，剩下的整理文字是
+    /// 后台的事，用户可以立刻开下一轮。把 `finalizing` 算进来的话，收尾拖
+    /// 一秒，快捷键就跟着哑一秒。
     #[allow(dead_code)]
     pub fn is_live_dictation(&self) -> bool {
-        matches!(
-            self.phase.as_str(),
-            "starting" | "connecting" | "recording" | "finalizing"
-        )
+        matches!(self.phase.as_str(), "starting" | "connecting" | "recording")
     }
 }
 
@@ -169,6 +169,9 @@ struct ActiveSession {
     /// 开始收尾的时刻。收尾链路上任何一步卡住（ASR 不返回、主线程被
     /// 子进程挂住）都会让 active 永远不释放，此后快捷键就变成“按了没反应”。
     stopping_since: Option<Instant>,
+    /// 取消标记属于这一轮本身。用全局标记的话，上一轮点了取消、下一轮
+    /// 已经开始时，上一轮的收尾会被误读成“也取消”。
+    cancel: Arc<AtomicBool>,
 }
 
 struct RecordingSession {
@@ -180,6 +183,9 @@ struct RecordingSession {
     audio_stop_tx: std::sync::mpsc::Sender<()>,
     settings: AppSettings,
     actual_input_device_id: String,
+    /// 这一轮自己的取消标记。不能读全局状态：用户可能在上一轮已经点过
+    /// 取消、而这一轮正在录音，全局标记会把两轮混在一起。
+    cancel: Arc<AtomicBool>,
 }
 
 enum SessionControl {
@@ -223,13 +229,19 @@ pub struct AppState {
     active: Mutex<Option<ActiveSession>>,
     monitor: Mutex<Option<MonitorSession>>,
     mic_fallback_state: Mutex<MicFallbackState>,
-    cancel_requested: Mutex<bool>,
     /// Prevents overlapping background sweeps of failed transcripts.
     retry_in_flight: AtomicBool,
     /// Record ids currently being re-transcribed, whether manual or automatic.
     retrying_records: Mutex<HashSet<String>>,
     /// File transcription shares one ASR connection at a time.
     retry_gate: tokio::sync::Mutex<()>,
+    /// 后台收尾串行化。收尾可以慢，但不能两轮同时往同一个输入位置粘贴。
+    finish_gate: tokio::sync::Mutex<()>,
+    /// 最近一次已经完成投递的轮次。用它保证文字按轮次顺序落地：
+    /// 更近的一轮先粘贴成功时，更早的一轮不再插队。
+    last_delivered_session: AtomicU64,
+    /// 正在后台收尾的轮数。录音一停 `active` 就释放了，但收尾还要跑一会儿。
+    background_finalize: std::sync::atomic::AtomicUsize,
     /// Serializes TOS glossary sync so a focus refresh cannot race a save-triggered sync.
     glossary_sync_gate: tokio::sync::Mutex<()>,
     /// Bumped whenever a dictation session starts, so a scheduled
@@ -324,14 +336,25 @@ impl AppState {
             active: Mutex::new(None),
             monitor: Mutex::new(None),
             mic_fallback_state: Mutex::new(MicFallbackState::default()),
-            cancel_requested: Mutex::new(false),
             retry_in_flight: AtomicBool::new(false),
             retrying_records: Mutex::new(HashSet::new()),
             retry_gate: tokio::sync::Mutex::new(()),
+            finish_gate: tokio::sync::Mutex::new(()),
+            last_delivered_session: AtomicU64::new(0),
+            background_finalize: std::sync::atomic::AtomicUsize::new(0),
             glossary_sync_gate: tokio::sync::Mutex::new(()),
             session_epoch: AtomicU64::new(0),
             session_pinned: AtomicBool::new(false),
         })
+    }
+
+    /// 是否有一轮听写正在进行（录音中，或刚停表还在后台整理文字）。
+    ///
+    /// 自动补转写、麦克风切换这类"只有空闲时才能做"的操作都用它判断。
+    /// 只看 `active` 不够：录音一停 `active` 就释放了，但后台收尾还在跑，
+    /// 这时插进去会把两路识别和两次 history.json 读改写叠在一起。
+    fn busy_with_a_take(&self) -> bool {
+        self.active.lock().is_some() || self.background_finalize.load(Ordering::Acquire) > 0
     }
 
     pub fn snapshot(&self) -> UiState {
@@ -1156,10 +1179,18 @@ impl AppState {
         // Silent cancel: stop capture, keep the local recording, skip ASR
         // finalization / paste. Hide the capsule without launching another
         // app or presenting the settings window.
-        let had_active = self.active.lock().is_some();
+        let (had_active, cancel_flag) = {
+            let active = self.active.lock();
+            (
+                active.is_some(),
+                active.as_ref().map(|session| session.cancel.clone()),
+            )
+        };
         self.session_pinned.store(false, Ordering::Relaxed);
         self.ui.lock().session_pinned = false;
-        *self.cancel_requested.lock() = true;
+        if let Some(flag) = cancel_flag {
+            flag.store(true, Ordering::SeqCst);
+        }
         if had_active {
             // stop without relying on UI focus changes
             let _ = self.stop(app.clone()).await?;
@@ -1200,7 +1231,7 @@ impl AppState {
         &self,
         app: AppHandle,
     ) -> Result<crate::history::HistoryData, String> {
-        if self.active.lock().is_some() {
+        if self.busy_with_a_take() {
             return Ok(crate::history::load(&self.shared_data_dir));
         }
         if self.settings.lock().volc_api_key.trim().is_empty() {
@@ -1212,7 +1243,7 @@ impl AppState {
         let result = async {
             let pending = crate::history::pending_auto_retry_records(&self.shared_data_dir);
             for record in pending {
-                if self.active.lock().is_some() {
+                if self.busy_with_a_take() {
                     break;
                 }
                 if self.retrying_records.lock().contains(&record.id) {
@@ -1524,11 +1555,11 @@ impl AppState {
                 started_at: None,
                 stopping: false,
                 stopping_since: None,
+                cancel: Arc::new(AtomicBool::new(false)),
             });
         }
 
         self.stop_mic_test_internal();
-        *self.cancel_requested.lock() = false;
         let settings = self.settings.lock().clone();
 
         {
@@ -1688,6 +1719,13 @@ impl AppState {
         }
 
         let actual_input_device_id = self.ui.lock().active_input_device_id.clone();
+        let session_cancel = self
+            .active
+            .lock()
+            .as_ref()
+            .filter(|active| active.id == session_id)
+            .map(|active| active.cancel.clone())
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
         let app_for_task = app.clone();
         tokio::spawn(run_recording_session(
@@ -1701,6 +1739,7 @@ impl AppState {
                 audio_stop_tx: audio_stop_tx.clone(),
                 settings: settings.clone(),
                 actual_input_device_id,
+                cancel: session_cancel,
             },
         ));
 
@@ -1764,6 +1803,7 @@ impl AppState {
 
         // 没有活动会话时不要把界面钉死在 finalizing：那会让胶囊一直显示
         // “收尾中”，同时 is_live_dictation() 永远为真，程序坞点击被吞掉。
+        // 上一轮还在后台整理文字时也会走到这里——那种情况界面归收尾自己管。
         if !had_session {
             let ui = self.snapshot();
             return Ok(ui);
@@ -1873,6 +1913,7 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
         audio_stop_tx,
         settings,
         actual_input_device_id,
+        cancel,
     } = session;
     let punctuation = settings.semantic_punctuation_enabled;
     let smoothing = settings.semantic_smoothing_enabled;
@@ -2143,42 +2184,14 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
         }
     }
 
-    let is_cancel = app
-        .try_state::<AppState>()
-        .map(|state| *state.cancel_requested.lock())
-        .unwrap_or(false);
+    let is_cancel = cancel.load(Ordering::SeqCst);
     if is_cancel {
         drop(asr_tx.take());
         recognition_error = Some("用户已取消文字识别".into());
     }
 
-    if !is_cancel {
-        if let Some(state) = app.try_state::<AppState>() {
-            let mut ui = state.ui.lock();
-            ui.phase = "finalizing".into();
-            ui.recognition_phase = "finalizing".into();
-            ui.audio_level = 0.0;
-            ui.status = if reached_duration_limit {
-                format!(
-                    "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限，录音已停止，正在整理文字…"
-                )
-            } else {
-                "本地录音已完成，正在整理文字…".into()
-            };
-            let _ = app.emit("jackvoice://level", 0.0_f32);
-            let _ = app.emit("jackvoice://state", ui.clone());
-        }
-    } else if let Some(state) = app.try_state::<AppState>() {
-        let mut ui = state.ui.lock();
-        ui.phase = "idle".into();
-        ui.recognition_phase = "idle".into();
-        ui.audio_level = 0.0;
-        ui.status = "正在保存已取消听写的本地录音…".into();
-        let _ = app.emit("jackvoice://level", 0.0_f32);
-        let _ = app.emit("jackvoice://state", ui.clone());
-    }
-
-    // Commit the local WAV before waiting for any network finalization.
+    // 本地 WAV 先落地：写完这一轮的录音就已经安全了，后面的文字整理
+    // 一律在后台做，不再占着快捷键的通道。
     let saved_audio = match recorder.finish() {
         Ok(audio) => Some(audio),
         Err(error) => {
@@ -2187,12 +2200,178 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
         }
     };
 
-    let mut final_text = app
-        .try_state::<AppState>()
-        .map(|state| state.ui.lock().transcript.clone())
-        .unwrap_or_default();
+    // 录音结束就把活动会话让出来。从这一刻起再按 Option+Space 走的是
+    // start()，新一轮立刻能开始，不用等上一轮的文字整理。
+    //
+    // 投递目标和实时转写也在同一时刻定格：这时用户还在他说话的那个输入框
+    // 里，界面上的 transcript 也还是这一轮的话。放行下一轮之后这两样都会变。
+    //
+    // 目标取「停表这一刻的前台」，不是胶囊弹出时的快照：用户中途换过应用时，
+    // 他现在待着的那个才是想写进去的地方。快照只在前台读不出来时兜底。
+    let target = delivery::freeze_delivery_target(
+        crate::overlay::current_frontmost_app(),
+        crate::overlay::remembered_frontmost_app(),
+    );
+    let live_transcript = match app.try_state::<AppState>() {
+        Some(state) => state.ui.lock().transcript.clone(),
+        None => String::new(),
+    };
+    // 置顶标记也在这里取走：留给后台收尾去读的话，用户可能已经开了新一轮
+    // 并重新置顶，旧一轮就会把新一轮的待办标记抢走。
+    let pinned = take_session_pin(&app, session_id);
+    let session_guard = take_active_session(&app, session_id);
+    let duration_ms = saved_audio
+        .as_ref()
+        .map(|audio| audio.duration_ms)
+        .or_else(|| {
+            session_guard
+                .as_ref()
+                .and_then(|session| session.started_at)
+                .map(|started| started.elapsed().as_millis() as u64)
+        })
+        .unwrap_or(0);
+    restore_output_mute(session_guard.and_then(|mut session| session.output_mute.take()));
+
+    {
+        // 只在这一轮仍是用户眼前那一轮时改写胶囊。已经开了下一轮就
+        // 什么都不动：新一轮的「正在录音」不能被上一轮的「整理中」盖掉。
+        if let Some(state) = app.try_state::<AppState>() {
+            let mut ui = state.ui.lock();
+            if state.session_epoch.load(Ordering::SeqCst) != session_id {
+                // 用户已经开了更新的一轮，界面归它所有。
+            } else if is_cancel {
+                ui.phase = "idle".into();
+                ui.recognition_phase = "idle".into();
+                ui.audio_level = 0.0;
+                ui.status = "正在保存已取消听写的本地录音…".into();
+                let _ = app.emit("jackvoice://level", 0.0_f32);
+                let _ = app.emit("jackvoice://state", ui.clone());
+            } else {
+                ui.phase = "finalizing".into();
+                ui.recognition_phase = "finalizing".into();
+                ui.audio_level = 0.0;
+                ui.status = if reached_duration_limit {
+                    format!(
+                        "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限，录音已停止，正在整理文字…"
+                    )
+                } else {
+                    "本地录音已完成，正在整理文字…".into()
+                };
+                let _ = app.emit("jackvoice://level", 0.0_f32);
+                let _ = app.emit("jackvoice://state", ui.clone());
+            }
+        }
+    }
+
+    spawn_background_finalize(
+        app.clone(),
+        FinalizeJob {
+            session_id,
+            record_id,
+            duration_ms,
+            live_transcript,
+            pinned,
+            saved_audio,
+            recognition_context,
+            replacement_rules,
+            target,
+            local_error,
+            recognition_error,
+            reached_duration_limit,
+            is_cancel,
+            asr_tx,
+        },
+    );
+}
+
+/// 录音结束、开始整理文字时取走活动会话。
+///
+/// 取走之后 `active` 为空，下一次 Option+Space 直接开新一轮；旧一轮的收尾
+/// 在后台继续跑。返回的会话里还带着这一轮的静音守卫，必须当场恢复。
+fn take_active_session(app: &AppHandle, session_id: u64) -> Option<ActiveSession> {
+    let state = app.try_state::<AppState>()?;
+    let mut active = state.active.lock();
+    if active
+        .as_ref()
+        .is_some_and(|session| session.id == session_id)
+    {
+        active.take()
+    } else {
+        None
+    }
+}
+
+/// 一场听写里「录音结束之后」的全部素材：把收尾从录音任务里整个摘出来，
+/// 让它能在后台独立跑完。
+struct FinalizeJob {
+    session_id: u64,
+    record_id: String,
+    duration_ms: u64,
+    /// 停表那一刻的实时转写快照。必须在放行下一轮之前抄好：新一轮的
+    /// start() 会清空并重写 ui.transcript，晚一步读到就是别的这一轮的话。
+    live_transcript: String,
+    /// 停表那一刻的置顶状态。同样必须在放行下一轮之前取走。
+    pinned: bool,
+    saved_audio: Option<crate::history::AudioArtifact>,
+    recognition_context: RecognitionContext,
+    replacement_rules: Vec<(String, String)>,
+    /// 文字要落到哪里。必须在停表那一刻定格：收尾拖得久时用户很可能已经
+    /// 换了应用，到投递时再读当前前台就会粘进错误的窗口。
+    target: Option<crate::overlay::FrontmostApp>,
+    local_error: Option<String>,
+    recognition_error: Option<String>,
+    reached_duration_limit: bool,
+    is_cancel: bool,
+    asr_tx: Option<mpsc::Sender<AsrCommand>>,
+}
+
+/// 把收尾丢进独立任务，并给 `background_finalize` 计数。
+///
+/// 计数不是装饰：录音一停 `active` 就释放了，自动补转写会以为「现在空着」
+/// 而插进来，于是两路识别同时开、同时往 history.json 里写。
+fn spawn_background_finalize(app: AppHandle, job: FinalizeJob) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    state.background_finalize.fetch_add(1, Ordering::AcqRel);
+    tokio::spawn(async move {
+        finalize_and_report(&app, job).await;
+        if let Some(state) = app.try_state::<AppState>() {
+            state.background_finalize.fetch_sub(1, Ordering::AcqRel);
+        }
+    });
+}
+
+/// 一轮听写的完整收尾：等 ASR 最终结果 → 写历史 → 投递 → 报界面。
+///
+/// 全程不碰 `active`，也不假定自己还是当前会话：录音已经结束，用户随时
+/// 可能又按了一次 Option+Space。界面归属由 `session_epoch` 判定。
+async fn finalize_and_report(app: &AppHandle, job: FinalizeJob) {
+    let session_id = job.session_id;
+    let is_cancel = job.is_cancel;
+    let reached_duration_limit = job.reached_duration_limit;
+
+    let FinalizeJob {
+        record_id,
+        duration_ms,
+        live_transcript,
+        pinned,
+        saved_audio,
+        recognition_context,
+        replacement_rules,
+        target,
+        mut local_error,
+        mut recognition_error,
+        asr_tx,
+        ..
+    } = job;
+
+    // 先取这一轮的实时文本快照。监听回调在 session 结束后就不再写它了，
+    // 但用户可能已经开了新一轮、把 ui.transcript 清空，所以要在收尾
+    // 拿到任何结论之前先抄一份。
+    let mut final_text = live_transcript;
     if local_error.is_none() && !is_cancel {
-        if let Some(tx) = asr_tx.take() {
+        if let Some(tx) = asr_tx {
             let (result_tx, result_rx) = oneshot::channel();
             if tx.send(AsrCommand::Finish(result_tx)).await.is_ok() {
                 match result_rx.await {
@@ -2207,190 +2386,343 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
                 recognition_error = Some("实时识别会话已经关闭".into());
             }
         }
-    } else {
-        drop(asr_tx);
     }
 
-    if let Some(state) = app.try_state::<AppState>() {
-        let elapsed_ms = state
-            .active
-            .lock()
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let history_result = crate::history::append(
+        &state.shared_data_dir,
+        HistoryAppend {
+            id: record_id,
+            text: &final_text,
+            duration_ms,
+            audio: saved_audio,
+            recognition: Some(recognition_context),
+            recording_error: local_error.clone(),
+            recognition_error: recognition_error.clone(),
+        },
+    );
+    if let Err(error) = history_result {
+        eprintln!("[history] 保存听写记录失败：{error}");
+        local_error.get_or_insert(format!("录音文件已保存，但写入历史记录失败：{error}"));
+    } else {
+        let _ = app.emit("jackvoice://history", true);
+        if recognition_error
             .as_ref()
-            .filter(|active| active.id == session_id)
-            .and_then(|active| active.started_at)
-            .map(|started| started.elapsed().as_millis() as u64)
-            .unwrap_or(0);
-        let duration_ms = saved_audio
-            .as_ref()
-            .map(|audio| audio.duration_ms)
-            .unwrap_or(elapsed_ms);
-        let history_result = crate::history::append(
-            &state.shared_data_dir,
-            HistoryAppend {
-                id: record_id,
-                text: &final_text,
-                duration_ms,
-                audio: saved_audio,
-                recognition: Some(recognition_context),
-                recording_error: local_error.clone(),
-                recognition_error: recognition_error.clone(),
-            },
-        );
-        if let Err(error) = history_result {
-            eprintln!("[history] 保存听写记录失败：{error}");
-            local_error.get_or_insert(format!("录音文件已保存，但写入历史记录失败：{error}"));
-        } else {
-            let _ = app.emit("jackvoice://history", true);
-            if recognition_error
-                .as_ref()
-                .is_some_and(|error| crate::history::is_auto_retryable_recognition_error(error))
-            {
-                schedule_pending_recognition_retries(&app);
+            .is_some_and(|error| crate::history::is_auto_retryable_recognition_error(error))
+        {
+            schedule_pending_recognition_retries(app);
+        }
+    }
+
+    let mut delivery_result = None;
+    let mut needs_copy_prompt = false;
+    let mut saved_to_memo = false;
+    let has_text = !final_text.trim().is_empty();
+    let can_deliver = has_text && local_error.is_none() && recognition_error.is_none();
+
+    if can_deliver {
+        // Pin means this take is a todo memo: file it and dismiss the capsule.
+        // It must not paste into a focused field.
+        if route_finished_transcript(pinned) == FinishedTranscriptRoute::MemoOnly {
+            match crate::memos::add_memo(app, &final_text, crate::memos::SOURCE_VOICE) {
+                Ok(_) => saved_to_memo = true,
+                Err(error) => eprintln!("[memos] 自动加入待办失败，改走粘贴: {error}"),
             }
         }
+    }
 
-        let mut delivery_result = None;
-        let mut needs_copy_prompt = false;
-        let mut saved_to_memo = false;
-        if !final_text.trim().is_empty() && local_error.is_none() && recognition_error.is_none() {
-            let is_pinned = state.session_pinned.swap(false, Ordering::Relaxed);
-            state.ui.lock().session_pinned = false;
-            // Pin means this take is a todo memo. Ending it (Option+Space or
-            // the confirm button) files the text and dismisses the capsule.
-            // It must not paste into a focused field, and it must not leave
-            // the result capsule up when there is no caret.
-            let mut route = route_finished_transcript(is_pinned);
-            if route == FinishedTranscriptRoute::MemoOnly {
-                match crate::memos::add_memo(&app, &final_text, crate::memos::SOURCE_VOICE) {
-                    Ok(_) => saved_to_memo = true,
-                    Err(e) => {
-                        eprintln!("[memos] 自动加入待办失败，改走粘贴: {e}");
-                        route = FinishedTranscriptRoute::InsertOrPrompt;
-                    }
-                }
-            }
-            if route == FinishedTranscriptRoute::MemoOnly {
-                needs_copy_prompt = false;
-                crate::overlay::hide_overlay(&app);
-            } else {
-                let initial_target = crate::overlay::remembered_frontmost_app();
-                let current_target = crate::overlay::current_frontmost_app();
-                let target = delivery::choose_delivery_target(
-                    initial_target.clone(),
-                    current_target.clone(),
-                );
-                eprintln!(
-                    "[delivery] target initial={initial_target:?} current={current_target:?} selected={target:?}"
-                );
-                let reactivate_target = target.as_ref().is_some_and(|selected| {
-                    current_target
-                        .as_ref()
-                        .is_none_or(|current| current.pid != selected.pid)
-                });
-                crate::overlay::set_remembered_frontmost_app(target.clone());
-                crate::overlay::hide_overlay_for_delivery(&app, reactivate_target);
-                // 目标本来就是前台时不要再激活：NSRunningApplication 的激活
-                // 会重新排列该应用的窗口，多窗口应用里带光标的窗口会被顶掉。
-                if reactivate_target {
-                    if let Some(target_app) = target.as_ref() {
-                        crate::overlay::activate_running_process(target_app.pid);
-                    }
-                }
-                // Keep a short delay so physical Option/Space keys have time to
-                // be released; deliver_text waits for modifiers as well.
-                tokio::time::sleep(Duration::from_millis(120)).await;
-                let probe = delivery::probe_insertion_target(target.as_ref());
-                let delivery = delivery::deliver_text_to(
-                    &app,
-                    &final_text,
-                    probe,
-                    target.as_ref().map(|target| target.pid),
-                )
-                .await;
-                needs_copy_prompt = !delivery.pasted;
-                delivery_result = Some(delivery);
-            }
-        } else if local_error.is_none() {
-            crate::overlay::hide_overlay(&app);
-            crate::overlay::ensure_main_stays_in_background(&app);
-        }
-
-        let guard = {
-            let mut active = state.active.lock();
-            if active
-                .as_ref()
-                .is_some_and(|active| active.id == session_id)
-            {
-                active
-                    .take()
-                    .and_then(|mut active| active.output_mute.take())
-            } else {
-                None
-            }
-        };
-        restore_output_mute(guard);
-
-        let mut ui = state.ui.lock();
-        ui.audio_level = 0.0;
-        ui.transcript = final_text;
-        ui.needs_copy_prompt = needs_copy_prompt;
-        ui.recognition_phase = "idle".into();
-        if let Some(error) = local_error {
-            ui.phase = "error".into();
-            ui.status = error;
-        } else {
-            ui.phase = "idle".into();
-            ui.status = if is_cancel {
-                "已取消文字处理，本地录音已保存。".into()
-            } else if let Some(error) = recognition_error {
-                if reached_duration_limit {
-                    format!(
-                        "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束；本地录音已保存；实时识别未完成：{error}"
-                    )
-                } else {
-                    format!("本地录音已保存；实时识别未完成：{error}")
-                }
-            } else if saved_to_memo {
-                if reached_duration_limit {
-                    format!(
-                        "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束，已收入待办事项。"
-                    )
-                } else {
-                    "已收入待办事项。".into()
-                }
-            } else if ui.transcript.trim().is_empty() {
-                if reached_duration_limit {
-                    format!(
-                        "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束；本地录音已保存，本次未识别到文字。"
-                    )
-                } else {
-                    "本地录音已保存，本次未识别到文字。".into()
-                }
-            } else if reached_duration_limit {
-                format!(
-                    "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束，本地录音已保存。"
-                )
-            } else {
-                "听写结束，本地录音已保存。".into()
+    if can_deliver && !saved_to_memo {
+        // 串行门必须一直握到粘贴结束：只做一次检查就放手的话，两轮收尾
+        // 仍会同时往同一个光标里塞文字。
+        let turn = {
+            let Some(state) = app.try_state::<AppState>() else {
+                return;
             };
+            let gate = state.finish_gate.lock().await;
+            let turn = delivery_turn(&state, session_id);
+            match turn {
+                DeliveryTurn::Go => {
+                    match deliver_finalized_text(app, session_id, &final_text, target.as_ref())
+                        .await
+                    {
+                        Some(delivery) => {
+                            needs_copy_prompt = !delivery.pasted;
+                            delivery_result = Some(delivery);
+                        }
+                        // 投递途中让位给了新一轮：文字已经进历史，界面归新一轮。
+                        None => needs_copy_prompt = false,
+                    }
+                }
+                DeliveryTurn::Held => {
+                    // 用户正在说下一轮：文字已经进历史，这次不抢他说话的光标。
+                    needs_copy_prompt = true;
+                }
+                DeliveryTurn::Superseded => {
+                    // 更新的轮次已经投递过，这一轮只留历史。
+                }
+            }
+            mark_delivered(&state, session_id);
+            drop(gate);
+            turn
+        };
+        if let DeliveryTurn::Superseded = turn {
+            needs_copy_prompt = false;
         }
-        if saved_to_memo {
-            ui.last_delivery_message = "已收入待办事项，未粘贴。".into();
-        } else if let Some(delivery) = delivery_result.as_ref() {
-            ui.last_delivery_message = delivery.message.clone();
+    } else if saved_to_memo {
+        if let Some(state) = app.try_state::<AppState>() {
+            mark_delivered(&state, session_id);
         }
-        let phase_is_error = ui.phase == "error";
-        if phase_is_error {
-            crate::overlay::show_overlay(&app);
-            schedule_error_overlay_hide(&app, session_id);
-        } else if needs_copy_prompt {
-            crate::overlay::show_overlay(&app);
+    }
+
+    report_finalize(
+        app,
+        FinalizeReport {
+            session_id,
+            final_text,
+            local_error,
+            recognition_error,
+            delivery_result,
+            needs_copy_prompt,
+            saved_to_memo,
+            is_cancel,
+            reached_duration_limit,
+        },
+    );
+}
+
+/// 实际把文字送进目标应用。调用方已经确认过「轮到这一轮了」。
+///
+/// 返回 `None` 表示中途让给了新一轮：投递要花上一两秒，这期间用户完全可能
+/// 已经按下 Option+Space 开始说话，而投递链路第一步就是收起胶囊——继续跑
+/// 会把新一轮的胶囊藏掉，粘贴也会插进他此刻正在说的那句话里。
+async fn deliver_finalized_text(
+    app: &AppHandle,
+    session_id: u64,
+    text: &str,
+    target: Option<&crate::overlay::FrontmostApp>,
+) -> Option<DeliveryResult> {
+    if !still_the_latest_session(app, session_id) {
+        return None;
+    }
+    let current_target = crate::overlay::current_frontmost_app();
+    let reactivate_target = delivery::needs_reactivation(target, current_target.as_ref());
+    crate::overlay::set_remembered_frontmost_app(target.cloned());
+    crate::overlay::hide_overlay_for_delivery(app, reactivate_target);
+    // 目标本来就是前台时不要再激活：NSRunningApplication 的激活会重新
+    // 排列该应用的窗口，多窗口应用里带光标的窗口会被顶掉。
+    if reactivate_target {
+        if let Some(target_app) = target {
+            crate::overlay::activate_running_process(target_app.pid);
         }
-        let _ = app.emit("jackvoice://state", ui.clone());
-        drop(ui);
+    }
+    // Keep a short delay so physical Option/Space keys have time to be
+    // released; deliver_text waits for modifiers as well.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    // 收起胶囊、激活目标、等修饰键都要时间；真正按键之前再确认一次，
+    // 别把上一轮的话打进新一轮正在录的那句话里。
+    if !still_the_latest_session(app, session_id) {
+        return None;
+    }
+    let probe = delivery::probe_insertion_target(target);
+    Some(delivery::deliver_text_to(app, text, probe, target.map(|target| target.pid)).await)
+}
+
+/// 这一轮还是不是最后开的那一轮？
+fn still_the_latest_session(app: &AppHandle, session_id: u64) -> bool {
+    match app.try_state::<AppState>() {
+        Some(state) => state.session_epoch.load(Ordering::SeqCst) == session_id,
+        None => false,
+    }
+}
+
+/// 一轮收尾投递文字之前要拿到的结果。
+enum DeliveryTurn {
+    /// 轮到了，可以往外粘贴。
+    Go,
+    /// 用户已经在说下一轮，这次不插队：文字留给胶囊上的结果卡片。
+    Held,
+    /// 更新的轮次已经投递过，这一轮只留历史。
+    Superseded,
+}
+
+/// 轮到这一轮投递了吗？调用方必须已经持有 `finish_gate`。
+///
+/// 收尾是并发的：两轮同时往一个光标里粘贴必然互相踩，而它们又是不同时间
+/// 说的话，落地顺序必须是说话的先后顺序。
+fn delivery_turn(state: &AppState, session_id: u64) -> DeliveryTurn {
+    decide_delivery_turn(
+        state.last_delivered_session.load(Ordering::Acquire),
+        state.active.lock().is_some(),
+        session_id,
+    )
+}
+
+/// `delivery_turn` 的判定本体，抽出来便于单独验证。
+///
+/// - 更新的轮次已经落地：这一轮只留历史，不然文字会以说话的反顺序出现。
+/// - 用户正在说下一轮：这次不抢他的光标，文字停在结果卡片上等他点。
+fn decide_delivery_turn(
+    last_delivered: u64,
+    dictation_running: bool,
+    session_id: u64,
+) -> DeliveryTurn {
+    if last_delivered > session_id {
+        return DeliveryTurn::Superseded;
+    }
+    if dictation_running {
+        return DeliveryTurn::Held;
+    }
+    DeliveryTurn::Go
+}
+
+/// 这一轮的收尾结果还能不能改界面？
+///
+/// 判据就必须是「它还是最后开的那一轮」。光看 phase 不够：两轮收尾前后
+/// 脚都落在 `idle`，谁都可能把对方的结果盖掉。
+fn owns_ui(current_epoch: u64, dictation_running: bool, session_id: u64) -> bool {
+    current_epoch == session_id && !dictation_running
+}
+
+/// 记下「这一轮的文字已经落地」。粘贴成功、留结果卡片、进待办都算。
+fn mark_delivered(state: &AppState, session_id: u64) {
+    let mut delivered = state.last_delivered_session.load(Ordering::Acquire);
+    while delivered < session_id {
+        match state.last_delivered_session.compare_exchange(
+            delivered,
+            session_id,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(current) => delivered = current,
+        }
+    }
+}
+
+/// 取走这一轮的置顶标记，只在这一轮仍是当前会话时动手。
+///
+/// `session_pinned` 是全局的「下一次结束要不要收入待办」。不核对轮次就
+/// `swap(false)` 的话，上一轮的收尾会把用户刚给新一轮点上的置顶清掉。
+fn take_session_pin(app: &AppHandle, session_id: u64) -> bool {
+    let Some(state) = app.try_state::<AppState>() else {
+        return false;
+    };
+    if state.session_epoch.load(Ordering::SeqCst) != session_id {
+        return false;
+    }
+    let pinned = state.session_pinned.swap(false, Ordering::Relaxed);
+    state.ui.lock().session_pinned = false;
+    pinned
+}
+
+/// 一轮收尾的结论，交给 `report_finalize` 写回界面。
+struct FinalizeReport {
+    session_id: u64,
+    final_text: String,
+    local_error: Option<String>,
+    recognition_error: Option<String>,
+    delivery_result: Option<DeliveryResult>,
+    needs_copy_prompt: bool,
+    saved_to_memo: bool,
+    is_cancel: bool,
+    reached_duration_limit: bool,
+}
+
+/// 把收尾结论写回界面。
+///
+/// 只有「这一轮就是用户眼前那一轮」时才动胶囊和状态栏：旧一轮的收尾哪怕
+/// 晚到十几秒，也不能把新一轮的录音界面换掉。判据是 `session_epoch` ——
+/// 它每开一轮就加一，当前值正好是最后那一轮的 id；光看 phase 分不清
+/// 同样是 idle 的两轮。
+fn report_finalize(app: &AppHandle, report: FinalizeReport) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let FinalizeReport {
+        session_id,
+        final_text,
+        local_error,
+        recognition_error,
+        delivery_result,
+        needs_copy_prompt,
+        saved_to_memo,
+        is_cancel,
+        reached_duration_limit,
+    } = report;
+
+    // 用户已经开了新一轮：这一轮的收尾只落历史，界面归新一轮所有。
+    // 但文字不能丢——把它留在状态行的历史里，用户可以自己去历史记录取。
+    if !owns_ui(
+        state.session_epoch.load(Ordering::SeqCst),
+        state.active.lock().is_some(),
+        session_id,
+    ) {
+        eprintln!("[session] 第 {session_id} 轮收尾晚于新一轮结束，结果已写入历史");
         if let Some(delivery) = delivery_result {
             let _ = app.emit("jackvoice://delivery", delivery);
         }
+        return;
+    }
+
+    let mut ui = state.ui.lock();
+    ui.audio_level = 0.0;
+    ui.transcript = final_text.clone();
+    ui.needs_copy_prompt = needs_copy_prompt;
+    ui.recognition_phase = "idle".into();
+    if let Some(error) = local_error {
+        ui.phase = "error".into();
+        ui.status = error;
+    } else {
+        ui.phase = "idle".into();
+        ui.status = if is_cancel {
+            "已取消文字处理，本地录音已保存。".into()
+        } else if let Some(error) = recognition_error {
+            if reached_duration_limit {
+                format!(
+                    "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束；本地录音已保存；实时识别未完成：{error}"
+                )
+            } else {
+                format!("本地录音已保存；实时识别未完成：{error}")
+            }
+        } else if saved_to_memo {
+            if reached_duration_limit {
+                format!(
+                    "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束，已收入待办事项。"
+                )
+            } else {
+                "已收入待办事项。".into()
+            }
+        } else if ui.transcript.trim().is_empty() {
+            if reached_duration_limit {
+                format!(
+                    "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束；本地录音已保存，本次未识别到文字。"
+                )
+            } else {
+                "本地录音已保存，本次未识别到文字。".into()
+            }
+        } else if reached_duration_limit {
+            format!("已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束，本地录音已保存。")
+        } else {
+            "听写结束，本地录音已保存。".into()
+        };
+    }
+    if saved_to_memo {
+        ui.last_delivery_message = "已收入待办事项，未粘贴。".into();
+    } else if let Some(delivery) = delivery_result.as_ref() {
+        ui.last_delivery_message = delivery.message.clone();
+    }
+    let phase_is_error = ui.phase == "error";
+    let _ = app.emit("jackvoice://state", ui.clone());
+    drop(ui);
+
+    // 只有失败和「没插进去、要用户手动复制」需要把胶囊叫回屏幕。
+    if phase_is_error || (needs_copy_prompt && !final_text.trim().is_empty()) {
+        crate::overlay::show_overlay(app);
+    }
+    if let Some(delivery) = delivery_result {
+        let _ = app.emit("jackvoice://delivery", delivery);
     }
 }
 
@@ -2651,7 +2983,7 @@ fn schedule_pending_recognition_retries(app: &AppHandle) {
             let Some(state) = app.try_state::<AppState>() else {
                 continue;
             };
-            if state.active.lock().is_some() {
+            if state.busy_with_a_take() {
                 continue;
             }
             if crate::history::pending_auto_retry_records(&state.shared_data_dir).is_empty() {
@@ -2742,6 +3074,7 @@ mod volc_connection_error_tests {
         MAX_DICTATION_DURATION, STUCK_STOP_TIMEOUT,
     };
     use crate::audio::{ActiveInputDevice, AudioNotice, InputDeviceInfo, InputDevicePreference};
+    use crate::session::{decide_delivery_turn, owns_ui, DeliveryTurn};
     use std::time::Duration;
 
     #[test]
@@ -2754,6 +3087,76 @@ mod volc_connection_error_tests {
             route_finished_transcript(false),
             FinishedTranscriptRoute::InsertOrPrompt
         );
+    }
+
+    /// 后台整理文字不能再算「麦克风还开着」。
+    ///
+    /// 这是这次修复的核心：`finalizing` 曾经让快捷键整段时间没有反应，
+    /// 因为用户按下去被当成了「对同一个会话再喊一次 stop」。
+    #[test]
+    fn background_finalizing_does_not_block_the_next_dictation() {
+        let mut ui = UiState::default();
+        for live in ["starting", "connecting", "recording"] {
+            ui.phase = live.into();
+            assert!(ui.is_live_dictation(), "{live} 仍然占用麦克风");
+        }
+        ui.phase = "finalizing".into();
+        assert!(
+            !ui.is_live_dictation(),
+            "整理文字属于后台收尾，不该再锁住快捷键"
+        );
+        ui.phase = "idle".into();
+        assert!(!ui.is_live_dictation());
+        ui.phase = "error".into();
+        assert!(!ui.is_live_dictation());
+    }
+
+    /// 收尾要按说话的先后顺序落地。
+    ///
+    /// 第 2 轮已经粘好了，第 1 轮才整理完——这时第 1 轮不能再往光标里插，
+    /// 否则用户会看到文字倒着出现。
+    #[test]
+    fn an_older_finish_never_outserts_a_newer_one() {
+        assert!(matches!(
+            decide_delivery_turn(2, false, 1),
+            DeliveryTurn::Superseded
+        ));
+        // 同一轮重复收尾不算插队，交给自己去判。
+        assert!(matches!(
+            decide_delivery_turn(1, false, 1),
+            DeliveryTurn::Go
+        ));
+        assert!(matches!(
+            decide_delivery_turn(0, false, 1),
+            DeliveryTurn::Go
+        ));
+    }
+
+    /// 用户已经在说下一轮时，上一轮不能抢他现在说话的光标。
+    #[test]
+    fn a_finish_holds_back_while_the_user_is_already_talking_again() {
+        assert!(matches!(
+            decide_delivery_turn(0, true, 1),
+            DeliveryTurn::Held
+        ));
+        // 但更新的一轮已经落地时，连「留着给他点」都不需要了。
+        assert!(matches!(
+            decide_delivery_turn(5, true, 1),
+            DeliveryTurn::Superseded
+        ));
+    }
+
+    /// 上一轮的收尾不许改写新一轮的界面。这是「按 Option+Space 没反应」
+    /// 之外最容易复发的那个问题：上一轮整理完把新一轮的胶囊换成结果卡片。
+    #[test]
+    fn only_the_latest_session_may_touch_the_ui() {
+        assert!(owns_ui(3, false, 3));
+        // 更新的一轮已经开了。
+        assert!(!owns_ui(4, false, 3));
+        // 用户正在录音。
+        assert!(!owns_ui(3, true, 3));
+        // 更早的一轮永远不拥有界面。
+        assert!(!owns_ui(3, false, 2));
     }
 
     /// 收尾卡死必须能被判出来：否则 active 永远不释放，快捷键就变成

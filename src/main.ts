@@ -477,7 +477,9 @@ function applyState(state: UiState) {
   const toggle = $("#toggle-btn") as HTMLButtonElement | null;
   if (toggle) {
     toggle.className = `dictation-control ${controlPhase}`;
-    toggle.disabled = phase === "finalizing";
+    // 「正在整理文字」是后台在做的事，用户可以随时开始下一轮听写。
+    // 这里绝不能把按钮禁用掉：按下去就该立刻开新录音，而不是等上一轮整理完。
+    toggle.disabled = false;
     toggle.title = state.status || phaseLabel(phase);
     toggle.setAttribute("aria-pressed", String(phase === "starting" || phase === "recording"));
     toggle.setAttribute(
@@ -486,7 +488,9 @@ function applyState(state: UiState) {
         ? "结束听写"
         : phase === "error"
             ? `重试听写：${state.status || "上次听写出错"}`
-            : state.status || "开始听写",
+            : phase === "finalizing"
+                ? "开始新一轮听写（上一轮在后台整理）"
+                : state.status || "开始听写",
     );
   }
 
@@ -687,7 +691,9 @@ function applyState(state: UiState) {
 }
 
 function applyMicUi(state: UiState) {
-  const dictationActive = !["idle", "error"].includes(state.phase);
+  // 「正在整理文字」属于后台收尾：麦克风已经放手了，用户随时可以开下一轮，
+  // 所以这一刻不该再把设备选择锁死。
+  const dictationActive = !["idle", "error", "finalizing"].includes(state.phase);
   const selectionLocked = dictationActive || state.micTesting;
   const select = $("#mic-select") as HTMLSelectElement | null;
   if (select) select.disabled = selectionLocked;
