@@ -36,6 +36,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+// schedule_push 要从 AppHandle 上取 state 和 emit 事件，这两个 trait 必须进来。
+use tauri::{Emitter, Manager};
 use ve_tos_rust_sdk::asynchronous::object::{ObjectAPI, ObjectContent};
 use ve_tos_rust_sdk::asynchronous::tos;
 use ve_tos_rust_sdk::asynchronous::tos::TosClient;
@@ -287,6 +289,14 @@ async fn push_remote(
     }
 }
 
+/// 两条待办的内容是否一样（id 之外的部分）。
+///
+/// 用来判断「本地这条和云端那条是不是同一状态」。只比 id 不够：勾完成、
+/// 改文本都不改 id，只比 id 就会永远认为「没变化」，永远推不上去。
+fn same_content(a: &MemoItem, b: &MemoItem) -> bool {
+    a.text == b.text && a.completed == b.completed && a.created_at_ms == b.created_at_ms
+}
+
 /// 合并：本地优先，云端补新，墓碑过滤。
 fn merge(
     local: &[MemoItem],
@@ -319,6 +329,46 @@ pub async fn sync(dir: &Path) -> Result<MemoSyncReport, String> {
     sync_inner(dir).await.map_err(|error| fail_state(dir, error))
 }
 
+/// 本地状态变了（勾完成 / 删除 / 撤销删除）之后，把这次改动推上去。
+///
+/// ## 为什么写操作要主动触发
+///
+/// 待办同步原来是「定时拉」的：每 60 秒、窗口聚焦、启动各一次。那套能拉回
+/// 手机记的新条目，但**推不出去本地状态的变化**——用户在这边勾掉一条，
+/// 手机上要等到下一次「本地有云端没有」的判定才可能更新，而那个判定
+/// 只看 id 在不在，根本不比较 `completed`。结果就是「Mac 上勾了，手机上还在」。
+///
+/// 所以勾/删之后立刻推一次。失败不弹错、不阻塞界面：定时拉取还会兜底，
+/// 下次同步时并集里本地优先，状态终归会传上去。
+pub fn schedule_push(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(state) = app.try_state::<crate::session::AppState>() else {
+            return;
+        };
+        let dir = state.data_dir();
+        // 没配 TOS 就别打网络：待办本来就是本地可用的功能。
+        if tos_sync::load_credentials(&dir).ok().flatten().is_none() {
+            return;
+        }
+        match sync(&dir).await {
+            Ok(report) => {
+                if report.pulled > 0 || report.pushed > 0 {
+                    let memos = crate::memos::list_memos(&app);
+                    let _ = app.emit(crate::memos::MEMOS_CHANGED_EVENT, &memos);
+                    crate::tray::update_tray_badge(
+                        &app,
+                        memos.iter().filter(|m| !m.completed).count(),
+                    );
+                }
+            }
+            // 静默：这条链路失败最常见的是断网，用户此刻正在做别的事，
+            // 弹一个「同步失败」只会打断他。
+            Err(error) => eprintln!("[memos-sync] 状态变更推送失败：{error}"),
+        }
+    });
+}
+
 async fn sync_inner(dir: &Path) -> Result<MemoSyncReport, String> {
     let credentials = tos_sync::load_credentials(dir)?
         .ok_or("还没有填写 TOS AccessKey / SecretKey。")?;
@@ -342,17 +392,26 @@ async fn sync_inner(dir: &Path) -> Result<MemoSyncReport, String> {
             memos::save_memos(dir, &merged)?;
         }
 
-        // 本地有没有云端缺的：有就推。删除墓碑过滤掉的条目**不算缺**，
-        // 否则每轮都会因为它们而反复推送。
-        let remote_ids: HashSet<&String> = remote
+        // 本地有没有云端缺的、或者内容不一样的：有就推。
+        //
+        // **不能只看 id 在不在**。勾完成只改 `completed`，id 没变——
+        // 以前这里只比 id，于是「在 Mac 上勾掉」永远推不上去，
+        // 手机上那条一直是未完成（实测复现过）。
+        // 删除墓碑过滤掉的条目不算「缺」，否则每轮都会因为它们反复推送。
+        let remote_by_id: std::collections::HashMap<&String, &MemoItem> = remote
             .as_ref()
-            .map(|r| r.0.iter().map(|item| &item.id).collect())
+            .map(|r| r.0.iter().map(|item| (&item.id, item)).collect())
             .unwrap_or_default();
-        let missing: Vec<&MemoItem> = local
+        let stale: Vec<&MemoItem> = local
             .iter()
-            .filter(|item| !remote_ids.contains(&item.id) && !deleted.contains(&item.id))
+            .filter(|item| !deleted.contains(&item.id))
+            .filter(|item| match remote_by_id.get(&item.id) {
+                None => true,
+                // 内容不一致（勾了完成、文本被改过）也要推。
+                Some(remote_item) => !same_content(item, remote_item),
+            })
             .collect();
-        let needs_push = !missing.is_empty() || remote.is_none();
+        let needs_push = !stale.is_empty() || remote.is_none();
 
         if !needs_push {
             let mut next = load_state(dir);
@@ -380,7 +439,7 @@ async fn sync_inner(dir: &Path) -> Result<MemoSyncReport, String> {
                 save_state(dir, &next)?;
                 return Ok(MemoSyncReport {
                     pulled: adopted,
-                    pushed: missing.len(),
+                    pushed: stale.len(),
                     skipped,
                     synced_at: now_rfc3339(),
                 });
@@ -465,9 +524,33 @@ mod tests {
         }
     }
 
+    /// 勾完成不改 id，所以「要不要推」不能只比 id。
+    ///
+    /// 这是真出过的 bug：在 Mac 上勾掉一条手机来的待办，推不上去，
+    /// 手机上永远显示未完成。原因是 `needs_push` 只检查 id 在不在云端。
     #[test]
-    fn merge_keeps_local_state_for_known_ids() {
-        let mut local = memo("a", "本地勾过的", 10);
+    fn same_content_detects_completion_change() {
+        let local = MemoItem {
+            completed: true,
+            ..memo("a", "买牛奶", 10)
+        };
+        let remote = memo("a", "买牛奶", 10);
+        assert!(
+            !same_content(&local, &remote),
+            "completed 变了必须算「不一样」，否则勾完成永远推不上去"
+        );
+        assert!(same_content(&local, &local.clone()));
+    }
+
+    #[test]
+    fn same_content_detects_text_change() {
+        let a = memo("a", "买牛奶", 10);
+        let b = memo("a", "买酸奶", 10);
+        assert!(!same_content(&a, &b));
+    }
+
+    #[test]
+    fn merge_keeps_local_state_for_known_ids() {        let mut local = memo("a", "本地勾过的", 10);
         local.completed = true;
         let remote = vec![memo("a", "云端还没勾", 10)];
         let deleted = HashSet::new();

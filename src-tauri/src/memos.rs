@@ -139,6 +139,8 @@ pub fn add_memo(app: &AppHandle, text: &str, source: &str) -> Result<MemoItem, S
     })?;
     let _ = app.emit(MEMOS_CHANGED_EVENT, &merged);
     refresh_tray_badge(app, &merged);
+    // 新条目也要推给云端，否则手机上永远看不到桌面记的待办。
+    crate::memos_sync::schedule_push(app);
     Ok(item)
 }
 
@@ -155,6 +157,8 @@ pub fn toggle_memo(app: &AppHandle, id: &str) -> Result<Vec<MemoItem>, String> {
     })?;
     let _ = app.emit(MEMOS_CHANGED_EVENT, &memos);
     refresh_tray_badge(app, &memos);
+    // 勾完成只改本地状态，不推的话手机上永远显示未完成。
+    crate::memos_sync::schedule_push(app);
     Ok(memos)
 }
 
@@ -172,6 +176,8 @@ pub fn delete_memo(app: &AppHandle, id: &str) -> Result<Vec<MemoItem>, String> {
     crate::memos_sync::remember_deleted(&dir, id);
     let _ = app.emit(MEMOS_CHANGED_EVENT, &memos);
     refresh_tray_badge(app, &memos);
+    // 推一次，让云端也跟着少一条——手机那边才会消失。
+    crate::memos_sync::schedule_push(app);
     Ok(memos)
 }
 
@@ -203,6 +209,8 @@ pub fn restore_memo(app: &AppHandle, memo: MemoItem) -> Result<Vec<MemoItem>, St
     crate::memos_sync::forget_deleted(&dir, &memo.id);
     let _ = app.emit(MEMOS_CHANGED_EVENT, &memos);
     refresh_tray_badge(app, &memos);
+    // 撤销之后云端也该把这条带回来。
+    crate::memos_sync::schedule_push(app);
     Ok(memos)
 }
 

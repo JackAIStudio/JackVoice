@@ -545,7 +545,13 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (!delivery.pasted && (state?.transcript || "").trim()) {
       enterResultMode();
     } else if (delivery.pasted) {
-      exitResultMode();
+      // 插进去了：这一轮就结束了，胶囊一起收掉。
+      //
+      // 以前这里只 exitResultMode()，它清的是「结果卡片」那套样式，**不隐藏窗口**。
+      // 于是文字已经落进输入框，屏幕上却还挂着一个胶囊写着「待命」——
+      // 用户看到的就是「说完了，它怎么还不走」。只有没插进去（要用户自己
+      // 复制）时才该留着，因为那时候还有事没办完。
+      await dismissResult();
     }
   });
 });
