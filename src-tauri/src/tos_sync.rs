@@ -21,10 +21,12 @@ use ve_tos_rust_sdk::asynchronous::tos;
 use ve_tos_rust_sdk::asynchronous::tos::{AsyncRuntime, TosClient};
 use ve_tos_rust_sdk::object::{GetObjectInput, PutObjectFromBufferInput};
 
-const BUCKET: &str = "jackvoice-glossary";
+// 桶和区域也给 memos_sync 用：待办和词库存同一个桶，只是对象名不同。
+// 改这里等于两端一起改，别在别处再写一遍字符串。
+pub(crate) const BUCKET: &str = "jackvoice-glossary";
 const KEY: &str = "glossary.json";
-const REGION: &str = "cn-beijing";
-const ENDPOINT: &str = "https://tos-cn-beijing.volces.com";
+pub(crate) const REGION: &str = "cn-beijing";
+pub(crate) const ENDPOINT: &str = "https://tos-cn-beijing.volces.com";
 const CREDENTIALS_FILE: &str = "tos-credentials.json";
 const STATE_FILE: &str = "glossary-sync-state.json";
 const FORMAT: &str = "jackvoice-glossary-v1";
@@ -103,7 +105,7 @@ struct MergeOutcome {
 }
 
 #[derive(Debug, Default)]
-struct TokioRuntime;
+pub(crate) struct TokioRuntime;
 
 #[async_trait::async_trait]
 impl AsyncRuntime for TokioRuntime {

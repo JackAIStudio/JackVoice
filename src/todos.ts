@@ -1,4 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import {
   MEMOS_CHANGED_EVENT,
   addMemo,
@@ -9,6 +10,22 @@ import {
   showUndoBar,
   type MemoItem,
 } from "./memos-shared";
+
+/** 待办同步回执。与 `memos_sync::MemoSyncReport` 对应。 */
+type MemoSyncReport = {
+  pulled: number;
+  pushed: number;
+  skipped: number;
+  syncedAt: string;
+};
+
+type MemoSyncStatus = {
+  hasCredentials: boolean;
+  key: string;
+  lastSyncedAt: string | null;
+  lastError: string | null;
+  deletedCount: number;
+};
 
 const $ = <T extends HTMLElement>(selector: string) => document.querySelector<T>(selector);
 
@@ -222,9 +239,99 @@ async function submitInput() {
   input.focus();
 }
 
-export async function initTodos() {
-  $("#todos-copy")?.addEventListener("click", () => void copyAll());
+/**
+ * 待办面板底部的同步状态。
+ *
+ * 只在**配置过 TOS** 时才显示。没配的用户看到一行「未配置」只会困惑——
+ * 他要的不是这个功能，是「待办能用」。
+ */
+async function refreshSyncState() {
+  const el = $("#todos-sync-state");
+  const button = $("#todos-sync") as HTMLButtonElement | null;
+  if (!el) return;
+  try {
+    const status = await invoke<MemoSyncStatus>("get_memos_sync_status");
+    if (!status.hasCredentials) {
+      el.hidden = true;
+      if (button) button.hidden = true;
+      return;
+    }
+    el.hidden = false;
+    if (button) button.hidden = false;
+    const at = status.lastSyncedAt;
+    const error = status.lastError;
+    if (error) {
+      el.textContent = `上次同步失败：${error}`;
+      el.dataset.state = "error";
+    } else if (!at) {
+      el.textContent = "已配置云端，等待首次同步";
+      el.dataset.state = "idle";
+    } else {
+      el.textContent = `上次同步 ${formatRelative(at)}`;
+      el.dataset.state = "ok";
+    }
+  } catch (error) {
+    console.warn("read memos sync status failed", error);
+    el.hidden = true;
+    if (button) button.hidden = true;
+  }
+}
+
+/** 把 ISO 时间说成「3 分钟前」。只给同步状态用，别的地方有 formatTime。 */
+function formatRelative(iso: string): string {
+  const at = Date.parse(iso);
+  if (Number.isNaN(at)) return iso;
+  const diff = Date.now() - at;
+  if (diff < 60_000) return "刚刚";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+  return `${Math.floor(diff / 86_400_000)} 天前`;
+}
+
+/** 面板内的轻提示。和 main.ts 的 showToast 用同一个元素，样式一致。 */
+let todoToastTimer: number | undefined;
+function todoToast(message: string, kind: "success" | "error") {
+  const toast = document.querySelector<HTMLElement>("#app-toast");
+  if (!toast) return;
+  if (todoToastTimer) window.clearTimeout(todoToastTimer);
+  toast.textContent = message;
+  toast.className = `app-toast ${kind}`;
+  todoToastTimer = window.setTimeout(() => {
+    toast.classList.add("hidden");
+    todoToastTimer = undefined;
+  }, 1800);
+}
+
+/** 手动同步：从手机拉一次。失败要说话——这是用户主动点的。 */
+async function syncFromPhone() {
+  const button = $("#todos-sync") as HTMLButtonElement | null;
+  if (button) button.disabled = true;
+  try {
+    const report = await invoke<MemoSyncReport>("sync_memos");
+    // 后端在 pulled > 0 时已经广播过事件，列表会自己刷新；
+    // 但用户点的是按钮，得给一句明确的回执。
+    if (report.pulled === 0 && report.pushed === 0) {
+      todoToast("已是最新，手机那边没有新待办。", "success");
+    } else {
+      const parts: string[] = [];
+      if (report.pulled > 0) parts.push(`拉回 ${report.pulled} 条`);
+      if (report.pushed > 0) parts.push(`推上去 ${report.pushed} 条`);
+      todoToast(`同步完成：${parts.join("，")}。`, "success");
+    }
+    currentMemos = await loadMemos();
+    render();
+    await refreshSyncState();
+  } catch (error) {
+    todoToast(`同步失败：${error instanceof Error ? error.message : String(error)}`, "error");
+    await refreshSyncState();
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+export async function initTodos() {  $("#todos-copy")?.addEventListener("click", () => void copyAll());
   $("#todos-submit")?.addEventListener("click", () => void submitInput());
+  $("#todos-sync")?.addEventListener("click", () => void syncFromPhone());
 
   const input = $("#todos-input") as HTMLTextAreaElement | null;
   input?.addEventListener("input", () => {
@@ -253,6 +360,7 @@ export async function initTodos() {
   render();
   autoGrow();
   syncSubmit();
+  void refreshSyncState();
 
   await listen<MemoItem[]>(MEMOS_CHANGED_EVENT, (event) => {
     currentMemos = event.payload;

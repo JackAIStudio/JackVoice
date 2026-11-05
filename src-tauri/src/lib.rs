@@ -7,6 +7,7 @@ mod history;
 mod hotwords;
 mod main_window;
 mod memos;
+mod memos_sync;
 mod normalize;
 mod onboarding;
 mod output_mute;
@@ -220,6 +221,30 @@ async fn sync_glossary(
     state: tauri::State<'_, AppState>,
 ) -> Result<tos_sync::SyncReport, String> {
     state.sync_glossary().await
+}
+
+/// 拉一次手机记的待办，并进本地 `memos.json`。
+///
+/// 与词库同步共用桶和凭据，但对象、合并规则都独立，见 [memos_sync]。
+#[tauri::command]
+async fn sync_memos(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<memos_sync::MemoSyncReport, String> {
+    let dir = state.data_dir();
+    let report = memos_sync::sync(&dir).await?;
+    // 变了就把新的列表广播出去：待办面板和托盘角标都靠这个事件刷新。
+    if report.pulled > 0 || report.pushed > 0 {
+        let memos = memos::list_memos(&app);
+        let _ = app.emit(memos::MEMOS_CHANGED_EVENT, &memos);
+        tray::update_tray_badge(&app, memos.iter().filter(|m| !m.completed).count());
+    }
+    Ok(report)
+}
+
+#[tauri::command]
+fn get_memos_sync_status(state: tauri::State<'_, AppState>) -> memos_sync::MemoSyncStatus {
+    memos_sync::status(&state.data_dir())
 }
 
 /// 把本地词典同步到当前配置的火山热词表（整表覆盖，权重统一 10）。
@@ -888,6 +913,8 @@ pub fn run() {
             pull_glossary_from_tos,
             push_glossary_to_tos,
             sync_glossary,
+            sync_memos,
+            get_memos_sync_status,
             sync_volc_hotword_table,
             update_shortcut,
             update_capture_shortcut,

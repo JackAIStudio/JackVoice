@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
-export type MemoSource = "voice" | "manual" | "clipboard";
+export type MemoSource = "voice" | "manual" | "clipboard" | "phone";
 
 export type MemoItem = {
   id: string;
@@ -29,6 +29,14 @@ const SOURCE_ICONS: Record<string, { title: string; svg: string }> = {
     title: "来自剪贴板",
     svg: `<rect x="8" y="2" width="8" height="4" rx="1" />
       <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />`,
+  },
+  // 手机记的。和上面两个一样是单色细线，尺寸对齐，别换成实心图标——
+  // 待办列表里那一列是「来源注脚」，不是主体。
+  phone: {
+    title: "手机上记的",
+    svg: `<rect x="7" y="2" width="10" height="20" rx="2" />
+      <path d="M10.5 5.5h3" />
+      <path d="M11 18.5h2" />`,
   },
 };
 

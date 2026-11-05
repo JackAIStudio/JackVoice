@@ -224,6 +224,13 @@
                   </svg>
                   <input id="todos-search" type="search" placeholder="搜索待办内容" autocomplete="off" />
                 </label>
+                <button id="todos-sync" class="todos-copy" type="button" title="从手机同步待办">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                    <polyline points="21 3 21 9 15 9" />
+                  </svg>
+                  <span>同步</span>
+                </button>
                 <button id="todos-copy" class="todos-copy" type="button" title="复制全部未完成待办">
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
@@ -233,6 +240,8 @@
                 </button>
               </div>
             </header>
+
+            <div id="todos-sync-state" class="todos-sync-state" hidden></div>
 
             <div class="todos-compose">
               <textarea

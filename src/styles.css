@@ -2082,6 +2082,22 @@ input[type="range"]#gain-db {
   font-size: 12.5px;
 }
 
+/* 手机同步状态。一行小字，夹在标题区和输入框之间，不抢主体的位置。 */
+.todos-sync-state {
+  margin: 0 22px 10px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.todos-sync-state[data-state="error"] {
+  color: #c2543f;
+}
+
+.todos-sync-state[data-state="ok"] {
+  color: var(--text-2);
+  opacity: 0.8;
+}
+
 .todos-copy {
   position: relative;
   display: inline-flex;

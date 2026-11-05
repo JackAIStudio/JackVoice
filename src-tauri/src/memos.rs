@@ -14,6 +14,10 @@ pub const SOURCE_VOICE: &str = "voice";
 pub const SOURCE_MANUAL: &str = "manual";
 pub const SOURCE_CLIPBOARD: &str = "clipboard";
 
+/// 从手机上记的。由 `memos_sync` 从 TOS 拉下来时写入，
+/// 值必须与 Android 端 `VoiceMemos.SOURCE_PHONE` 一致——两端靠这个字符串对暗号。
+pub const SOURCE_PHONE: &str = "phone";
+
 /// 单条待办最长能有多长。剪贴板里偶尔会是一次误操作粘来的整页内容，
 /// 与其静默截断（那样用户看到的内容和复制的不一样），不如明确拒绝。
 pub const MAX_MEMO_CHARS: usize = 100_000;
@@ -29,7 +33,7 @@ pub struct MemoItem {
     pub text: String,
     pub created_at_ms: i64,
     pub completed: bool,
-    /// voice / manual / clipboard。旧版本没有这个字段，一律按语音收入处理。
+    /// voice / manual / clipboard / phone。旧版本没有这个字段，一律按语音收入处理。
     #[serde(default = "default_memo_source")]
     pub source: String,
 }
@@ -49,6 +53,7 @@ pub fn normalize_source(source: &str) -> String {
     match source.trim() {
         SOURCE_MANUAL => SOURCE_MANUAL.into(),
         SOURCE_CLIPBOARD => SOURCE_CLIPBOARD.into(),
+        SOURCE_PHONE => SOURCE_PHONE.into(),
         _ => SOURCE_VOICE.into(),
     }
 }
@@ -162,6 +167,9 @@ pub fn delete_memo(app: &AppHandle, id: &str) -> Result<Vec<MemoItem>, String> {
         save_memos(&dir, &memos)?;
         Ok(memos)
     })?;
+    // 留一块墓碑。手机推上来的待办在云端还有一份，不留记号的话
+    // 下次同步会被当成「云端有、本地没有」又追加回来——删了又活过来。
+    crate::memos_sync::remember_deleted(&dir, id);
     let _ = app.emit(MEMOS_CHANGED_EVENT, &memos);
     refresh_tray_badge(app, &memos);
     Ok(memos)
@@ -190,6 +198,9 @@ pub fn restore_memo(app: &AppHandle, memo: MemoItem) -> Result<Vec<MemoItem>, St
         }
         Ok(memos)
     })?;
+    // 撤销删除要连墓碑一起撤：否则云端那份再也回不来（虽然本地已经有了，
+    // 但下次同步时它仍会被墓碑挡住，等于这条永远停在「只有本机有」）。
+    crate::memos_sync::forget_deleted(&dir, &memo.id);
     let _ = app.emit(MEMOS_CHANGED_EVENT, &memos);
     refresh_tray_badge(app, &memos);
     Ok(memos)

@@ -88,6 +88,25 @@ type TosSyncReport = {
   updatedAt: string;
 };
 
+/** 待办同步回执。与 `memos_sync::MemoSyncReport` 对应。 */
+type MemoSyncReport = {
+  /** 从手机拉回来的条数。 */
+  pulled: number;
+  /** 推到云端的条数。 */
+  pushed: number;
+  /** 因为本地删过而被跳过的条数。 */
+  skipped: number;
+  syncedAt: string;
+};
+
+type MemoSyncStatus = {
+  hasCredentials: boolean;
+  key: string;
+  lastSyncedAt: string | null;
+  lastError: string | null;
+  deletedCount: number;
+};
+
 type HistoryRecord = {
   id: string;
   finishedAtMs: number;
@@ -142,6 +161,16 @@ let replacementFilter = "";
 let glossarySyncInFlight = false;
 let glossarySyncQueued = false;
 let glossarySyncTimer: number | undefined;
+/**
+ * 待办同步的独立闸门。
+ *
+ * 不跟词库共用一套 in-flight 标记：两者请求不同对象、失败原因也不同
+ * （词库 401 和待办 401 是同一件事，但词库冲突和待办冲突的处理不一样）。
+ * 共用会让「词库正在同步」把待办那次请求直接吞掉。
+ */
+let memosSyncInFlight = false;
+let memosSyncQueued = false;
+let memosSyncTimer: number | undefined;
 let editingReplacementSource: string | null = null;
 let recordingShortcut: ShortcutTarget | null = null;
 let historyRecords: HistoryRecord[] = [];
@@ -2825,6 +2854,59 @@ function scheduleGlossarySync(delayMs = 800) {
   }, delayMs);
 }
 
+/**
+ * 拉一次手机记的待办。
+ *
+ * 静默失败：这条链路失败最常见的原因是「没配 TOS」或「手机还没记过」，
+ * 那两种情况都不该弹提示打扰用户。真要手动确认，待办面板上有状态和按钮。
+ *
+ * @param manual 用户点了「立即同步」——这时失败要说话。
+ */
+async function syncMemosQuietly(manual = false) {
+  if (memosSyncInFlight) {
+    memosSyncQueued = true;
+    return;
+  }
+  memosSyncInFlight = true;
+  try {
+    const status = await invoke<MemoSyncStatus>("get_memos_sync_status");
+    if (!status.hasCredentials) {
+      if (manual) showToast("先在「词典 → 云同步」里填 TOS AccessKey 和 SecretKey。", "error");
+      return;
+    }
+    const report = await invoke<MemoSyncReport>("sync_memos");
+    if (report.pulled > 0 || report.pushed > 0) {
+      // 后端已经广播了 MEMOS_CHANGED_EVENT，待办面板和主窗口会自己刷新；
+      // 这里只在手动同步时给一句回执。
+      if (manual) {
+        showToast(`已同步：从手机拉回 ${report.pulled} 条，推上去 ${report.pushed} 条。`, "success");
+      }
+    } else if (manual) {
+      showToast("已是最新，没有变化。", "success");
+    }
+  } catch (error) {
+    if (manual) {
+      showToast(`待办同步失败：${error instanceof Error ? error.message : String(error)}`, "error");
+    } else {
+      console.warn("auto memos sync failed", error);
+    }
+  } finally {
+    memosSyncInFlight = false;
+    if (memosSyncQueued) {
+      memosSyncQueued = false;
+      void syncMemosQuietly(false);
+    }
+  }
+}
+
+function scheduleMemosSync(delayMs = 800) {
+  if (memosSyncTimer !== undefined) window.clearTimeout(memosSyncTimer);
+  memosSyncTimer = window.setTimeout(() => {
+    memosSyncTimer = undefined;
+    void syncMemosQuietly(false);
+  }, delayMs);
+}
+
 async function saveTosCredentials() {
   const keyInput = $("#tos-access-key") as HTMLInputElement | null;
   const secretInput = $("#tos-secret-key") as HTMLInputElement | null;
@@ -2948,12 +3030,23 @@ window.addEventListener("DOMContentLoaded", async () => {
     refreshTosSyncStatus(),
   ]);
   void syncGlossaryQuietly(false);
-  window.addEventListener("focus", () => scheduleGlossarySync(0));
+  // 待办：启动、回到前台、每 60 秒各拉一次。手机上记的条目就是靠这条链路出现的。
+  void syncMemosQuietly(false);
+  window.addEventListener("focus", () => {
+    scheduleGlossarySync(0);
+    scheduleMemosSync(0);
+  });
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) scheduleGlossarySync(0);
+    if (!document.hidden) {
+      scheduleGlossarySync(0);
+      scheduleMemosSync(0);
+    }
   });
   window.setInterval(() => {
-    if (!document.hidden) scheduleGlossarySync(0);
+    if (!document.hidden) {
+      scheduleGlossarySync(0);
+      scheduleMemosSync(0);
+    }
   }, 60_000);
 
   await listen<UiState>("jackvoice://state", (event) => applyState(event.payload));
