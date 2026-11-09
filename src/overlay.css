@@ -53,13 +53,61 @@ body {
   overflow: hidden;
 }
 
+.status-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
 .status {
+  flex: 0 1 auto;
+  min-width: 0;
   font-size: 10px;
   line-height: 1.1;
   color: rgba(255, 255, 255, 0.5);
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+  transition: color 0.3s ease;
+}
+
+/* 已录时长：录满一分钟才出现，等宽数字避免跳动。 */
+.elapsed {
+  flex: 0 0 auto;
+  font-size: 10px;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.36);
+  transition: color 0.3s ease;
+}
+
+.capsule.long-take .elapsed {
+  color: rgba(255, 177, 74, 0.85);
+}
+
+/* 录满十分钟时轻提醒一次。 */
+.capsule.recording.long-pulse {
+  animation: long-take-pulse 1.2s ease-in-out 2;
+}
+
+@keyframes long-take-pulse {
+  0%, 100% { border-color: rgba(42, 214, 170, 0.28); }
+  50% { border-color: rgba(255, 177, 74, 0.75); }
+}
+
+/* 长时间无语音：边框缓慢呼吸，状态行转为倒计时。 */
+.capsule.recording.silence-warn {
+  animation: silence-breathe 2.4s ease-in-out infinite;
+}
+
+.capsule.silence-warn .status {
+  color: rgba(255, 177, 74, 0.92);
+}
+
+@keyframes silence-breathe {
+  0%, 100% { border-color: rgba(255, 177, 74, 0.22); }
+  50% { border-color: rgba(255, 177, 74, 0.7); }
 }
 
 .text {

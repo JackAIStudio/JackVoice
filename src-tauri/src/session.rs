@@ -36,6 +36,86 @@ const MAX_CONNECT_BACKLOG_BYTES: usize = 2 * 1024 * 1024;
 const ASR_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_DICTATION_DURATION: Duration = Duration::from_secs(30 * 60);
 const MAX_DICTATION_DURATION_LABEL: &str = "30 分钟";
+/// 连续这么久没有新的语音，胶囊开始提醒「即将自动结束」。
+/// 正常说话时想事情的停顿很少超过一分钟，两分钟足够宽容。
+const SILENCE_WARNING_AFTER: Duration = Duration::from_secs(2 * 60);
+/// 连续这么久没有新的语音就自动结束。比提醒晚一分钟，留出回来接着说的余地。
+const SILENCE_AUTO_STOP_AFTER: Duration = Duration::from_secs(3 * 60);
+/// 实时识别没连上时，退回用音量判断「有没有在说话」。
+/// 约 -36 dBFS：高于风扇、空调这类底噪，低于正常说话。
+const SPEECH_LEVEL_THRESHOLD: f32 = 0.05;
+
+/// 不是用户亲手结束、而是到点自动停下的原因。
+///
+/// 自动结束时用户多半已经离开了：文字不往任何窗口里粘贴，只留在结果卡片
+/// 和历史记录里，免得几十分钟后一大段话砸进一个他早已不在的输入框。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoStop {
+    /// 连续 `SILENCE_AUTO_STOP_AFTER` 没有新的语音。
+    Silence,
+    /// 单次听写达到 `MAX_DICTATION_DURATION`。
+    DurationLimit,
+}
+
+impl AutoStop {
+    /// 给前端的稳定标识。
+    fn key(self) -> &'static str {
+        match self {
+            AutoStop::Silence => "silence",
+            AutoStop::DurationLimit => "durationLimit",
+        }
+    }
+
+    /// 状态栏里「为什么停了」的那半句。
+    fn describe(self) -> String {
+        match self {
+            AutoStop::Silence => "长时间无语音，已自动结束".into(),
+            AutoStop::DurationLimit => {
+                format!("已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束")
+            }
+        }
+    }
+
+    /// 录音刚停、文字还在整理时的状态栏文案。
+    fn finalizing_status(self) -> String {
+        match self {
+            AutoStop::Silence => "长时间无语音，录音已自动停止，正在整理文字…".into(),
+            AutoStop::DurationLimit => format!(
+                "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限，录音已停止，正在整理文字…"
+            ),
+        }
+    }
+}
+
+/// 每秒检查一次「已经多久没说话」的结论。
+#[derive(Debug, PartialEq, Eq)]
+enum SilenceCheck {
+    /// 还在正常范围内。
+    Fine,
+    /// 该提醒了，再过 `stop_in` 就自动结束。
+    Warn { stop_in: Duration },
+    /// 该自动结束了。
+    Stop,
+}
+
+fn check_silence(silent_for: Duration) -> SilenceCheck {
+    if silent_for >= SILENCE_AUTO_STOP_AFTER {
+        SilenceCheck::Stop
+    } else if silent_for >= SILENCE_WARNING_AFTER {
+        SilenceCheck::Warn {
+            stop_in: SILENCE_AUTO_STOP_AFTER - silent_for,
+        }
+    } else {
+        SilenceCheck::Fine
+    }
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +180,12 @@ pub struct UiState {
     pub onboarding_completed: bool,
     pub history_text_size: String,
     pub session_pinned: bool,
+    /// 这一轮开始录音的时刻（Unix 毫秒），胶囊据此显示已录时长。不在录音时为 0。
+    pub recording_started_at_ms: u64,
+    /// 长时间无语音、即将自动结束的时刻（Unix 毫秒）。没有在提醒时为 0。
+    pub silence_stop_at_ms: u64,
+    /// 上一轮是怎么自动结束的："silence" / "durationLimit"；手动结束时为空。
+    pub auto_stop_reason: String,
 }
 
 impl UiState {
@@ -153,6 +239,9 @@ impl Default for UiState {
             onboarding_completed: false,
             history_text_size: "standard".into(),
             session_pinned: false,
+            recording_started_at_ms: 0,
+            silence_stop_at_ms: 0,
+            auto_stop_reason: String::new(),
         }
     }
 }
@@ -1575,6 +1664,9 @@ impl AppState {
             ui.last_delivery_message.clear();
             ui.audio_level = 0.0;
             ui.needs_copy_prompt = false;
+            ui.recording_started_at_ms = 0;
+            ui.silence_stop_at_ms = 0;
+            ui.auto_stop_reason.clear();
             let _ = app.emit("jackvoice://state", ui.clone());
         }
 
@@ -1860,7 +1952,7 @@ fn persist_local_pcm(
     recorder: &mut AudioRecorder,
     pcm: &[u8],
     last_level_emit: &mut Instant,
-) -> Result<(), String> {
+) -> Result<f32, String> {
     // Local persistence always happens before the chunk is offered to ASR.
     recorder.write_pcm(pcm)?;
     let level = audio::pcm16_level(pcm);
@@ -1880,7 +1972,61 @@ fn persist_local_pcm(
             }
         }
     }
-    Ok(())
+    Ok(level)
+}
+
+/// 到点自动结束录音：停麦克风、恢复系统音量、胶囊切到「整理中」。
+///
+/// 只做「让录音停下来」这一半；收尾（整理文字、写历史）照常由录音循环之后
+/// 的流程接手，和用户手动结束走同一条路。
+fn begin_auto_stop(
+    app: &AppHandle,
+    session_id: u64,
+    audio_stop_tx: &std::sync::mpsc::Sender<()>,
+    reason: AutoStop,
+) {
+    let output_mute = app.try_state::<AppState>().and_then(|state| {
+        let mut active = state.active.lock();
+        active
+            .as_mut()
+            .filter(|active| active.id == session_id)
+            .and_then(|active| {
+                active.stopping = true;
+                active.output_mute.take()
+            })
+    });
+    let _ = audio_stop_tx.send(());
+    restore_output_mute(output_mute);
+    if let Some(state) = app.try_state::<AppState>() {
+        let mut ui = state.ui.lock();
+        ui.phase = "finalizing".into();
+        ui.recognition_phase = "finalizing".into();
+        ui.audio_level = 0.0;
+        ui.silence_stop_at_ms = 0;
+        ui.status = reason.finalizing_status();
+        let _ = app.emit("jackvoice://level", 0.0_f32);
+        let _ = app.emit("jackvoice://state", ui.clone());
+    }
+}
+
+/// 进入或退出「长时间无语音」提醒。只在这一轮仍是用户眼前那一轮时改界面。
+fn set_silence_warning(app: &AppHandle, session_id: u64, stop_at_ms: u64) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let is_current = state
+        .active
+        .lock()
+        .as_ref()
+        .is_some_and(|active| active.id == session_id && !active.stopping);
+    if !is_current {
+        return;
+    }
+    let mut ui = state.ui.lock();
+    if ui.silence_stop_at_ms != stop_at_ms {
+        ui.silence_stop_at_ms = stop_at_ms;
+        let _ = app.emit("jackvoice://state", ui.clone());
+    }
 }
 
 fn mark_recognition_unavailable(app: &AppHandle, session_id: u64, message: &str) {
@@ -1936,6 +2082,20 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
         input_device_id: actual_input_device_id,
     };
 
+    // 「最后一次听到说话」距本轮开始的毫秒数。实时识别连上时以「识别出的
+    // 文字有没有变多」为准——风扇、空调、背景音乐会让音量一直不为零，靠音量
+    // 判断静音会被骗；识别没连上时才退回看音量。
+    let recording_started = Instant::now();
+    let last_speech_ms = Arc::new(AtomicU64::new(0));
+    if let Some(state) = app.try_state::<AppState>() {
+        if state.session_epoch.load(Ordering::SeqCst) == session_id {
+            let mut ui = state.ui.lock();
+            ui.recording_started_at_ms = unix_now_ms();
+            ui.silence_stop_at_ms = 0;
+            let _ = app.emit("jackvoice://state", ui.clone());
+        }
+    }
+
     let mut recognition_error = if settings.volc_api_key.trim().is_empty() {
         Some("尚未配置豆包语音 API Key".to_string())
     } else {
@@ -1950,6 +2110,7 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
         let connect_hotwords = hotwords.clone();
         let app_for_updates = app.clone();
         let replacement_rules_for_updates = replacement_rules.clone();
+        let last_speech_for_updates = last_speech_ms.clone();
         Some(Box::pin(async move {
             tokio::time::timeout(
                 ASR_CONNECT_TIMEOUT,
@@ -1972,10 +2133,17 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
                             if ui.recognition_phase != "streaming" {
                                 return;
                             }
-                            ui.transcript = crate::hotwords::apply_replacements(
+                            let text = crate::hotwords::apply_replacements(
                                 &update.text,
                                 &replacement_rules_for_updates,
                             );
+                            if text != ui.transcript {
+                                last_speech_for_updates.store(
+                                    recording_started.elapsed().as_millis() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                            ui.transcript = text;
                             ui.status = if update.is_final_sentence {
                                 "正在录音 · 已生成句子".into()
                             } else {
@@ -2001,42 +2169,56 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
     let mut asr_error_tx = Some(asr_error_tx);
     let mut local_error: Option<String> = None;
     let mut last_level_emit = Instant::now() - Duration::from_millis(100);
-    let mut reached_duration_limit = false;
+    let mut auto_stop: Option<AutoStop> = None;
     let duration_limit = tokio::time::sleep(MAX_DICTATION_DURATION);
     tokio::pin!(duration_limit);
+    let mut silence_tick = tokio::time::interval(Duration::from_secs(1));
+    silence_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut silence_warning_shown = false;
 
     loop {
         tokio::select! {
             _ = &mut duration_limit => {
-                reached_duration_limit = true;
-                let output_mute = app.try_state::<AppState>().and_then(|state| {
-                    let mut active = state.active.lock();
-                    active
-                        .as_mut()
-                        .filter(|active| active.id == session_id)
-                        .and_then(|active| {
-                            active.stopping = true;
-                            active.output_mute.take()
-                        })
-                });
-                let _ = audio_stop_tx.send(());
-                restore_output_mute(output_mute);
+                auto_stop = Some(AutoStop::DurationLimit);
+                begin_auto_stop(&app, session_id, &audio_stop_tx, AutoStop::DurationLimit);
                 if connect_future.is_some() && recognition_error.is_none() {
                     recognition_error = Some("达到时长上限前实时识别尚未连接完成".into());
                 }
                 drop(connect_future.take());
-                if let Some(state) = app.try_state::<AppState>() {
-                    let mut ui = state.ui.lock();
-                    ui.phase = "finalizing".into();
-                    ui.recognition_phase = "finalizing".into();
-                    ui.audio_level = 0.0;
-                    ui.status = format!(
-                        "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限，正在自动结束并整理文字…"
-                    );
-                    let _ = app.emit("jackvoice://level", 0.0_f32);
-                    let _ = app.emit("jackvoice://state", ui.clone());
-                }
                 break;
+            }
+            _ = silence_tick.tick() => {
+                let silent_for = recording_started
+                    .elapsed()
+                    .saturating_sub(Duration::from_millis(last_speech_ms.load(Ordering::Relaxed)));
+                match check_silence(silent_for) {
+                    SilenceCheck::Stop => {
+                        auto_stop = Some(AutoStop::Silence);
+                        begin_auto_stop(&app, session_id, &audio_stop_tx, AutoStop::Silence);
+                        if connect_future.is_some() && recognition_error.is_none() {
+                            recognition_error = Some("自动结束前实时识别尚未连接完成".into());
+                        }
+                        drop(connect_future.take());
+                        break;
+                    }
+                    SilenceCheck::Warn { stop_in } => {
+                        // 只在刚进入提醒时定一次截止时刻，之后每秒重算会让倒计时抖动。
+                        if !silence_warning_shown {
+                            silence_warning_shown = true;
+                            set_silence_warning(
+                                &app,
+                                session_id,
+                                unix_now_ms() + stop_in.as_millis() as u64,
+                            );
+                        }
+                    }
+                    SilenceCheck::Fine => {
+                        if silence_warning_shown {
+                            silence_warning_shown = false;
+                            set_silence_warning(&app, session_id, 0);
+                        }
+                    }
+                }
             }
             control = control_rx.recv() => {
                 match control {
@@ -2072,17 +2254,27 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
                     drop(connect_future.take());
                     break;
                 };
-                if let Err(error) = persist_local_pcm(
+                match persist_local_pcm(
                     &app,
                     session_id,
                     &mut recorder,
                     &pcm,
                     &mut last_level_emit,
                 ) {
-                    local_error = Some(error);
-                    let _ = audio_stop_tx.send(());
-                    drop(connect_future.take());
-                    break;
+                    Ok(level) => {
+                        if asr_tx.is_none() && level >= SPEECH_LEVEL_THRESHOLD {
+                            last_speech_ms.store(
+                                recording_started.elapsed().as_millis() as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        local_error = Some(error);
+                        let _ = audio_stop_tx.send(());
+                        drop(connect_future.take());
+                        break;
+                    }
                 }
 
                 if let Some(tx) = asr_tx.as_ref() {
@@ -2243,6 +2435,8 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
                 ui.phase = "idle".into();
                 ui.recognition_phase = "idle".into();
                 ui.audio_level = 0.0;
+                ui.recording_started_at_ms = 0;
+                ui.silence_stop_at_ms = 0;
                 ui.status = "正在保存已取消听写的本地录音…".into();
                 let _ = app.emit("jackvoice://level", 0.0_f32);
                 let _ = app.emit("jackvoice://state", ui.clone());
@@ -2250,12 +2444,11 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
                 ui.phase = "finalizing".into();
                 ui.recognition_phase = "finalizing".into();
                 ui.audio_level = 0.0;
-                ui.status = if reached_duration_limit {
-                    format!(
-                        "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限，录音已停止，正在整理文字…"
-                    )
-                } else {
-                    "本地录音已完成，正在整理文字…".into()
+                ui.recording_started_at_ms = 0;
+                ui.silence_stop_at_ms = 0;
+                ui.status = match auto_stop {
+                    Some(reason) => reason.finalizing_status(),
+                    None => "本地录音已完成，正在整理文字…".into(),
                 };
                 let _ = app.emit("jackvoice://level", 0.0_f32);
                 let _ = app.emit("jackvoice://state", ui.clone());
@@ -2277,7 +2470,7 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
             target,
             local_error,
             recognition_error,
-            reached_duration_limit,
+            auto_stop,
             is_cancel,
             asr_tx,
         },
@@ -2320,7 +2513,8 @@ struct FinalizeJob {
     target: Option<crate::overlay::FrontmostApp>,
     local_error: Option<String>,
     recognition_error: Option<String>,
-    reached_duration_limit: bool,
+    /// 到点自动停下的原因；用户亲手结束时为 `None`。
+    auto_stop: Option<AutoStop>,
     is_cancel: bool,
     asr_tx: Option<mpsc::Sender<AsrCommand>>,
 }
@@ -2349,7 +2543,7 @@ fn spawn_background_finalize(app: AppHandle, job: FinalizeJob) {
 async fn finalize_and_report(app: &AppHandle, job: FinalizeJob) {
     let session_id = job.session_id;
     let is_cancel = job.is_cancel;
-    let reached_duration_limit = job.reached_duration_limit;
+    let auto_stop = job.auto_stop;
 
     let FinalizeJob {
         record_id,
@@ -2443,6 +2637,11 @@ async fn finalize_and_report(app: &AppHandle, job: FinalizeJob) {
             let gate = state.finish_gate.lock().await;
             let turn = delivery_turn(&state, session_id);
             match turn {
+                DeliveryTurn::Go if auto_stop.is_some() => {
+                    // 到点自动结束时人多半已经离开：不往任何窗口里粘贴，
+                    // 文字留在结果卡片和历史记录里，等他回来自己取。
+                    needs_copy_prompt = true;
+                }
                 DeliveryTurn::Go => {
                     match deliver_finalized_text(app, session_id, &final_text, target.as_ref())
                         .await
@@ -2487,7 +2686,7 @@ async fn finalize_and_report(app: &AppHandle, job: FinalizeJob) {
             needs_copy_prompt,
             saved_to_memo,
             is_cancel,
-            reached_duration_limit,
+            auto_stop,
         },
     );
 }
@@ -2627,7 +2826,7 @@ struct FinalizeReport {
     needs_copy_prompt: bool,
     saved_to_memo: bool,
     is_cancel: bool,
-    reached_duration_limit: bool,
+    auto_stop: Option<AutoStop>,
 }
 
 /// 把收尾结论写回界面。
@@ -2649,7 +2848,7 @@ fn report_finalize(app: &AppHandle, report: FinalizeReport) {
         needs_copy_prompt,
         saved_to_memo,
         is_cancel,
-        reached_duration_limit,
+        auto_stop,
     } = report;
 
     // 用户已经开了新一轮：这一轮的收尾只落历史，界面归新一轮所有。
@@ -2676,50 +2875,52 @@ fn report_finalize(app: &AppHandle, report: FinalizeReport) {
         ui.status = error;
     } else {
         ui.phase = "idle".into();
+        let auto_label = auto_stop.map(AutoStop::describe);
         ui.status = if is_cancel {
             "已取消文字处理，本地录音已保存。".into()
         } else if let Some(error) = recognition_error {
-            if reached_duration_limit {
-                format!(
-                    "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束；本地录音已保存；实时识别未完成：{error}"
-                )
-            } else {
-                format!("本地录音已保存；实时识别未完成：{error}")
+            match auto_label {
+                Some(label) => {
+                    format!("{label}；本地录音已保存；实时识别未完成：{error}")
+                }
+                None => format!("本地录音已保存；实时识别未完成：{error}"),
             }
         } else if saved_to_memo {
-            if reached_duration_limit {
-                format!(
-                    "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束，已收入待办事项。"
-                )
-            } else {
-                "已收入待办事项。".into()
+            match auto_label {
+                Some(label) => format!("{label}，已收入待办事项。"),
+                None => "已收入待办事项。".into(),
             }
         } else if ui.transcript.trim().is_empty() {
-            if reached_duration_limit {
-                format!(
-                    "已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束；本地录音已保存，本次未识别到文字。"
-                )
-            } else {
-                "本地录音已保存，本次未识别到文字。".into()
+            match auto_label {
+                Some(label) => format!("{label}；本地录音已保存，本次未识别到文字。"),
+                None => "本地录音已保存，本次未识别到文字。".into(),
             }
-        } else if reached_duration_limit {
-            format!("已达到单次听写 {MAX_DICTATION_DURATION_LABEL}上限并自动结束，本地录音已保存。")
+        } else if let Some(label) = auto_label {
+            format!("{label}，文字未粘贴，已存入历史记录。")
         } else {
             "听写结束，本地录音已保存。".into()
         };
     }
+    ui.auto_stop_reason = auto_stop.map(AutoStop::key).unwrap_or_default().into();
     if saved_to_memo {
         ui.last_delivery_message = "已收入待办事项，未粘贴。".into();
     } else if let Some(delivery) = delivery_result.as_ref() {
         ui.last_delivery_message = delivery.message.clone();
+    } else if auto_stop.is_some() && needs_copy_prompt {
+        ui.last_delivery_message = "已自动结束，未粘贴。".into();
     }
     let phase_is_error = ui.phase == "error";
     let _ = app.emit("jackvoice://state", ui.clone());
     drop(ui);
 
     // 只有失败和「没插进去、要用户手动复制」需要把胶囊叫回屏幕。
-    if phase_is_error || (needs_copy_prompt && !final_text.trim().is_empty()) {
+    let shows_result_card = needs_copy_prompt && !final_text.trim().is_empty();
+    if phase_is_error || shows_result_card {
         crate::overlay::show_overlay(app);
+    } else if auto_stop.is_some() {
+        // 自动结束且没有要用户取的文字（一句没说、或已收入待办）：胶囊没有
+        // 理由继续挂在屏幕上等一个已经离开的人。
+        crate::overlay::hide_overlay(app);
     }
     if let Some(delivery) = delivery_result {
         let _ = app.emit("jackvoice://delivery", delivery);
@@ -3073,6 +3274,7 @@ mod volc_connection_error_tests {
         FinishedTranscriptRoute, MicFallbackState, UiState, VolcCredentialStatus,
         MAX_DICTATION_DURATION, STUCK_STOP_TIMEOUT,
     };
+    use super::{check_silence, AutoStop, SilenceCheck, SPEECH_LEVEL_THRESHOLD};
     use crate::audio::{ActiveInputDevice, AudioNotice, InputDeviceInfo, InputDevicePreference};
     use crate::session::{decide_delivery_turn, owns_ui, DeliveryTurn};
     use std::time::Duration;
@@ -3175,6 +3377,64 @@ mod volc_connection_error_tests {
     #[test]
     fn limits_each_dictation_to_thirty_minutes() {
         assert_eq!(MAX_DICTATION_DURATION, Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn a_thinking_pause_is_not_treated_as_forgotten() {
+        assert_eq!(check_silence(Duration::ZERO), SilenceCheck::Fine);
+        assert_eq!(check_silence(Duration::from_secs(60)), SilenceCheck::Fine);
+        assert_eq!(check_silence(Duration::from_secs(119)), SilenceCheck::Fine);
+    }
+
+    #[test]
+    fn warns_after_two_silent_minutes_and_counts_down_to_the_stop() {
+        assert_eq!(
+            check_silence(Duration::from_secs(120)),
+            SilenceCheck::Warn {
+                stop_in: Duration::from_secs(60)
+            }
+        );
+        assert_eq!(
+            check_silence(Duration::from_secs(150)),
+            SilenceCheck::Warn {
+                stop_in: Duration::from_secs(30)
+            }
+        );
+    }
+
+    #[test]
+    fn stops_after_three_silent_minutes() {
+        assert_eq!(check_silence(Duration::from_secs(180)), SilenceCheck::Stop);
+        assert_eq!(check_silence(Duration::from_secs(45 * 60)), SilenceCheck::Stop);
+    }
+
+    #[test]
+    fn auto_stop_reasons_are_stable_for_the_capsule() {
+        assert_eq!(AutoStop::Silence.key(), "silence");
+        assert_eq!(AutoStop::DurationLimit.key(), "durationLimit");
+        assert!(AutoStop::Silence.describe().contains("无语音"));
+        assert!(AutoStop::DurationLimit.describe().contains("30 分钟"));
+    }
+
+    #[test]
+    fn level_fallback_ignores_room_noise_but_hears_speech() {
+        // 约 -50 dBFS 的底噪（风扇、空调）不算说话。
+        let noise = pcm_at_rms(0.003);
+        assert!(crate::audio::pcm16_level(&noise) < SPEECH_LEVEL_THRESHOLD);
+        // 约 -30 dBFS 的正常说话要算。
+        let speech = pcm_at_rms(0.03);
+        assert!(crate::audio::pcm16_level(&speech) >= SPEECH_LEVEL_THRESHOLD);
+    }
+
+    /// 一段方波 PCM16，均方根等于 `rms`（满幅为 1.0）。
+    fn pcm_at_rms(rms: f64) -> Vec<u8> {
+        let amplitude = (rms * i16::MAX as f64) as i16;
+        (0..1600)
+            .flat_map(|i| {
+                let sample = if i % 2 == 0 { amplitude } else { -amplitude };
+                sample.to_le_bytes()
+            })
+            .collect()
     }
 
     #[test]

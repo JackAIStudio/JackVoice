@@ -11,6 +11,12 @@ type UiState = {
   micNotice?: string;
   micNoticeSeq?: number;
   sessionPinned?: boolean;
+  /** 本轮开始录音的时刻（Unix 毫秒）；不在录音时为 0。 */
+  recordingStartedAtMs?: number;
+  /** 长时间无语音、即将自动结束的时刻（Unix 毫秒）；没有提醒时为 0。 */
+  silenceStopAtMs?: number;
+  /** 上一轮自动结束的原因："silence" / "durationLimit"；手动结束为空。 */
+  autoStopReason?: string;
 };
 
 type DeliveryResult = {
@@ -25,6 +31,15 @@ const textEl = () => document.querySelector<HTMLElement>("#overlay-text");
 const pinBtn = () => document.querySelector<HTMLButtonElement>("#pin-btn");
 const copyBtn = () => document.querySelector<HTMLButtonElement>("#copy-btn");
 const retryBtn = () => document.querySelector<HTMLButtonElement>("#retry-btn");
+const elapsedEl = () => document.querySelector<HTMLElement>("#overlay-elapsed");
+
+function isLive(state: UiState) {
+  return (
+    state.phase === "starting" ||
+    state.phase === "connecting" ||
+    state.phase === "recording"
+  );
+}
 
 /**
  * Audio meter (3 monochrome micro-bars) indicating microphone activity.
@@ -111,6 +126,8 @@ function resetAudioMeter() {
  * re-copy the text themselves and nothing gets silently lost.
  */
 let resultActive = false;
+/** 这张结果卡片来自自动结束：人多半不在，卡片不自动消失，「重试」改叫「插入」。 */
+let resultAuto = false;
 let resultStatusText = "未检测到插入";
 let resultDismissTimer: number | undefined;
 let copyDismissTimer: number | undefined;
@@ -126,18 +143,38 @@ function paintResultChrome() {
   copyBtn()?.classList.remove("hidden");
 }
 
-function enterResultMode() {
+function autoStopText(reason: string | undefined): string | null {
+  if (reason === "silence") return "长时间无语音 · 已自动结束";
+  if (reason === "durationLimit") return "已录满 30 分钟 · 已自动结束";
+  return null;
+}
+
+function enterResultMode(state?: UiState | null) {
   resultActive = true;
-  resultStatusText = "未检测到插入";
+  const autoText = autoStopText(state?.autoStopReason);
+  resultAuto = autoText !== null;
+  resultStatusText = autoText ?? "未检测到插入";
+  const retry = retryBtn();
+  if (retry) {
+    retry.textContent = resultAuto ? "插入" : "重试";
+    retry.title = resultAuto
+      ? "插入，保持剪贴板不变"
+      : "重新尝试插入，保持剪贴板不变";
+  }
   paintResultChrome();
   if (resultDismissTimer) window.clearTimeout(resultDismissTimer);
-  resultDismissTimer = window.setTimeout(() => {
-    void dismissResult();
-  }, RESULT_AUTO_DISMISS_MS);
+  resultDismissTimer = undefined;
+  // 自动结束的卡片要等人回来，不自动消失。
+  if (!resultAuto) {
+    resultDismissTimer = window.setTimeout(() => {
+      void dismissResult();
+    }, RESULT_AUTO_DISMISS_MS);
+  }
 }
 
 function exitResultMode() {
   resultActive = false;
+  resultAuto = false;
   if (resultDismissTimer) {
     window.clearTimeout(resultDismissTimer);
     resultDismissTimer = undefined;
@@ -209,7 +246,10 @@ function renderPreview(state: UiState) {
 function renderStatus(state: UiState) {
   const status = statusEl();
   if (!status) return;
+  const silenceText = silenceCountdownText(state);
+  capsule()?.classList.toggle("silence-warn", silenceText !== null);
   if (activeNotice) status.textContent = activeNotice;
+  else if (silenceText) status.textContent = silenceText;
   else if (state.sessionPinned) {
     if (state.phase === "finalizing") status.textContent = "正在收入待办…";
     else status.textContent = "正在听写 · 待办事项";
@@ -224,6 +264,68 @@ function renderStatus(state: UiState) {
   else if (state.phase === "finalizing") status.textContent = "收尾中";
   else if (state.phase === "error") status.textContent = state.status || "出错了";
   else status.textContent = "待命";
+}
+
+/** 长时间无语音时的倒计时文案；没在提醒时返回 null。 */
+function silenceCountdownText(state: UiState): string | null {
+  if (!isLive(state) || !state.silenceStopAtMs) return null;
+  const left = Math.max(0, Math.ceil((state.silenceStopAtMs - Date.now()) / 1000));
+  return `无语音 · ${left} 秒后结束`;
+}
+
+/**
+ * 已录时长与长时提醒。录满一分钟才显示，十分钟起转为暖色并轻闪一次边框。
+ * 状态事件在录音时很密，但不能指望它驱动秒表：用一个独立的 1s 节拍。
+ */
+const ELAPSED_VISIBLE_AFTER_MS = 60_000;
+const LONG_TAKE_AFTER_MS = 10 * 60_000;
+let clockTimer: number | undefined;
+let longPulseFor = 0;
+
+function formatElapsed(ms: number): string {
+  const total = Math.floor(ms / 1000);
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function stopClock() {
+  if (clockTimer) {
+    window.clearInterval(clockTimer);
+    clockTimer = undefined;
+  }
+}
+
+function renderClock() {
+  const el = elapsedEl();
+  const root = capsule();
+  const state = lastState;
+  const startedAt = state?.recordingStartedAtMs ?? 0;
+  if (!state || !isLive(state) || !startedAt) {
+    el?.classList.add("hidden");
+    root?.classList.remove("long-take", "long-pulse", "silence-warn");
+    stopClock();
+    return;
+  }
+  if (!clockTimer) {
+    clockTimer = window.setInterval(() => {
+      renderClock();
+      // 只在录音中刷新倒计时；收尾后的结果卡片有自己的状态文案，不能被盖掉。
+      if (lastState && isLive(lastState)) renderStatus(lastState);
+    }, 1000);
+  }
+
+  const elapsed = Math.max(0, Date.now() - startedAt);
+  if (el) {
+    el.classList.toggle("hidden", elapsed < ELAPSED_VISIBLE_AFTER_MS);
+    el.textContent = formatElapsed(elapsed);
+  }
+  const longTake = elapsed >= LONG_TAKE_AFTER_MS;
+  root?.classList.toggle("long-take", longTake);
+  if (longTake && longPulseFor !== startedAt) {
+    longPulseFor = startedAt;
+    root?.classList.add("long-pulse");
+  }
 }
 
 async function copyResult() {
@@ -252,7 +354,7 @@ async function retryResult() {
   const copy = copyBtn();
   if (retry) retry.disabled = true;
   if (copy) copy.disabled = true;
-  resultStatusText = "正在重试";
+  resultStatusText = resultAuto ? "正在插入" : "正在重试";
   const status = statusEl();
   if (status) status.textContent = resultStatusText;
 
@@ -262,10 +364,10 @@ async function retryResult() {
       exitResultMode();
       return;
     }
-    resultStatusText = "仍未插入 · 剪贴板未改变";
+    resultStatusText = resultAuto ? "未能插入 · 剪贴板未改变" : "仍未插入 · 剪贴板未改变";
     paintResultChrome();
   } catch {
-    resultStatusText = "重试失败 · 剪贴板未改变";
+    resultStatusText = resultAuto ? "插入失败 · 剪贴板未改变" : "重试失败 · 剪贴板未改变";
     paintResultChrome();
   } finally {
     if (retry) retry.disabled = false;
@@ -379,6 +481,7 @@ function applyState(state: UiState) {
   }
 
   renderStatus(state);
+  renderClock();
 
   pinBtn()?.classList.toggle("active", Boolean(state.sessionPinned));
 
@@ -398,7 +501,7 @@ function applyState(state: UiState) {
     (state.transcript || "").trim()
   ) {
     if (!resultActive) {
-      enterResultMode();
+      enterResultMode(state);
     } else {
       paintResultChrome();
     }
@@ -446,6 +549,9 @@ function noteInteraction() {
 
 window.addEventListener("DOMContentLoaded", async () => {
   document.querySelector("#capsule")?.addEventListener("mousedown", noteInteraction, true);
+  capsule()?.addEventListener("animationend", (e) => {
+    if (e.animationName === "long-take-pulse") capsule()?.classList.remove("long-pulse");
+  });
   document.querySelector("#cancel-btn")?.addEventListener("click", (e) => {
     e.stopPropagation();
     if (resultActive) {
@@ -527,7 +633,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Restore the result card if the webview reloaded while it was pending.
   const initial = await invoke<UiState>("get_state").catch(() => null);
   if (initial?.needsCopyPrompt && (initial.transcript || "").trim()) {
-    enterResultMode();
+    enterResultMode(initial);
   }
 
   await listen<UiState>("jackvoice://state", (event) => {
@@ -543,7 +649,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     const state = await invoke<UiState>("get_state").catch(() => null);
     if (state) applyState(state);
     if (!delivery.pasted && (state?.transcript || "").trim()) {
-      enterResultMode();
+      enterResultMode(state);
     } else if (delivery.pasted) {
       // 插进去了：这一轮就结束了，胶囊一起收掉。
       //

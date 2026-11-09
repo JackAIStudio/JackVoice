@@ -17,7 +17,10 @@
     <div class="capsule" id="capsule">
       <button id="cancel-btn" class="icon-btn" title="取消">×</button>
       <div class="content" id="drag-region">
-        <div id="overlay-status" class="status">正在听写</div>
+        <div class="status-row">
+          <div id="overlay-status" class="status">正在听写</div>
+          <span id="overlay-elapsed" class="elapsed hidden" aria-label="已录时长"></span>
+        </div>
         <div id="overlay-text" class="text empty">等待语音…</div>
       </div>
       <div id="audio-meter" class="audio-meter" aria-hidden="true" title="麦克风输入电平">
