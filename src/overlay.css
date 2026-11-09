@@ -21,15 +21,17 @@ body {
   background: transparent !important;
 }
 
+/*
+ * 胶囊 = 可选的全文卡片（sheet）+ 一行控制条（bar）。
+ * 圆角固定 23px：单行 46px 高时正好是胶囊，展开成卡片时也不变形。
+ * 往上长时卡片在控制条上方；往下长（grow-down）时在下方，控制条始终钉在原处。
+ */
 .capsule {
   width: 100%;
   height: 100%;
-  display: grid;
-  grid-template-columns: 28px minmax(0, 1fr) 20px 28px 28px;
-  gap: 8px;
-  align-items: center;
-  padding: 6px 8px;
-  border-radius: 999px;
+  display: flex;
+  flex-direction: column;
+  border-radius: 23px;
   background: rgba(20, 20, 22, 0.96);
   border: 1px solid rgba(255, 255, 255, 0.10);
   /* No drop shadow: macOS transparent windows + shadow often create square plates. */
@@ -43,9 +45,150 @@ body {
   cursor: grabbing;
 }
 
+.capsule.grow-down {
+  flex-direction: column-reverse;
+}
+
+.bar {
+  flex: 0 0 44px;
+  height: 44px;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 20px 28px 28px;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 8px;
+  min-width: 0;
+}
+
+/* 全文卡片：只在展开时出现，占满控制条以外的高度。 */
+.sheet {
+  display: none;
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 10px 0 2px;
+}
+
+.capsule.grow-down .sheet {
+  padding: 2px 0 10px;
+}
+
+.capsule.expanded .sheet {
+  display: flex;
+  animation: sheet-in 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes sheet-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.sheet-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0 14px;
+  scrollbar-width: none;
+}
+
+.sheet-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+/* 上面还有没露出来的旧内容时，顶边淡出。 */
+.sheet-scroll.clipped {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 14px);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 14px);
+}
+
+.sheet-flow {
+  font-size: 13px;
+  line-height: 20px;
+  color: #f3f5f7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 说过的句子退后一层，正在说的这句保持全亮。 */
+.sheet-flow .said {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.jump-btn {
+  position: absolute;
+  right: 10px;
+  bottom: 4px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  background: rgba(40, 40, 44, 0.98);
+  color: rgba(255, 255, 255, 0.8);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.capsule.grow-down .jump-btn {
+  bottom: 12px;
+}
+
+.jump-btn:hover {
+  color: #fff;
+  background: rgba(56, 56, 60, 0.98);
+}
+
+/* 展开 / 收起：跟在状态文字后面，不占控制条的格子。 */
+.expand-btn {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 14px;
+  margin: -2px 0 -2px -2px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.45);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+.expand-btn svg {
+  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.expand-btn.flip svg {
+  transform: rotate(180deg);
+}
+
+.expand-btn:hover,
+.content.expandable:hover .expand-btn {
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.expand-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.content.expandable {
+  cursor: pointer;
+}
+
+/* 展开后单行预览让位给卡片；保留宽度以便继续判断是否溢出。 */
+.capsule.expanded .text {
+  visibility: hidden;
+  height: 0;
+}
+
 .content {
   min-width: 0;
   width: 100%;
+  /* 撑满控制条高度：点状态 / 文字那一栏的任何位置都算点中。 */
+  align-self: stretch;
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -55,7 +198,7 @@ body {
 
 .status-row {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 6px;
   min-width: 0;
 }
@@ -169,8 +312,11 @@ body {
 
 /* Result mode: insertion was not detected, offer safe retry and explicit copy. */
 .capsule.result {
-  grid-template-columns: 28px minmax(0, 1fr) auto auto;
   border-color: rgba(255, 177, 74, 0.45);
+}
+
+.capsule.result .bar {
+  grid-template-columns: 28px minmax(0, 1fr) auto auto;
 }
 
 .capsule.result #confirm-btn,

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use crate::main_window::MAIN_LABEL;
 
@@ -11,6 +11,212 @@ const OVERLAY_HEIGHT: f64 = 46.0;
 const DOCK_GAP: f64 = 14.0;
 /// Fallback when we cannot read dock height from work area.
 const DEFAULT_DOCK_RESERVE: f64 = 78.0;
+/// 展开的卡片离屏幕工作区边缘至少留这么多。
+const EXPAND_EDGE_MARGIN: f64 = 4.0;
+/// 胶囊藏起来时缩回单行，通知前端撤掉卡片排版。
+const OVERLAY_COLLAPSED_EVENT: &str = "jackvoice://overlay-collapsed";
+
+/// 胶囊展开成多行卡片时往哪边长。按钮那一行始终钉在原处，
+/// 说着话伸手去点「确认」时不会点歪。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrowAnchor {
+    /// 底边不动，往上长：胶囊在屏幕下半部（默认停在程序坞上方）。
+    Up,
+    /// 顶边不动，往下长：胶囊被拖到了屏幕上半部。
+    Down,
+}
+
+impl GrowAnchor {
+    fn as_str(self) -> &'static str {
+        match self {
+            GrowAnchor::Up => "up",
+            GrowAnchor::Down => "down",
+        }
+    }
+}
+
+/// 现在展开着就是 Some(方向)；收起的单行胶囊是 None。
+fn expanded_slot() -> &'static parking_lot::Mutex<Option<GrowAnchor>> {
+    static SLOT: std::sync::OnceLock<parking_lot::Mutex<Option<GrowAnchor>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+/// 胶囊中心落在工作区下半部就往上长，否则往下长。
+fn anchor_for(top: f64, height: f64, work_top: f64, work_bottom: f64) -> GrowAnchor {
+    let center = top + height / 2.0;
+    if center >= (work_top + work_bottom) / 2.0 {
+        GrowAnchor::Up
+    } else {
+        GrowAnchor::Down
+    }
+}
+
+/// 改高度后窗口的顶边和高度（逻辑像素，左上角坐标系）。
+/// 往上长时底边不动，往下长时顶边不动；高度不超出工作区，也不小于单行。
+fn resized_geometry(
+    anchor: GrowAnchor,
+    top: f64,
+    height: f64,
+    target: f64,
+    work_top: f64,
+    work_bottom: f64,
+) -> (f64, f64) {
+    match anchor {
+        GrowAnchor::Up => {
+            let bottom = top + height;
+            let room = bottom - work_top - EXPAND_EDGE_MARGIN;
+            let h = target.min(room).max(OVERLAY_HEIGHT);
+            (bottom - h, h)
+        }
+        GrowAnchor::Down => {
+            let room = work_bottom - top - EXPAND_EDGE_MARGIN;
+            let h = target.min(room).max(OVERLAY_HEIGHT);
+            (top, h)
+        }
+    }
+}
+
+/// 窗口当前的顶边、高度，以及所在屏幕工作区的上下边（都是逻辑像素）。
+fn overlay_frame(window: &WebviewWindow) -> Result<(f64, f64, f64, f64, f64), String> {
+    let scale = window
+        .scale_factor()
+        .map_err(|e| format!("读取胶囊缩放失败：{e}"))?;
+    let pos = window
+        .outer_position()
+        .map_err(|e| format!("读取胶囊位置失败：{e}"))?;
+    let size = window
+        .inner_size()
+        .map_err(|e| format!("读取胶囊尺寸失败：{e}"))?;
+    let x = pos.x as f64 / scale;
+    let top = pos.y as f64 / scale;
+    let height = size.height as f64 / scale;
+    let (work_top, work_bottom) = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| {
+            let work = monitor.work_area();
+            let s = monitor.scale_factor();
+            let work_top = work.position.y as f64 / s;
+            (work_top, work_top + work.size.height as f64 / s)
+        })
+        .unwrap_or((f64::MIN / 4.0, f64::MAX / 4.0));
+    Ok((x, top, height, work_top, work_bottom))
+}
+
+/// 把胶囊窗口改成 `height` 高。macOS 上用一次 `setFrame:display:` 同时改
+/// 高度和位置：分开 set_size + set_position 会先朝错的方向长一帧再跳回来。
+fn apply_overlay_height(
+    window: &WebviewWindow,
+    anchor: GrowAnchor,
+    x: f64,
+    top: f64,
+    height: f64,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (x, top);
+        let ns_window = window
+            .ns_window()
+            .map_err(|e| format!("读取胶囊窗口失败：{e}"))? as usize;
+        let bottom_fixed = anchor == GrowAnchor::Up;
+        window
+            .run_on_main_thread(move || {
+                // SAFETY: the pointer comes from the live overlay window and is
+                // only dereferenced on the main thread, where AppKit expects it.
+                let ns_window = unsafe { &*(ns_window as *const objc2_app_kit::NSWindow) };
+                let mut frame = ns_window.frame();
+                // Cocoa 的原点在左下角：底边不动就是 origin.y 不变。
+                if !bottom_fixed {
+                    frame.origin.y += frame.size.height - height;
+                }
+                frame.size.height = height;
+                ns_window.setFrame_display(frame, true);
+            })
+            .map_err(|e| format!("调整胶囊尺寸失败：{e}"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = anchor;
+        window
+            .set_size(tauri::LogicalSize::new(OVERLAY_WIDTH, height))
+            .map_err(|e| format!("调整胶囊尺寸失败：{e}"))?;
+        window
+            .set_position(tauri::LogicalPosition::new(x, top))
+            .map_err(|e| format!("移动胶囊失败：{e}"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayGeometry {
+    /// "up" / "down"：展开着、往哪边长；"none"：收起成单行。
+    pub grow: &'static str,
+    pub height: f64,
+}
+
+/// 胶囊现在要展开的话会往哪边长。前端据此决定箭头朝向。
+pub fn overlay_grow_direction(app: &AppHandle) -> Result<&'static str, String> {
+    if let Some(anchor) = *expanded_slot().lock() {
+        return Ok(anchor.as_str());
+    }
+    let window = app
+        .get_webview_window(OVERLAY_LABEL)
+        .ok_or_else(|| "实时预览胶囊尚未创建。".to_string())?;
+    let (_, top, height, work_top, work_bottom) = overlay_frame(&window)?;
+    Ok(anchor_for(top, height, work_top, work_bottom).as_str())
+}
+
+/// 把胶囊设成 `height` 高（逻辑像素）。不超过单行高度就是收起。
+pub fn set_overlay_height(app: &AppHandle, height: f64) -> Result<OverlayGeometry, String> {
+    let window = app
+        .get_webview_window(OVERLAY_LABEL)
+        .ok_or_else(|| "实时预览胶囊尚未创建。".to_string())?;
+    let (x, top, current, work_top, work_bottom) = overlay_frame(&window)?;
+    let mut slot = expanded_slot().lock();
+
+    if height <= OVERLAY_HEIGHT + 0.5 {
+        let Some(anchor) = slot.take() else {
+            return Ok(OverlayGeometry {
+                grow: "none",
+                height: current,
+            });
+        };
+        let (new_top, h) = resized_geometry(
+            anchor,
+            top,
+            current,
+            OVERLAY_HEIGHT,
+            work_top,
+            work_bottom,
+        );
+        apply_overlay_height(&window, anchor, x, new_top, h)?;
+        return Ok(OverlayGeometry {
+            grow: "none",
+            height: h,
+        });
+    }
+
+    let anchor = slot.unwrap_or_else(|| anchor_for(top, current, work_top, work_bottom));
+    let (new_top, h) = resized_geometry(anchor, top, current, height, work_top, work_bottom);
+    apply_overlay_height(&window, anchor, x, new_top, h)?;
+    *slot = Some(anchor);
+    Ok(OverlayGeometry {
+        grow: anchor.as_str(),
+        height: h,
+    })
+}
+
+/// 胶囊藏起来时缩回单行：下一轮总是从单行开始，存下来的位置也不会漂。
+fn collapse_hidden_overlay(app: &AppHandle) {
+    if expanded_slot().lock().is_some() {
+        if let Err(error) = set_overlay_height(app, OVERLAY_HEIGHT) {
+            eprintln!("[overlay] collapse failed: {error}");
+        }
+    }
+    let _ = app.emit(OVERLAY_COLLAPSED_EVENT, ());
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -174,6 +380,7 @@ pub fn hide_overlay(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
         let _ = window.hide();
     }
+    collapse_hidden_overlay(app);
     ensure_main_stays_in_background(app);
 }
 
@@ -188,6 +395,7 @@ pub fn hide_overlay_for_delivery(app: &AppHandle, reactivate_target: bool) {
     if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
         let _ = window.hide();
     }
+    collapse_hidden_overlay(app);
     conceal_main_if_unwanted(app);
 }
 
@@ -527,12 +735,24 @@ fn has_visible_windows<R: tauri::Runtime>(_app: &AppHandle<R>) -> bool {
 }
 
 /// Called from frontend drag end to persist capsule position.
+/// 存的永远是单行胶囊的位置：往上长的卡片要把顶边换算回单行时的顶边。
 pub fn save_overlay_position(app: AppHandle, x: f64, y: f64) -> Result<(), String> {
+    let anchor = *expanded_slot().lock();
+    let y = match (anchor, app.get_webview_window(OVERLAY_LABEL)) {
+        (Some(GrowAnchor::Up), Some(window)) => match overlay_frame(&window) {
+            Ok((_, _, height, _, _)) => y + height - OVERLAY_HEIGHT,
+            Err(_) => y,
+        },
+        _ => y,
+    };
     save_position(&app, &OverlayPosition { x, y })
 }
 
 pub fn reset_overlay_position(app: AppHandle) -> Result<(), String> {
     ensure_overlay(&app)?;
+    // 先缩回单行，下面算的居中位置才对得上。
+    set_overlay_height(&app, OVERLAY_HEIGHT)?;
+    let _ = app.emit(OVERLAY_COLLAPSED_EVENT, ());
     let (x, y) = center_on_settings_screen(&app)
         .ok_or_else(|| "无法获取当前屏幕，请稍后重试。".to_string())?;
     save_position(&app, &OverlayPosition { x, y })?;
@@ -645,5 +865,42 @@ mod tests {
         activate_running_process(-1);
         activate_running_process(0);
         activate_running_process(999999);
+    }
+
+    #[test]
+    fn capsule_grows_away_from_the_nearer_screen_edge() {
+        // 工作区 25..1000：默认停在程序坞上方，往上长。
+        assert_eq!(anchor_for(900.0, 46.0, 25.0, 1000.0), GrowAnchor::Up);
+        // 拖到屏幕上半部，往下长。
+        assert_eq!(anchor_for(60.0, 46.0, 25.0, 1000.0), GrowAnchor::Down);
+    }
+
+    #[test]
+    fn growing_up_keeps_the_bottom_edge_in_place() {
+        let (top, h) = resized_geometry(GrowAnchor::Up, 900.0, 46.0, 200.0, 25.0, 1000.0);
+        assert_eq!(h, 200.0);
+        assert_eq!(top + h, 946.0);
+
+        // 收回单行时底边仍不动。
+        let (top, h) = resized_geometry(GrowAnchor::Up, 746.0, 200.0, OVERLAY_HEIGHT, 25.0, 1000.0);
+        assert_eq!((top, h), (900.0, OVERLAY_HEIGHT));
+    }
+
+    #[test]
+    fn growing_down_keeps_the_top_edge_in_place() {
+        let (top, h) = resized_geometry(GrowAnchor::Down, 60.0, 46.0, 200.0, 25.0, 1000.0);
+        assert_eq!((top, h), (60.0, 200.0));
+    }
+
+    #[test]
+    fn expanded_card_never_leaves_the_work_area() {
+        // 底边在 140，上面只剩 140 - 25 - 4 = 111。
+        let (top, h) = resized_geometry(GrowAnchor::Up, 94.0, 46.0, 200.0, 25.0, 1000.0);
+        assert_eq!(h, 111.0);
+        assert_eq!(top, 29.0);
+
+        // 再挤也不比单行矮。
+        let (_, h) = resized_geometry(GrowAnchor::Down, 980.0, 46.0, 200.0, 25.0, 1000.0);
+        assert_eq!(h, OVERLAY_HEIGHT);
     }
 }

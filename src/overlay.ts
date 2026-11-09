@@ -170,6 +170,7 @@ function enterResultMode(state?: UiState | null) {
       void dismissResult();
     }, RESULT_AUTO_DISMISS_MS);
   }
+  syncExpansion(state ?? lastState);
 }
 
 function exitResultMode() {
@@ -238,6 +239,8 @@ function renderPreview(state: UiState) {
       text.textContent = "本地录音发生错误";
       text.classList.add("empty");
     }
+    previewContent = "";
+    setOverflowing(false);
     return;
   }
   setPreviewText(state.transcript || "");
@@ -386,17 +389,22 @@ function setPreviewText(value: string) {
 
   const content = (value || "").replace(/\s+/g, " ").trim();
   text.classList.toggle("empty", !content);
+  previewContent = content;
+  renderSheet();
 
   if (!content) {
     text.textContent = "等待语音…";
+    setOverflowing(false);
     return;
   }
 
   // Fast path: if short enough, show full text.
   text.textContent = content;
   if (text.scrollWidth <= text.clientWidth + 1) {
+    setOverflowing(false);
     return;
   }
+  setOverflowing(true);
 
   // Keep the newest end. Prefix with ellipsis only when truncated.
   const available = Math.max(8, text.clientWidth);
@@ -430,6 +438,232 @@ function setPreviewText(value: string) {
   }
 
   text.textContent = best;
+}
+
+/**
+ * 长听写的全文卡片。单行放不下时状态行后面出现展开箭头；展开后胶囊长成
+ * 卡片，控制条钉在原处不动。展开与否记成偏好：上次展开过，下次一溢出就
+ * 自动展开；短句永远是单行胶囊。
+ */
+const EXPAND_PREF_KEY = "jackvoice.overlay.expanded";
+const COLLAPSED_HEIGHT = 46;
+const SHEET_LINE_HEIGHT = 20;
+const SHEET_MAX_LINES = 7;
+/** 卡片上下内边距之和，见 overlay.css 的 `.sheet`。 */
+const SHEET_CHROME = 12;
+/** 收起时等窗口缩回单行再撤卡片排版；等不到就按这个时间兜底。 */
+const COLLAPSE_SETTLE_MS = 300;
+/** 滚动发生在最近一次滚轮之后多久内，算作用户自己在翻。 */
+const WHEEL_SCROLL_WINDOW_MS = 300;
+const DRAG_THRESHOLD_PX = 3;
+
+type GrowDirection = "up" | "down";
+type OverlayGeometry = { grow: GrowDirection | "none"; height: number };
+
+const sheetScrollEl = () => document.querySelector<HTMLElement>("#sheet-scroll");
+const sheetFlowEl = () => document.querySelector<HTMLElement>("#sheet-flow");
+const sheetSaidEl = () => document.querySelector<HTMLElement>("#sheet-said");
+const sheetCurrentEl = () => document.querySelector<HTMLElement>("#sheet-current");
+const expandBtn = () => document.querySelector<HTMLButtonElement>("#expand-btn");
+const jumpBtn = () => document.querySelector<HTMLButtonElement>("#jump-btn");
+const contentEl = () => document.querySelector<HTMLElement>("#drag-region");
+
+let previewContent = "";
+let overflowing = false;
+let expanded = false;
+let growDir: GrowDirection = "up";
+let followLatest = true;
+let lastWheelAt = 0;
+let collapseTimer: number | undefined;
+
+function readExpandPref(): boolean {
+  try {
+    return window.localStorage.getItem(EXPAND_PREF_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeExpandPref(value: boolean) {
+  try {
+    window.localStorage.setItem(EXPAND_PREF_KEY, value ? "1" : "0");
+  } catch {
+    // 记不住就每次手动展开，不影响听写。
+  }
+}
+
+let expandPref = readExpandPref();
+
+/** 窗口高度请求排队：同一时刻只发一个，期间的新高度合并成最后一次。 */
+let appliedHeight = COLLAPSED_HEIGHT;
+let wantedHeight = COLLAPSED_HEIGHT;
+let geometryBusy = false;
+
+async function flushHeight() {
+  if (geometryBusy) return;
+  geometryBusy = true;
+  try {
+    while (wantedHeight !== appliedHeight) {
+      const target = wantedHeight;
+      try {
+        const geometry = await invoke<OverlayGeometry>("set_overlay_height", { height: target });
+        if (geometry.grow !== "none") setGrowDirection(geometry.grow);
+      } catch (err) {
+        console.error("resize overlay failed", err);
+      }
+      appliedHeight = target;
+    }
+  } finally {
+    geometryBusy = false;
+  }
+}
+
+function requestHeight(height: number) {
+  wantedHeight = Math.round(height);
+  void flushHeight();
+}
+
+function setGrowDirection(dir: GrowDirection) {
+  growDir = dir;
+  capsule()?.classList.toggle("grow-down", dir === "down");
+  paintExpandButton();
+}
+
+async function refreshGrowDirection() {
+  if (expanded) return;
+  try {
+    const dir = await invoke<GrowDirection>("overlay_grow_direction");
+    if (!expanded) setGrowDirection(dir);
+  } catch {
+    // 拿不到就沿用上次的方向。
+  }
+}
+
+function setOverflowing(next: boolean) {
+  if (next === overflowing) return;
+  overflowing = next;
+  if (next && !expanded) void refreshGrowDirection();
+  paintExpandButton();
+}
+
+/** 箭头指向卡片会长出去的方向；展开后反过来，表示收回。 */
+function paintExpandButton() {
+  const available = overflowing || expanded;
+  const btn = expandBtn();
+  if (btn) {
+    btn.classList.toggle("hidden", !available);
+    btn.classList.toggle("flip", (growDir === "up") === expanded);
+    btn.title = expanded ? "收起" : "展开全文";
+  }
+  contentEl()?.classList.toggle("expandable", available);
+}
+
+/** 最后一个句末标点之后是正在说的这句；末尾刚好落在标点上时，取上一句。 */
+function splitLatestSentence(text: string): [string, string] {
+  const body = text.slice(0, -1);
+  let cut = -1;
+  for (const match of body.matchAll(/[。！？!?；;]|\.(?=\s)/g)) {
+    cut = (match.index ?? 0) + match[0].length;
+  }
+  return cut <= 0 ? ["", text] : [text.slice(0, cut), text.slice(cut)];
+}
+
+function sheetWindowHeight(): number {
+  const flow = sheetFlowEl()?.offsetHeight ?? SHEET_LINE_HEIGHT;
+  const text = Math.min(
+    Math.max(flow, SHEET_LINE_HEIGHT),
+    SHEET_LINE_HEIGHT * SHEET_MAX_LINES,
+  );
+  return COLLAPSED_HEIGHT + SHEET_CHROME + text;
+}
+
+function paintSheetClip() {
+  const el = sheetScrollEl();
+  el?.classList.toggle("clipped", Boolean(el && el.scrollTop > 1));
+}
+
+function scrollSheetToLatest() {
+  const el = sheetScrollEl();
+  if (el) el.scrollTop = el.scrollHeight;
+  paintSheetClip();
+}
+
+function setFollowLatest(next: boolean) {
+  followLatest = next;
+  jumpBtn()?.classList.toggle("hidden", next);
+}
+
+function renderSheet() {
+  if (!expanded) return;
+  const [said, current] = splitLatestSentence(previewContent);
+  const saidEl = sheetSaidEl();
+  const currentEl = sheetCurrentEl();
+  if (saidEl && saidEl.textContent !== said) saidEl.textContent = said;
+  if (currentEl && currentEl.textContent !== current) currentEl.textContent = current;
+  requestHeight(sheetWindowHeight());
+  if (followLatest) scrollSheetToLatest();
+}
+
+function finishCollapse() {
+  if (collapseTimer) {
+    window.clearTimeout(collapseTimer);
+    collapseTimer = undefined;
+  }
+  if (!expanded) capsule()?.classList.remove("expanded");
+}
+
+function setExpanded(next: boolean) {
+  if (next === expanded) return;
+  expanded = next;
+  if (next) {
+    if (collapseTimer) {
+      window.clearTimeout(collapseTimer);
+      collapseTimer = undefined;
+    }
+    setFollowLatest(true);
+    capsule()?.classList.add("expanded");
+    renderSheet();
+  } else {
+    requestHeight(COLLAPSED_HEIGHT);
+    // 等窗口缩回单行再撤卡片排版，免得高窗口里先露出一截空胶囊。
+    if (collapseTimer) window.clearTimeout(collapseTimer);
+    collapseTimer = window.setTimeout(finishCollapse, COLLAPSE_SETTLE_MS);
+  }
+  paintExpandButton();
+}
+
+function toggleExpanded() {
+  const next = !expanded;
+  expandPref = next;
+  writeExpandPref(next);
+  setExpanded(next);
+}
+
+/**
+ * 只有录音中、收尾中或结果卡片上才可能展开；自动展开只发生在录音中和结果
+ * 卡片上，免得胶囊已经藏起来后又被后台的收尾状态撑大。
+ */
+function syncExpansion(state: UiState | null) {
+  const live = state ? isLive(state) : false;
+  const showing = live || resultActive || state?.phase === "finalizing";
+  if (!overflowing || !showing) {
+    if (expanded) setExpanded(false);
+  } else if (!expanded && expandPref && (live || resultActive)) {
+    setExpanded(true);
+  }
+  paintExpandButton();
+}
+
+/** 后端藏起胶囊时已经把窗口缩回单行，这里只撤掉排版。 */
+function dropExpandedLayout() {
+  expanded = false;
+  appliedHeight = COLLAPSED_HEIGHT;
+  wantedHeight = COLLAPSED_HEIGHT;
+  finishCollapse();
+  capsule()?.classList.remove("expanded", "grow-down");
+  growDir = "up";
+  setFollowLatest(true);
+  paintExpandButton();
 }
 
 function applyState(state: UiState) {
@@ -510,6 +744,8 @@ function applyState(state: UiState) {
   } else if (resultActive && state.phase === "idle") {
     paintResultChrome();
   }
+
+  syncExpansion(state);
 }
 
 async function refresh(): Promise<UiState | null> {
@@ -591,19 +827,58 @@ window.addEventListener("DOMContentLoaded", async () => {
     void retryResult();
   });
 
-  // Drag the capsule body itself.
-  const dragTargets = [
-    capsule(),
-    document.querySelector("#drag-region"),
-    statusEl(),
-    textEl(),
-  ].filter(Boolean) as HTMLElement[];
+  expandBtn()?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    toggleExpanded();
+  });
+  jumpBtn()?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    setFollowLatest(true);
+    const el = sheetScrollEl();
+    el?.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  });
 
-  for (const el of dragTargets) {
-    el.addEventListener("mousedown", async (e) => {
-      const target = e.target as HTMLElement | null;
-      if (target?.closest("button")) return;
-      e.preventDefault();
+  // 只有用户自己滚动才改变「跟随最新」：新文字撑高、窗口变高引起的滚动不算。
+  const sheetScroll = sheetScrollEl();
+  sheetScroll?.addEventListener(
+    "wheel",
+    () => {
+      lastWheelAt = Date.now();
+    },
+    { passive: true },
+  );
+  sheetScroll?.addEventListener(
+    "scroll",
+    () => {
+      paintSheetClip();
+      if (Date.now() - lastWheelAt > WHEEL_SCROLL_WINDOW_MS) return;
+      const el = sheetScrollEl();
+      if (!el) return;
+      setFollowLatest(el.scrollHeight - el.scrollTop - el.clientHeight < 4);
+    },
+    { passive: true },
+  );
+
+  // 按住拖动胶囊；没挪动就松开算点击：点状态和文字那一栏也能展开 / 收起。
+  let press: { x: number; y: number; onContent: boolean } | null = null;
+  capsule()?.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement | null;
+    if (target?.closest("button")) return;
+    e.preventDefault();
+    press = {
+      x: e.screenX,
+      y: e.screenY,
+      onContent: Boolean(target?.closest("#drag-region")),
+    };
+  });
+
+  window.addEventListener("mousemove", (e) => {
+    if (!press || (e.buttons & 1) === 0) return;
+    const moved = Math.abs(e.screenX - press.x) + Math.abs(e.screenY - press.y);
+    if (moved < DRAG_THRESHOLD_PX) return;
+    press = null;
+    void (async () => {
       try {
         await invoke("start_overlay_drag");
       } catch {
@@ -613,20 +888,28 @@ window.addEventListener("DOMContentLoaded", async () => {
           // no-op
         }
       }
-    });
-  }
-
-  window.addEventListener("mouseup", () => {
-    void persistPosition();
+    })();
   });
 
+  window.addEventListener("mouseup", () => {
+    const clicked = press;
+    press = null;
+    if (clicked?.onContent && (overflowing || expanded)) toggleExpanded();
+    void persistPosition();
+    // 拖到屏幕另一半后，下次展开的方向也跟着变。
+    if (overflowing && !expanded) void refreshGrowDirection();
+  });
+
+  let lastWidth = window.innerWidth;
   window.addEventListener("resize", () => {
     // Recompute visible suffix when width changes.
-    const current = textEl()?.textContent || "";
-    if (current && current !== "等待语音…") {
-      // best effort: re-fetch full state
+    if (window.innerWidth !== lastWidth) {
+      lastWidth = window.innerWidth;
       void refresh();
     }
+    if (!expanded && window.innerHeight <= COLLAPSED_HEIGHT + 2) finishCollapse();
+    if (expanded && followLatest) scrollSheetToLatest();
+    else paintSheetClip();
   });
 
   await refresh();
@@ -638,6 +921,10 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   await listen<UiState>("jackvoice://state", (event) => {
     applyState(event.payload);
+  });
+
+  await listen("jackvoice://overlay-collapsed", () => {
+    dropExpandedLayout();
   });
 
   await listen<number>("jackvoice://level", (event) => {

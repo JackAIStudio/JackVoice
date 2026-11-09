@@ -578,6 +578,19 @@ fn start_overlay_drag(app: AppHandle) -> Result<(), String> {
     crate::overlay::start_overlay_drag(app)
 }
 
+#[tauri::command]
+fn overlay_grow_direction(app: AppHandle) -> Result<&'static str, String> {
+    crate::overlay::overlay_grow_direction(&app)
+}
+
+#[tauri::command]
+fn set_overlay_height(
+    app: AppHandle,
+    height: f64,
+) -> Result<crate::overlay::OverlayGeometry, String> {
+    crate::overlay::set_overlay_height(&app, height)
+}
+
 /// Re-copy the last dictation result to the clipboard. Used by the manual
 /// "copy" button that appears when auto-insertion was not detected.
 #[tauri::command]
@@ -942,6 +955,8 @@ pub fn run() {
             save_overlay_position,
             reset_overlay_position,
             start_overlay_drag,
+            overlay_grow_direction,
+            set_overlay_height,
             copy_last_transcript,
             retry_last_transcript,
             note_overlay_interaction,
