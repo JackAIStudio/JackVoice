@@ -2816,6 +2816,37 @@ fn take_session_pin(app: &AppHandle, session_id: u64) -> bool {
     pinned
 }
 
+/// 一轮收尾之后胶囊的去留。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinishedOverlay {
+    /// 出错：叫回屏幕让人看清原因，几秒后自己收起。
+    ShowError,
+    /// 有文字没送到（没插进去、或自动结束不粘贴）：留结果卡片等人取。
+    ShowResult,
+    /// 这一轮没有要人处理的事：已粘贴、已收入待办、一句没说、识别没成但
+    /// 录音和文字都进了历史。胶囊挂着只剩一个「待命」和一颗点了也没用的 ✓。
+    Hide,
+}
+
+/// `report_finalize` 的胶囊判定本体，抽出来便于单独验证。
+///
+/// 收尾挪进后台那次重构只留了「叫回来」的两条，把「收起」整个丢了：置顶
+/// 听写收入待办后胶囊停在「待命」不走。默认必须是收起，只有确实还有事要人
+/// 处理时才留着。
+fn finished_overlay(
+    phase_is_error: bool,
+    needs_copy_prompt: bool,
+    has_text: bool,
+) -> FinishedOverlay {
+    if phase_is_error {
+        FinishedOverlay::ShowError
+    } else if needs_copy_prompt && has_text {
+        FinishedOverlay::ShowResult
+    } else {
+        FinishedOverlay::Hide
+    }
+}
+
 /// 一轮收尾的结论，交给 `report_finalize` 写回界面。
 struct FinalizeReport {
     session_id: u64,
@@ -2913,14 +2944,17 @@ fn report_finalize(app: &AppHandle, report: FinalizeReport) {
     let _ = app.emit("jackvoice://state", ui.clone());
     drop(ui);
 
-    // 只有失败和「没插进去、要用户手动复制」需要把胶囊叫回屏幕。
-    let shows_result_card = needs_copy_prompt && !final_text.trim().is_empty();
-    if phase_is_error || shows_result_card {
-        crate::overlay::show_overlay(app);
-    } else if auto_stop.is_some() {
-        // 自动结束且没有要用户取的文字（一句没说、或已收入待办）：胶囊没有
-        // 理由继续挂在屏幕上等一个已经离开的人。
-        crate::overlay::hide_overlay(app);
+    match finished_overlay(
+        phase_is_error,
+        needs_copy_prompt,
+        !final_text.trim().is_empty(),
+    ) {
+        FinishedOverlay::ShowError => {
+            crate::overlay::show_overlay(app);
+            schedule_error_overlay_hide(app, session_id);
+        }
+        FinishedOverlay::ShowResult => crate::overlay::show_overlay(app),
+        FinishedOverlay::Hide => crate::overlay::hide_overlay(app),
     }
     if let Some(delivery) = delivery_result {
         let _ = app.emit("jackvoice://delivery", delivery);
@@ -3276,7 +3310,9 @@ mod volc_connection_error_tests {
     };
     use super::{check_silence, AutoStop, SilenceCheck, SPEECH_LEVEL_THRESHOLD};
     use crate::audio::{ActiveInputDevice, AudioNotice, InputDeviceInfo, InputDevicePreference};
-    use crate::session::{decide_delivery_turn, owns_ui, DeliveryTurn};
+    use crate::session::{
+        decide_delivery_turn, finished_overlay, owns_ui, DeliveryTurn, FinishedOverlay,
+    };
     use std::time::Duration;
 
     #[test]
@@ -3288,6 +3324,34 @@ mod volc_connection_error_tests {
         assert_eq!(
             route_finished_transcript(false),
             FinishedTranscriptRoute::InsertOrPrompt
+        );
+    }
+
+    /// 置顶听写收入待办之后胶囊必须收起，不能停在「待命」挂着一颗 ✓。
+    #[test]
+    fn capsule_hides_once_nothing_is_left_for_the_user() {
+        // 收入待办 / 已粘贴：有文字，但不需要人去取。
+        assert_eq!(finished_overlay(false, false, true), FinishedOverlay::Hide);
+        // 一句没说。
+        assert_eq!(finished_overlay(false, false, false), FinishedOverlay::Hide);
+        // 要提示复制却没有文字，也没什么可取的。
+        assert_eq!(finished_overlay(false, true, false), FinishedOverlay::Hide);
+    }
+
+    #[test]
+    fn capsule_stays_when_text_waits_or_something_failed() {
+        assert_eq!(
+            finished_overlay(false, true, true),
+            FinishedOverlay::ShowResult
+        );
+        assert_eq!(
+            finished_overlay(true, false, false),
+            FinishedOverlay::ShowError
+        );
+        // 出错优先于结果卡片：状态行要先把原因摆出来。
+        assert_eq!(
+            finished_overlay(true, true, true),
+            FinishedOverlay::ShowError
         );
     }
 
