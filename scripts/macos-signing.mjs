@@ -108,6 +108,75 @@ export function discoverProductionSigningIdentity(env = process.env) {
   });
 }
 
+export const DEV_SIGNING_IDENTITY_ENV = "JACKVOICE_DEV_SIGNING_IDENTITY";
+
+/** `security find-identity` 输出里所有带引号的身份名。 */
+export function parseCodesigningIdentityNames(output) {
+  const names = [];
+  for (const line of output.split("\n")) {
+    const quoted = line.match(/^\s*\d+\)\s+[0-9A-F]+\s+"(.+)"\s*$/)?.[1]?.trim();
+    if (quoted && !names.includes(quoted)) names.push(quoted);
+  }
+  return names;
+}
+
+/**
+ * 开发版 App 的签名身份。
+ *
+ * 临时签名（ad-hoc）的 Designated Requirement 只绑 CDHash，每次重新打包都会变，
+ * macOS 就把它当成没见过的新应用，辅助功能、麦克风要全部重新授权。换成钥匙串里
+ * 的固定证书后，DR 绑的是「Bundle ID + 证书」，授权一次以后一直有效。
+ *
+ * 优先 Apple Development（本机开发证书），其次 Developer ID Application；多张时
+ * 按名字排序取第一张，保证每次选中同一张。`JACKVOICE_DEV_SIGNING_IDENTITY` 可以
+ * 指定某张证书，设成 `-` 则强制临时签名。没有证书时退回临时签名，不挡构建。
+ */
+export function selectDevelopmentSigningIdentity({ availableNames, explicitIdentity }) {
+  const explicit = explicitIdentity?.trim();
+  if (explicit === "-") return { identity: null, source: "explicit-adhoc" };
+  if (explicit) {
+    if (!availableNames.includes(explicit)) {
+      throw new Error(`${DEV_SIGNING_IDENTITY_ENV} 指定的证书不在当前钥匙串中：${explicit}`);
+    }
+    return { identity: explicit, source: "explicit" };
+  }
+
+  for (const prefix of ["Apple Development: ", "Developer ID Application: "]) {
+    const matches = availableNames.filter((name) => name.startsWith(prefix)).sort();
+    if (matches.length > 0) return { identity: matches[0], source: "keychain" };
+  }
+  return { identity: null, source: "none" };
+}
+
+export function discoverDevelopmentSigningIdentity(env = process.env) {
+  let names = [];
+  try {
+    names = parseCodesigningIdentityNames(
+      commandOutput("/usr/bin/security", ["find-identity", "-v", "-p", "codesigning"]),
+    );
+  } catch {
+    // 读不了钥匙串时按「没有证书」处理，开发构建照常用临时签名。
+  }
+  return selectDevelopmentSigningIdentity({
+    availableNames: names,
+    explicitIdentity: env[DEV_SIGNING_IDENTITY_ENV],
+  });
+}
+
+/**
+ * 给开发版 App 签名的 codesign 参数。不开 hardened runtime：开发版不公证，
+ * 开了反而要补齐 entitlements 才能用麦克风。也不打时间戳，免得构建依赖网络。
+ */
+export function developmentCodesignArgs(identity, appPath) {
+  if (!identity) return ["--force", "--deep", "--sign", "-", appPath];
+  return ["--force", "--deep", "--timestamp=none", "--sign", identity, appPath];
+}
+
+/** DR 只绑 CDHash 时，每次重新打包都要重新授权。 */
+export function designatedRequirementIsStable(designatedRequirement) {
+  return !/^# designated => cdhash\b/m.test(designatedRequirement);
+}
+
 export function productionSigningConfig(signing) {
   if (!signing.identity) return null;
   return JSON.stringify({

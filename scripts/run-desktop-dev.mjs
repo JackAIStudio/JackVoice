@@ -4,6 +4,10 @@ import { homedir, platform } from "node:os";
 import { join } from "node:path";
 
 import {
+  DEV_SIGNING_IDENTITY_ENV,
+  designatedRequirementIsStable,
+  developmentCodesignArgs,
+  discoverDevelopmentSigningIdentity,
   discoverProductionSigningIdentity,
   productionAppPath,
   productionSigningConfig,
@@ -245,6 +249,26 @@ if (build && production && platform() === "darwin") {
   }
 }
 
+let developmentSigning = null;
+if (build && !production && platform() === "darwin") {
+  try {
+    developmentSigning = discoverDevelopmentSigningIdentity(buildEnvironment);
+  } catch (error) {
+    console.error(`[JackVoice] 开发版签名已阻止：${error.message}`);
+    process.exit(1);
+  }
+  if (developmentSigning.identity) {
+    console.log(`[JackVoice] 开发版签名：${developmentSigning.identity}（授权一次后重新打包不再丢失）`);
+  } else if (developmentSigning.source === "none") {
+    console.log(
+      "[JackVoice] 开发版签名：临时签名。钥匙串里没有 Apple Development 证书，" +
+        "每次重新打包都要重新授权辅助功能和麦克风。",
+    );
+  } else {
+    console.log(`[JackVoice] 开发版签名：临时签名（${DEV_SIGNING_IDENTITY_ENV}=-）`);
+  }
+}
+
 const child = spawn(npmCommand, args, {
   cwd: process.cwd(),
   env: buildEnvironment,
@@ -274,21 +298,40 @@ child.on("exit", (code, signal) => {
       // Repeated local bundles can retain Finder metadata or quarantine xattrs
       // from an older .app directory. codesign may appear to succeed while a
       // strict verification still rejects those attributes, so normalize the
-      // freshly bundled development app before applying its ad-hoc signature.
+      // freshly bundled development app before signing it.
       execFileSync("xattr", ["-cr", appPath], { stdio: "inherit" });
-      // Tauri's --no-sign avoids using the production Developer ID. Apply a
-      // local ad-hoc signature so macOS still validates the development app's
-      // resource envelope and keeps it distinct from the release identity.
-      execFileSync(
-        "codesign",
-        ["--force", "--deep", "--sign", "-", appPath],
-        { stdio: "inherit" },
-      );
+      // Tauri's --no-sign keeps the production signing config out of the
+      // development bundle. Sign here instead: with a keychain certificate
+      // when one exists, so the Designated Requirement binds the dev Bundle ID
+      // plus that certificate and TCC grants survive rebuilds; otherwise
+      // ad-hoc, which still validates the resource envelope.
+      const identity = developmentSigning?.identity ?? null;
+      try {
+        execFileSync("codesign", developmentCodesignArgs(identity, appPath), {
+          stdio: "inherit",
+        });
+      } catch (error) {
+        if (!identity) throw error;
+        console.warn(
+          `[JackVoice] 用 ${identity} 签名失败，退回临时签名；这次需要重新授权。` +
+            `（${error.message}）`,
+        );
+        execFileSync("codesign", developmentCodesignArgs(null, appPath), {
+          stdio: "inherit",
+        });
+      }
       execFileSync(
         "codesign",
         ["--verify", "--deep", "--strict", "--verbose=2", appPath],
         { stdio: "inherit" },
       );
+      const requirement = execFileSync("codesign", ["-d", "-r-", appPath], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (identity && !designatedRequirementIsStable(requirement)) {
+        console.warn("[JackVoice] 开发版签名仍只绑 CDHash，重新打包后需要重新授权。");
+      }
     } catch (error) {
       console.error(`无法为 JackVoice Dev 添加本地签名：${error.message}`);
       process.exitCode = 1;
