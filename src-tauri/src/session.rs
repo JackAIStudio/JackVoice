@@ -446,6 +446,11 @@ impl AppState {
         self.active.lock().is_some() || self.background_finalize.load(Ordering::Acquire) > 0
     }
 
+    /// 是否有一轮听写正占着胶囊（录音中，或刚停表还没交出 `active`）。
+    pub fn dictation_running(&self) -> bool {
+        self.active.lock().is_some()
+    }
+
     pub fn snapshot(&self) -> UiState {
         let mut ui = self.ui.lock().clone();
         ui.session_pinned = self.session_pinned.load(Ordering::Relaxed);
@@ -2883,16 +2888,14 @@ fn report_finalize(app: &AppHandle, report: FinalizeReport) {
     } = report;
 
     // 用户已经开了新一轮：这一轮的收尾只落历史，界面归新一轮所有。
-    // 但文字不能丢——把它留在状态行的历史里，用户可以自己去历史记录取。
+    // 投递结果也不往胶囊上发：胶囊此刻显示的是新一轮，旧一轮的「已插入 /
+    // 未插入」会把它收起或换成结果卡片。文字已经在历史记录里。
     if !owns_ui(
         state.session_epoch.load(Ordering::SeqCst),
         state.active.lock().is_some(),
         session_id,
     ) {
         eprintln!("[session] 第 {session_id} 轮收尾晚于新一轮结束，结果已写入历史");
-        if let Some(delivery) = delivery_result {
-            let _ = app.emit("jackvoice://delivery", delivery);
-        }
         return;
     }
 

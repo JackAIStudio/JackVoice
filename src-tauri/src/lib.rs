@@ -658,8 +658,14 @@ fn note_overlay_interaction() {
 }
 
 /// Hide the capsule from the frontend (e.g. after manual copy or timeout).
+///
+/// 前端只会在结果卡片的计时器到点时来藏胶囊。计时器和新一轮开始可能撞在
+/// 一起：那时胶囊已经归新一轮，不能藏。
 #[tauri::command]
-fn dismiss_overlay(app: AppHandle) -> Result<(), String> {
+fn dismiss_overlay(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if state.dictation_running() {
+        return Ok(());
+    }
     crate::overlay::hide_overlay(&app);
     Ok(())
 }

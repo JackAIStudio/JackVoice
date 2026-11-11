@@ -935,16 +935,14 @@ window.addEventListener("DOMContentLoaded", async () => {
     const delivery = event.payload;
     const state = await invoke<UiState>("get_state").catch(() => null);
     if (state) applyState(state);
-    if (!delivery.pasted && (state?.transcript || "").trim()) {
+    // 胶囊藏不藏由后端定：插进去了它会自己收起（收尾的 report_finalize、
+    // 手动重试的 retry_last_transcript 都是）。这里不能再调 dismiss_overlay ——
+    // 投递事件到达时用户可能已经按下 Option+Space 开了新一轮，前端一藏，
+    // 新一轮就成了「在录但看不见」。
+    if (delivery.pasted) {
+      exitResultMode();
+    } else if (state?.phase === "idle" && (state.transcript || "").trim()) {
       enterResultMode(state);
-    } else if (delivery.pasted) {
-      // 插进去了：这一轮就结束了，胶囊一起收掉。
-      //
-      // 以前这里只 exitResultMode()，它清的是「结果卡片」那套样式，**不隐藏窗口**。
-      // 于是文字已经落进输入框，屏幕上却还挂着一个胶囊写着「待命」——
-      // 用户看到的就是「说完了，它怎么还不走」。只有没插进去（要用户自己
-      // 复制）时才该留着，因为那时候还有事没办完。
-      await dismissResult();
     }
   });
 });
