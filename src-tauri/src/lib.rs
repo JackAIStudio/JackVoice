@@ -627,7 +627,7 @@ async fn retry_last_transcript(
 
     let target = crate::overlay::remembered_frontmost_app();
     if let Some(target_app) = target.as_ref() {
-        crate::overlay::activate_running_process(target_app.pid);
+        crate::overlay::bring_target_forward(&app, target_app);
     }
     crate::overlay::hide_overlay(&app);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

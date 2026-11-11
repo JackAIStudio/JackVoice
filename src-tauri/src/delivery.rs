@@ -1049,7 +1049,8 @@ fn post_paste_via_cgevent() -> bool {
 /// 优先读**当前**前台：用户完全可能在录音中途换过应用，那才是他真正想
 /// 写进去的地方。`remembered` 是胶囊弹出时记下的快照，听写全程不会更新，
 /// 所以只能在前台读不出来时兜底（macOS 拿不到 frontmostApplication，或
-/// 前台就是 JackVoice 自己）。
+/// 胶囊抢到了焦点）。用户在 JackVoice 自己的窗口里打字时，`current` 就是
+/// JackVoice 本身，见 `overlay::current_input_target`。
 ///
 /// 反过来只用 `remembered` 会退化成「粘回开始听写时那个应用」：在 Chrome
 /// 开始说话、中途切到 Notes 再停表，文字会被拉回 Chrome——这正是

@@ -2406,7 +2406,7 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
     // 目标取「停表这一刻的前台」，不是胶囊弹出时的快照：用户中途换过应用时，
     // 他现在待着的那个才是想写进去的地方。快照只在前台读不出来时兜底。
     let target = delivery::freeze_delivery_target(
-        crate::overlay::current_frontmost_app(),
+        crate::overlay::current_input_target(&app),
         crate::overlay::remembered_frontmost_app(),
     );
     let live_transcript = match app.try_state::<AppState>() {
@@ -2710,7 +2710,7 @@ async fn deliver_finalized_text(
     if !still_the_latest_session(app, session_id) {
         return None;
     }
-    let current_target = crate::overlay::current_frontmost_app();
+    let current_target = crate::overlay::current_input_target(app);
     let reactivate_target = delivery::needs_reactivation(target, current_target.as_ref());
     crate::overlay::set_remembered_frontmost_app(target.cloned());
     crate::overlay::hide_overlay_for_delivery(app, reactivate_target);
@@ -2718,7 +2718,7 @@ async fn deliver_finalized_text(
     // 排列该应用的窗口，多窗口应用里带光标的窗口会被顶掉。
     if reactivate_target {
         if let Some(target_app) = target {
-            crate::overlay::activate_running_process(target_app.pid);
+            crate::overlay::bring_target_forward(app, target_app);
         }
     }
     // Keep a short delay so physical Option/Space keys have time to be

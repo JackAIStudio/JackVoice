@@ -346,7 +346,17 @@ pub fn show_overlay(app: &AppHandle) {
         }
         // Remember the user's working app before the capsule takes any attention.
         remember_frontmost_app(app);
-        let _ = window.show();
+        if focus_snapshot().lock().own_window.is_some() {
+            // 用户正在 JackVoice 自己的窗口里打字（主窗口搜索框、待办输入框）。
+            // `show()` 是 makeKeyAndOrderFront，胶囊会把 key window 抢走：
+            // 主窗口的输入框当场失焦，待办窗口失焦即收起。显示的这一下先
+            // 让胶囊不可聚焦，它就只上屏、不接键盘；随后恢复，点胶囊照常可用。
+            let _ = window.set_focusable(false);
+            let _ = window.show();
+            let _ = window.set_focusable(true);
+        } else {
+            let _ = window.show();
+        }
         let _ = window.set_always_on_top(true);
         // `show()` 在 macOS 上是 makeKeyAndOrderFront：胶囊会变成 key window，
         // JackVoice 被激活，用户正在打字的窗口丢掉焦点。收尾时虽然会再激活
@@ -370,6 +380,10 @@ fn restore_focus_after_overlay_show() {
     let Some(target) = remembered else {
         return;
     };
+    // 目标就是 JackVoice 自己时，胶囊显示时没抢焦点，没什么要还的。
+    if is_self_app(&target, std::process::id()) {
+        return;
+    }
     if frontmost_pid() != Some(std::process::id() as i32) {
         return;
     }
@@ -412,6 +426,8 @@ pub struct FrontmostApp {
 struct FocusSnapshot {
     app: Option<FrontmostApp>,
     main_was_visible: bool,
+    /// 胶囊弹出时用户正在输入的 JackVoice 自己的窗口（label）。
+    own_window: Option<String>,
 }
 
 /// Settings/main window is manual-only. Never auto-present it because overlay closed.
@@ -625,13 +641,96 @@ fn should_suppress_reopen(
 }
 
 /// Remember which app the user was working in, before the capsule shows.
+///
+/// 前台是 JackVoice 自己时，旧做法是「不覆盖、沿用上一次记下的应用」——那是为
+/// 胶囊抢了焦点的情况准备的。可用户要是正在 JackVoice 主窗口里打字，沿用的就是
+/// 上一轮听写的那个别的应用：停表时文字被投过去，JackVoice 被直接切走。所以
+/// 自己的窗口在接键盘时，目标就记成 JackVoice 自己。
 pub fn remember_frontmost_app(app: &AppHandle) {
+    let own_window = own_input_window(app).map(|window| window.label().to_string());
     let mut snapshot = focus_snapshot().lock();
     snapshot.main_was_visible = main_is_visible(app);
+    if own_window.is_some() {
+        snapshot.app = Some(self_target(app));
+        snapshot.own_window = own_window;
+        return;
+    }
+    // 胶囊抢到焦点时读不出用户的窗口；只有确实换到了别的应用才清掉旧的。
     #[cfg(target_os = "macos")]
     if let Some(front) = read_frontmost_app() {
         snapshot.app = Some(front);
+        snapshot.own_window = None;
     }
+}
+
+/// JackVoice 自己正在接收键盘的那个窗口（主窗口 / 待办），胶囊不算。
+///
+/// key window 只有在应用处于前台时才成立，这里再核对一次前台进程，
+/// 免得读到一个正在交出 key 状态的窗口。
+#[cfg(target_os = "macos")]
+fn own_input_window<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<WebviewWindow<R>> {
+    if frontmost_pid() != Some(std::process::id() as i32) {
+        return None;
+    }
+    app.webview_windows()
+        .into_iter()
+        .find_map(|(label, window)| {
+            if label == OVERLAY_LABEL {
+                return None;
+            }
+            let receiving_keys =
+                window.is_visible().unwrap_or(false) && window.is_focused().unwrap_or(false);
+            receiving_keys.then_some(window)
+        })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn own_input_window<R: tauri::Runtime>(_app: &AppHandle<R>) -> Option<WebviewWindow<R>> {
+    None
+}
+
+fn self_target<R: tauri::Runtime>(app: &AppHandle<R>) -> FrontmostApp {
+    FrontmostApp {
+        pid: std::process::id() as i32,
+        name: app.package_info().name.clone(),
+    }
+}
+
+/// 此刻真正在接收键盘的应用。JackVoice 自己的窗口在接键盘时就是 JackVoice；
+/// 否则是别的前台应用。胶囊抢到焦点时两者都读不出，返回 `None` 交给快照兜底。
+pub fn current_input_target<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<FrontmostApp> {
+    if own_input_window(app).is_some() {
+        return Some(self_target(app));
+    }
+    current_frontmost_app()
+}
+
+/// 把投递目标带回前台。目标是 JackVoice 自己时，把用户原先打字的那个窗口
+/// 重新设成 key window：只激活应用的话，key 可能落在胶囊上，粘贴就落空。
+pub fn bring_target_forward<R: tauri::Runtime>(app: &AppHandle<R>, target: &FrontmostApp) {
+    if is_self_app(target, std::process::id()) {
+        refocus_own_window(app);
+    } else {
+        activate_running_process(target.pid);
+    }
+}
+
+/// 听写开始时用户所在的 JackVoice 窗口还在、但已不是 key window 时，把它
+/// 重新设成 key window（例如中途点过胶囊，胶囊拿走了 key）。
+///
+/// 只在 key 落在胶囊上或悬空时才接手：用户之后换去了 JackVoice 的另一个
+/// 窗口（比如打开了待办）就别拽回来——待办窗口一失焦就会收起。
+fn refocus_own_window<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let Some(label) = focus_snapshot().lock().own_window.clone() else {
+        return;
+    };
+    let Some(window) = app.get_webview_window(&label) else {
+        return;
+    };
+    if !window.is_visible().unwrap_or(false) || own_input_window(app).is_some() {
+        return;
+    }
+    let _ = window.set_focus();
 }
 
 /// Read the current non-JackVoice frontmost app without changing the target
@@ -672,6 +771,14 @@ pub fn ensure_main_stays_in_background(app: &AppHandle) {
             if let Some(target) = remembered {
                 activate_running_process(target.pid);
             }
+        } else if remembered
+            .as_ref()
+            .is_some_and(|target| is_self_app(target, std::process::id()))
+            && frontmost_pid() == Some(std::process::id() as i32)
+        {
+            // 用户是在 JackVoice 自己的窗口里听写的：胶囊收起后把 key window
+            // 还给那个窗口。只在 JackVoice 仍是前台时做，用户已经切走就别拽回来。
+            refocus_own_window(app);
         }
     }
     conceal_main_if_unwanted(app);
