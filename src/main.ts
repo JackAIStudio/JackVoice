@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { initTodos } from "./todos";
+import { addMemo } from "./memos-shared";
 import { inputSignalNotice, type InputSignal } from "./input-signal";
 
 type InputDeviceInfo = { id: string; name: string; isDefault: boolean };
@@ -178,6 +179,10 @@ let recordingShortcut: ShortcutTarget | null = null;
 let historyRecords: HistoryRecord[] = [];
 let selectedHistoryId: string | null = null;
 let historyQuery = "";
+const historyMemoStates = new Map<string, {
+  phase: "saving" | "added" | "error";
+  message?: string;
+}>();
 let historyPlaybackRate = 1;
 let historyPlaybackLoadingId: string | null = null;
 let historyPlaybackLoadGeneration = 0;
@@ -214,6 +219,69 @@ function showToast(message: string, kind: "success" | "error") {
     toast.classList.add("hidden");
     toastTimer = undefined;
   }, 1800);
+}
+
+const HISTORY_MEMO_ICON =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h11M9 12h5M9 18h3M18 15v6M15 18h6M4 6h.01M4 12h.01M4 18h.01"/></svg>';
+
+function updateHistoryMemoButton(button: HTMLButtonElement) {
+  const state = historyMemoStates.get(button.dataset.historyMemo ?? "");
+  const label = state?.phase === "saving" ? "正在添加…"
+    : state?.phase === "added" ? "已转为待办"
+    : state?.phase === "error" ? "重试添加" : "转为待办";
+  const icon = state?.phase === "added" ? COPY_SUCCESS_ICON
+    : state?.phase === "error" ? COPY_ERROR_ICON : HISTORY_MEMO_ICON;
+  button.innerHTML = `${icon}<span>${label}</span>`;
+  button.disabled = state?.phase === "saving" || state?.phase === "added";
+  button.title = state?.message ?? label;
+  button.setAttribute("aria-label", label);
+  button.setAttribute("aria-busy", String(state?.phase === "saving"));
+  button.classList.toggle("memo-added", state?.phase === "added");
+  button.classList.toggle("memo-error", state?.phase === "error");
+}
+
+function syncHistoryMemoUi() {
+  document.querySelectorAll<HTMLButtonElement>("[data-history-memo]")
+    .forEach(updateHistoryMemoButton);
+}
+
+function createHistoryMemoButton(record: HistoryRecord, className: string): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `${className} history-memo-action`;
+  button.dataset.historyMemo = record.id;
+  updateHistoryMemoButton(button);
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    void convertHistoryToMemo(record);
+  });
+  return button;
+}
+
+async function convertHistoryToMemo(record: HistoryRecord) {
+  const phase = historyMemoStates.get(record.id)?.phase;
+  if (!record.text.trim() || phase === "saving" || phase === "added") return;
+
+  // 列表、详情和刷新后的按钮共用状态，避免连点生成重复待办。
+  historyMemoStates.set(record.id, { phase: "saving" });
+  syncHistoryMemoUi();
+  try {
+    await addMemo(record.text, "voice");
+    const added = { phase: "added" } as const;
+    historyMemoStates.set(record.id, added);
+    syncHistoryMemoUi();
+    showToast("已转为待办", "success");
+    window.setTimeout(() => {
+      if (historyMemoStates.get(record.id) !== added) return;
+      historyMemoStates.delete(record.id);
+      syncHistoryMemoUi();
+    }, 2000);
+  } catch (error) {
+    const message = `转为待办失败：${error instanceof Error ? error.message : String(error)}`;
+    historyMemoStates.set(record.id, { phase: "error", message });
+    syncHistoryMemoUi();
+    showToast(message, "error");
+  }
 }
 
 async function copyHistoryText(text: string, button: HTMLButtonElement) {
@@ -977,6 +1045,7 @@ function renderHistory(records: HistoryRecord[]) {
       const openDetail = () => openHistoryDetail(record);
       row.addEventListener("click", openDetail);
       row.addEventListener("keydown", (event) => {
+        if (event.target !== row) return;
         if (event.key !== "Enter" && event.key !== " ") return;
         event.preventDefault();
         openDetail();
@@ -999,6 +1068,7 @@ function renderHistory(records: HistoryRecord[]) {
       const actions = document.createElement("div");
       actions.className = "history-row-actions";
       if (record.text.trim()) {
+        actions.appendChild(createHistoryMemoButton(record, "history-row-action"));
         const copy = document.createElement("button");
         copy.type = "button";
         copy.className = "history-row-action";
@@ -1077,6 +1147,7 @@ function renderHistoryDetail(record: HistoryRecord) {
   const actions = document.createElement("div");
   actions.className = "detail-actions";
   if (record.text.trim()) {
+    actions.appendChild(createHistoryMemoButton(record, "detail-action"));
     const copy = document.createElement("button");
     copy.type = "button";
     copy.className = "detail-action";

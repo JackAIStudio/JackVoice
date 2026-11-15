@@ -614,6 +614,31 @@ kbd.shortcut {
 
 .history-row-action:hover { background: var(--hover); color: var(--text); }
 
+.history-memo-action {
+  display: inline-flex;
+  min-width: 100px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.history-memo-action svg { flex-shrink: 0; }
+.history-memo-action:disabled { cursor: wait; }
+.history-memo-action.memo-added:disabled,
+.history-memo-action.memo-added:hover {
+  border-color: #cfe8df;
+  background: #f4faf7;
+  color: var(--mint-dark);
+  cursor: default;
+  opacity: 1;
+}
+.history-memo-action.memo-error { color: var(--danger); }
+.history-memo-action:focus-visible {
+  outline: 2px solid var(--mint-dark);
+  outline-offset: 2px;
+}
+
 .history-empty {
   display: flex;
   min-height: 250px;
