@@ -3,6 +3,7 @@ use crate::audio::{self, AudioCapture, InputDeviceInfo, InputDevicePreference};
 use crate::credentials::{CredentialMode, CredentialSource};
 use crate::delivery::{self, DeliveryResult};
 use crate::history::{AudioRecorder, HistoryAppend, RecognitionContext, RecognitionPatch};
+use crate::input_signal::{InputActivity, InputSignal};
 use crate::output_mute::OutputMuteGuard;
 use crate::settings::{self, AppSettings};
 use parking_lot::Mutex;
@@ -160,6 +161,10 @@ pub struct UiState {
     pub active_input_device_name: String,
     pub using_input_device_fallback: bool,
     pub audio_level: f32,
+    /// 只在 phase=recording 时用于输入健康提示。
+    pub input_signal: InputSignal,
+    #[serde(skip)]
+    input_activity: InputActivity,
     pub mic_testing: bool,
     pub last_delivery_message: String,
     /// True when the last dictation ended without a detected insertion,
@@ -226,6 +231,8 @@ impl Default for UiState {
             active_input_device_name: String::new(),
             using_input_device_fallback: false,
             audio_level: 0.0,
+            input_signal: InputSignal::Quiet,
+            input_activity: InputActivity::default(),
             mic_testing: false,
             last_delivery_message: String::new(),
             needs_copy_prompt: false,
@@ -1659,6 +1666,8 @@ impl AppState {
         {
             let mut ui = self.ui.lock();
             ui.phase = "starting".into();
+            ui.input_activity = InputActivity::default();
+            ui.input_signal = InputSignal::Quiet;
             ui.recognition_phase = if settings.volc_api_key.trim().is_empty() {
                 "unavailable".into()
             } else {
@@ -1970,6 +1979,8 @@ fn persist_local_pcm(
         if is_current {
             let mut ui = state.ui.lock();
             ui.audio_level = level;
+            ui.input_activity.frame(level, Instant::now());
+            ui.input_signal = ui.input_activity.signal(Instant::now());
             if last_level_emit.elapsed() >= Duration::from_millis(50) {
                 *last_level_emit = Instant::now();
                 let _ = app.emit("jackvoice://level", level);
@@ -2193,6 +2204,19 @@ async fn run_recording_session(app: AppHandle, session: RecordingSession) {
                 break;
             }
             _ = silence_tick.tick() => {
+                // 即使设备不再发送 PCM，也要更新断流提示，不能永久停在「有声」。
+                if let Some(state) = app.try_state::<AppState>() {
+                    let mut ui = state.ui.lock();
+                    if state.session_epoch.load(Ordering::SeqCst) == session_id
+                        && ui.phase == "recording"
+                    {
+                        let signal = ui.input_activity.signal(Instant::now());
+                        if signal != ui.input_signal {
+                            ui.input_signal = signal;
+                            let _ = app.emit("jackvoice://state", ui.clone());
+                        }
+                    }
+                }
                 let silent_for = recording_started
                     .elapsed()
                     .saturating_sub(Duration::from_millis(last_speech_ms.load(Ordering::Relaxed)));
@@ -3080,6 +3104,13 @@ fn update_audio_device_state(
     notice: &audio::AudioNotice,
 ) -> Option<String> {
     match notice {
+        audio::AudioNotice::DeviceLost { .. } => ui.input_activity.disconnected(),
+        audio::AudioNotice::CaptureStarted { .. } | audio::AudioNotice::DeviceChanged { .. } => {
+            ui.input_activity.connected(Instant::now());
+        }
+    }
+    ui.input_signal = ui.input_activity.signal(Instant::now());
+    match notice {
         audio::AudioNotice::CaptureStarted {
             actual,
             using_fallback,
@@ -3538,6 +3569,55 @@ mod volc_connection_error_tests {
     fn preserves_unknown_service_error() {
         let message = format_volc_connection_error("remote closed the connection");
         assert!(message.contains("remote closed the connection"));
+    }
+
+    #[test]
+    fn input_signal_tracks_device_loss_and_fallback_recovery() {
+        use super::{InputSignal, Instant};
+
+        let mut ui = UiState::default();
+        let mut fallback = MicFallbackState::default();
+        let device = ActiveInputDevice {
+            id: "test:mic".into(),
+            name: "Test Mic".into(),
+        };
+        update_audio_device_state(
+            &mut ui,
+            &mut fallback,
+            None,
+            &AudioNotice::CaptureStarted {
+                actual: device.clone(),
+                using_fallback: false,
+            },
+        );
+        ui.input_activity.frame(0.2, Instant::now());
+        assert_eq!(ui.input_activity.signal(Instant::now()), InputSignal::Sound);
+        update_audio_device_state(
+            &mut ui,
+            &mut fallback,
+            None,
+            &AudioNotice::DeviceLost {
+                previous: device.clone(),
+            },
+        );
+        assert_eq!(ui.input_signal, InputSignal::Disconnected);
+        assert!(ui.active_input_device_id.is_empty());
+        update_audio_device_state(
+            &mut ui,
+            &mut fallback,
+            None,
+            &AudioNotice::DeviceChanged {
+                previous: device,
+                actual: ActiveInputDevice {
+                    id: "test:backup".into(),
+                    name: "Backup Mic".into(),
+                },
+                using_fallback: true,
+            },
+        );
+        assert_eq!(ui.input_signal, InputSignal::Quiet);
+        assert_eq!(ui.active_input_device_name, "Backup Mic");
+        assert!(ui.using_input_device_fallback);
     }
 
     #[test]

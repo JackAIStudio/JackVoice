@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { inputSignalNotice, type InputSignal } from "./input-signal";
 
 type UiState = {
   phase: string;
@@ -17,6 +18,9 @@ type UiState = {
   silenceStopAtMs?: number;
   /** 上一轮自动结束的原因："silence" / "durationLimit"；手动结束为空。 */
   autoStopReason?: string;
+  inputSignal?: InputSignal;
+  usingInputDeviceFallback?: boolean;
+  activeInputDeviceName?: string;
 };
 
 type DeliveryResult = {
@@ -250,9 +254,17 @@ function renderStatus(state: UiState) {
   const status = statusEl();
   if (!status) return;
   const silenceText = silenceCountdownText(state);
+  const inputNotice = inputSignalNotice(state.phase, state.inputSignal);
+  capsule()?.classList.toggle("input-warning", inputNotice !== null);
+  status.title = state.inputSignal === "silent" && inputNotice
+    ? "检查麦克风连接或静音开关" : "";
   capsule()?.classList.toggle("silence-warn", silenceText !== null);
-  if (activeNotice) status.textContent = activeNotice;
+  if (inputNotice) status.textContent = inputNotice;
+  else if (activeNotice) status.textContent = activeNotice;
   else if (silenceText) status.textContent = silenceText;
+  else if (state.phase === "recording" && state.usingInputDeviceFallback && state.activeInputDeviceName) {
+    status.textContent = `录音中 · ${state.activeInputDeviceName}`;
+  }
   else if (state.sessionPinned) {
     if (state.phase === "finalizing") status.textContent = "正在收入待办…";
     else status.textContent = "正在听写 · 待办事项";

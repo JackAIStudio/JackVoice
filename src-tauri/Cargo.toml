@@ -54,7 +54,7 @@ ve-tos-rust-sdk = { version = "2.9.20", features = ["asynchronous", "tokio-runti
 core-foundation = "0.10"
 core-graphics = "0.25"
 objc2 = { version = "0.6", features = ["exception"] }
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSWorkspace"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSWorkspace"] }
 objc2-core-audio = "0.3.2"
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSData", "NSString"] }
 security-framework = "3.7"

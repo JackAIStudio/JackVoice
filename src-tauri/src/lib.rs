@@ -2,9 +2,11 @@ pub mod asr;
 mod audio;
 mod credentials;
 mod delivery;
+mod dock_icon;
 mod dock_menu;
 mod history;
 mod hotwords;
+mod input_signal;
 mod main_window;
 mod memos;
 mod memos_sync;
@@ -985,6 +987,7 @@ pub fn run() {
             // 应用起来、NSApplicationDelegate 就位之后再装程序坞右键菜单。
             tauri::RunEvent::Ready => {
                 dock_menu::setup(app);
+                dock_icon::setup(app);
             }
             // Dock icon click opens settings, except when the capsule itself
             // just caused this activation. A Dock click during dictation is an

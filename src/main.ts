@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { initTodos } from "./todos";
+import { inputSignalNotice, type InputSignal } from "./input-signal";
 
 type InputDeviceInfo = { id: string; name: string; isDefault: boolean };
 
@@ -35,6 +36,7 @@ type UiState = {
   activeInputDeviceName: string;
   usingInputDeviceFallback: boolean;
   audioLevel: number;
+  inputSignal: InputSignal;
   micTesting: boolean;
   lastDeliveryMessage: string;
   needsCopyPrompt: boolean;
@@ -494,7 +496,8 @@ function applyState(state: UiState) {
   const consoleTitle = $("#console-title");
   if (consoleTitle) {
     if (phase === "recording") {
-      consoleTitle.textContent = state.recognitionPhase === "streaming" ? "正在听写" : "正在录音";
+      consoleTitle.textContent = inputSignalNotice(phase, state.inputSignal)
+        ?? (state.recognitionPhase === "streaming" ? "正在听写" : "正在录音");
     }
     else if (phase === "starting") consoleTitle.textContent = "正在启动录音…";
     else if (phase === "connecting") consoleTitle.textContent = "正在连接…";
@@ -509,7 +512,7 @@ function applyState(state: UiState) {
     // 「正在整理文字」是后台在做的事，用户可以随时开始下一轮听写。
     // 这里绝不能把按钮禁用掉：按下去就该立刻开新录音，而不是等上一轮整理完。
     toggle.disabled = false;
-    toggle.title = state.status || phaseLabel(phase);
+    toggle.title = inputSignalNotice(phase, state.inputSignal) || state.status || phaseLabel(phase);
     toggle.setAttribute("aria-pressed", String(phase === "starting" || phase === "recording"));
     toggle.setAttribute(
       "aria-label",

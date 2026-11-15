@@ -248,6 +248,14 @@ body {
   color: rgba(255, 177, 74, 0.92);
 }
 
+.capsule.input-warning .status {
+  color: rgba(255, 255, 255, 0.94);
+}
+
+.capsule.recording.input-warning {
+  border-color: rgba(255, 255, 255, 0.5);
+}
+
 @keyframes silence-breathe {
   0%, 100% { border-color: rgba(255, 177, 74, 0.22); }
   50% { border-color: rgba(255, 177, 74, 0.7); }
