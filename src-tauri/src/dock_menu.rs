@@ -22,7 +22,8 @@ static RECENTER: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
 pub fn setup(app: &AppHandle) {
     let app = app.clone();
     let _ = RECENTER.set(Box::new(move || {
-        if let Err(error) = crate::overlay::reset_overlay_position(app.clone()) {
+        crate::dock_reopen::cancel_pending();
+        if let Err(error) = crate::overlay::recenter_and_flash_overlay(app.clone()) {
             eprintln!("[dock-menu] 将预览胶囊移到屏幕中央失败：{error}");
         }
     }));

@@ -29,6 +29,10 @@ type DeliveryResult = {
   message: string;
 };
 
+type OverlayRecenteredPayload = {
+  flash: boolean;
+};
+
 const capsule = () => document.querySelector<HTMLElement>("#capsule");
 const statusEl = () => document.querySelector<HTMLElement>("#overlay-status");
 const textEl = () => document.querySelector<HTMLElement>("#overlay-text");
@@ -36,6 +40,39 @@ const pinBtn = () => document.querySelector<HTMLButtonElement>("#pin-btn");
 const copyBtn = () => document.querySelector<HTMLButtonElement>("#copy-btn");
 const retryBtn = () => document.querySelector<HTMLButtonElement>("#retry-btn");
 const elapsedEl = () => document.querySelector<HTMLElement>("#overlay-elapsed");
+const recenterBannerEl = () => document.querySelector<HTMLElement>("#recenter-banner");
+
+let recenterFlashActive = false;
+
+function triggerRecenterPulse() {
+  const root = capsule();
+  if (!root) return;
+  root.classList.remove("recenter-pulse");
+  // 强制重排，保证连续双击时每次都能重播边框微光脉冲。
+  void root.offsetWidth;
+  root.classList.add("recenter-pulse");
+}
+
+function enterRecenterFlash() {
+  recenterFlashActive = true;
+  const root = capsule();
+  root?.classList.remove("recenter-fading");
+  root?.classList.add("recenter-flash");
+  recenterBannerEl()?.classList.remove("hidden");
+  triggerRecenterPulse();
+}
+
+function beginRecenterFlashFade() {
+  if (!recenterFlashActive) return;
+  capsule()?.classList.add("recenter-fading");
+}
+
+function exitRecenterFlash() {
+  recenterFlashActive = false;
+  const root = capsule();
+  root?.classList.remove("recenter-flash", "recenter-fading", "recenter-pulse");
+  recenterBannerEl()?.classList.add("hidden");
+}
 
 function isLive(state: UiState) {
   return (
@@ -690,6 +727,11 @@ function dropExpandedLayout() {
 function applyState(state: UiState) {
   lastState = state;
 
+  // 新一轮听写 / 收尾 / 错误优先于短暂的居中闪现。
+  if (recenterFlashActive && state.phase !== "idle") {
+    exitRecenterFlash();
+  }
+
   // A new session supersedes any pending result card.
   if (resultActive && state.phase !== "idle") {
     exitResultMode();
@@ -755,6 +797,9 @@ function applyState(state: UiState) {
     state.needsCopyPrompt &&
     (state.transcript || "").trim()
   ) {
+    if (recenterFlashActive) {
+      exitRecenterFlash();
+    }
     if (!resultActive) {
       enterResultMode(state);
     } else {
@@ -907,6 +952,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   capsule()?.addEventListener("animationend", (e) => {
     if (e.animationName === "long-take-pulse") capsule()?.classList.remove("long-pulse");
+    if (e.animationName === "recenter-pulse") capsule()?.classList.remove("recenter-pulse");
   });
   document.querySelector("#cancel-btn")?.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -1088,6 +1134,22 @@ window.addEventListener("DOMContentLoaded", async () => {
     dropExpandedLayout();
   });
 
+  await listen<OverlayRecenteredPayload>("jackvoice://overlay-recentered", (event) => {
+    if (event.payload?.flash) {
+      enterRecenterFlash();
+    } else {
+      triggerRecenterPulse();
+    }
+  });
+
+  await listen("jackvoice://overlay-flash-fading", () => {
+    beginRecenterFlashFade();
+  });
+
+  await listen("jackvoice://overlay-flash-ended", () => {
+    exitRecenterFlash();
+  });
+
   await listen<OverlayHoverEvent>("jackvoice://overlay-hover", (event) => {
     applyNativeHover(event.payload);
   });
@@ -1110,4 +1172,9 @@ window.addEventListener("DOMContentLoaded", async () => {
       enterResultMode(state);
     }
   });
+
+  const flashActive = await invoke<boolean>("overlay_ready").catch(() => false);
+  if (flashActive && (!lastState || (!isLive(lastState) && !resultActive))) {
+    enterRecenterFlash();
+  }
 });

@@ -15,10 +15,27 @@ const DEFAULT_DOCK_RESERVE: f64 = 78.0;
 const EXPAND_EDGE_MARGIN: f64 = 4.0;
 /// 胶囊藏起来时缩回单行，通知前端撤掉卡片排版。
 const OVERLAY_COLLAPSED_EVENT: &str = "jackvoice://overlay-collapsed";
+/// 胶囊被移回屏幕中央时通知前端播放微光反馈（隐藏态进入短暂闪现模式）。
+const OVERLAY_RECENTERED_EVENT: &str = "jackvoice://overlay-recentered";
+/// 短暂闪现即将结束，通知前端播淡出动画。
+const OVERLAY_FLASH_FADING_EVENT: &str = "jackvoice://overlay-flash-fading";
+/// 短暂闪现彻底结束或被新一轮听写打断，通知前端撤掉闪现样式。
+const OVERLAY_FLASH_ENDED_EVENT: &str = "jackvoice://overlay-flash-ended";
 /// 后台鼠标悬停状态同步给前端（含窗口内逻辑坐标），保证非激活态也能即时高亮与切光标。
 const OVERLAY_HOVER_EVENT: &str = "jackvoice://overlay-hover";
 /// 后台鼠标移动同步给前端的最小间隔，兼顾跟手度与零多余 IPC 压力。
 const HOVER_MOVE_THROTTLE: std::time::Duration = std::time::Duration::from_millis(16);
+/// 居中后胶囊原本隐藏时的短暂闪现停留时长。
+const RECENTER_FLASH_DURATION: std::time::Duration = std::time::Duration::from_millis(1500);
+/// 闪现期间若用户顺手拖拽微调位置，松手后短暂停留再淡出。
+const RECENTER_FLASH_POST_DRAG_DURATION: std::time::Duration =
+    std::time::Duration::from_millis(600);
+/// 闪现淡出动画时长（与 overlay.css 中的 `.capsule.recenter-fading` 对齐）。
+const RECENTER_FLASH_FADE_DURATION: std::time::Duration = std::time::Duration::from_millis(180);
+/// 通知前端切换闪现视图后，给 WebView 留出极短的绘制提前量，避免首帧闪过旧内容。
+const RECENTER_FLASH_PAINT_LEAD: std::time::Duration = std::time::Duration::from_millis(32);
+/// 冷启动首次创建胶囊窗口时，最多等待前端初始化这么久再上屏。
+const RECENTER_FLASH_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(450);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OverlayCursor {
@@ -46,6 +63,88 @@ struct OverlayHoverPayload {
     inside: bool,
     x: f64,
     y: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OverlayRecenteredPayload {
+    flash: bool,
+}
+
+#[derive(Debug, Default)]
+struct RecenterFlashState {
+    active: bool,
+    token: u64,
+    webview_ready: bool,
+}
+
+impl RecenterFlashState {
+    fn begin_flash(&mut self) -> u64 {
+        self.token = self.token.wrapping_add(1).max(1);
+        self.active = true;
+        self.token
+    }
+
+    fn cancel(&mut self) -> bool {
+        self.token = self.token.wrapping_add(1).max(1);
+        let was_active = self.active;
+        self.active = false;
+        was_active
+    }
+
+    fn mark_ready(&mut self) -> bool {
+        self.webview_ready = true;
+        self.active
+    }
+
+    fn mark_unready(&mut self) {
+        self.webview_ready = false;
+    }
+
+    fn is_active_token(&self, token: u64) -> bool {
+        self.active && self.token == token
+    }
+
+    fn finish_if_matches(&mut self, token: u64) -> bool {
+        if self.active && self.token == token {
+            self.active = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn bump_if_active(&mut self) -> Option<u64> {
+        if self.active {
+            self.token = self.token.wrapping_add(1).max(1);
+            Some(self.token)
+        } else {
+            None
+        }
+    }
+}
+
+static RECENTER_FLASH_STATE: std::sync::OnceLock<parking_lot::Mutex<RecenterFlashState>> =
+    std::sync::OnceLock::new();
+
+fn flash_state() -> &'static parking_lot::Mutex<RecenterFlashState> {
+    RECENTER_FLASH_STATE.get_or_init(|| parking_lot::Mutex::new(RecenterFlashState::default()))
+}
+
+fn is_recenter_flash_active() -> bool {
+    flash_state().lock().active
+}
+
+/// 前端在完成事件监听注册后调用，返回当前是否正处于「居中闪现」状态。
+pub fn overlay_ready() -> bool {
+    flash_state().lock().mark_ready()
+}
+
+fn cancel_recenter_flash(app: &AppHandle) {
+    let was_active = flash_state().lock().cancel();
+    if was_active {
+        let _ = app.emit(OVERLAY_FLASH_ENDED_EVENT, ());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,11 +436,7 @@ fn default_bottom_center(app: &AppHandle) -> Option<(f64, f64)> {
     Some((x, y))
 }
 
-fn center_on_settings_screen(app: &AppHandle) -> Option<(f64, f64)> {
-    let anchor = app
-        .get_webview_window(MAIN_LABEL)
-        .or_else(|| app.get_webview_window(OVERLAY_LABEL))?;
-    let monitor = anchor.current_monitor().ok().flatten()?;
+fn monitor_center(monitor: &tauri::Monitor) -> (f64, f64) {
     let work = monitor.work_area();
     let scale = monitor.scale_factor();
 
@@ -350,10 +445,41 @@ fn center_on_settings_screen(app: &AppHandle) -> Option<(f64, f64)> {
     let work_w = work.size.width as f64 / scale;
     let work_h = work.size.height as f64 / scale;
 
-    Some((
+    (
         work_x + (work_w - OVERLAY_WIDTH).max(0.0) / 2.0,
         work_y + (work_h - OVERLAY_HEIGHT).max(0.0) / 2.0,
-    ))
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn cursor_monitor(app: &AppHandle) -> Option<tauri::Monitor> {
+    // `tao::monitor::from_point` 使用 `CGDisplayBounds`（主屏左上角原点的逻辑点），
+    // 而 `NSEvent::mouseLocation` 是主屏左下角原点的逻辑点；显式换算避免 Retina 缩放偏差。
+    let loc = objc2_app_kit::NSEvent::mouseLocation();
+    let main_height = core_graphics::display::CGDisplay::main().bounds().size.height;
+    if main_height <= 0.0 {
+        return None;
+    }
+    let (cg_x, cg_y) = (loc.x, main_height - loc.y);
+    app.monitor_from_point(cg_x, cg_y).ok().flatten()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cursor_monitor(app: &AppHandle) -> Option<tauri::Monitor> {
+    let pos = app.cursor_position().ok()?;
+    app.monitor_from_point(pos.x, pos.y).ok().flatten()
+}
+
+fn center_on_active_screen(app: &AppHandle) -> Option<(f64, f64)> {
+    let monitor = cursor_monitor(app)
+        .or_else(|| {
+            let anchor = app
+                .get_webview_window(MAIN_LABEL)
+                .or_else(|| app.get_webview_window(OVERLAY_LABEL))?;
+            anchor.current_monitor().ok().flatten()
+        })
+        .or_else(|| app.primary_monitor().ok().flatten())?;
+    Some(monitor_center(&monitor))
 }
 
 fn apply_position(app: &AppHandle, x: f64, y: f64) -> Result<(), String> {
@@ -369,6 +495,8 @@ pub fn ensure_overlay(app: &AppHandle) -> Result<(), String> {
     if app.get_webview_window(OVERLAY_LABEL).is_some() {
         return Ok(());
     }
+
+    flash_state().lock().mark_unready();
 
     // `App` URLs automatically resolve against Tauri's configured `devUrl`
     // in development and against bundled assets in production. Keeping the
@@ -409,6 +537,7 @@ pub fn ensure_overlay(app: &AppHandle) -> Result<(), String> {
 }
 
 pub fn show_overlay(app: &AppHandle) {
+    cancel_recenter_flash(app);
     if ensure_overlay(app).is_err() {
         return;
     }
@@ -468,6 +597,7 @@ fn restore_focus_after_overlay_show() {
 }
 
 pub fn hide_overlay(app: &AppHandle) {
+    cancel_recenter_flash(app);
     reset_hover_on_hide(app);
     if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
         let _ = window.hide();
@@ -480,6 +610,7 @@ pub fn hide_overlay(app: &AppHandle) {
 /// current app, do not activate it again: activating can select a different
 /// window in multi-window apps and discard the user's original caret.
 pub fn hide_overlay_for_delivery(app: &AppHandle, reactivate_target: bool) {
+    cancel_recenter_flash(app);
     if reactivate_target {
         hide_overlay(app);
         return;
@@ -949,16 +1080,211 @@ pub fn save_overlay_position(app: AppHandle, x: f64, y: f64) -> Result<(), Strin
     save_position(&app, &OverlayPosition { x, y })
 }
 
-pub fn reset_overlay_position(app: AppHandle) -> Result<(), String> {
-    ensure_overlay(&app)?;
+fn reset_overlay_position_inner(app: &AppHandle) -> Result<(), String> {
+    ensure_overlay(app)?;
     // 先缩回单行，下面算的居中位置才对得上。
-    set_overlay_height(&app, OVERLAY_HEIGHT)?;
+    set_overlay_height(app, OVERLAY_HEIGHT)?;
     let _ = app.emit(OVERLAY_COLLAPSED_EVENT, ());
-    let (x, y) = center_on_settings_screen(&app)
+    let (x, y) = center_on_active_screen(app)
         .ok_or_else(|| "无法获取当前屏幕，请稍后重试。".to_string())?;
-    save_position(&app, &OverlayPosition { x, y })?;
-    apply_position(&app, x, y)?;
+    save_position(app, &OverlayPosition { x, y })?;
+    apply_position(app, x, y)?;
     Ok(())
+}
+
+/// 将预览胶囊移到当前屏幕中央；若此时胶囊处于隐藏状态，则简短闪现给予视觉确认。
+pub fn recenter_and_flash_overlay(app: AppHandle) -> Result<(), String> {
+    let was_flashing = is_recenter_flash_active();
+    let already_showing_session = app
+        .get_webview_window(OVERLAY_LABEL)
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false)
+        && !was_flashing;
+
+    reset_overlay_position_inner(&app)?;
+
+    if already_showing_session {
+        // 正在听写 / 结果卡片展示中：只移到中央并轻闪边框，不打断内容、不隐藏胶囊。
+        let _ = flash_state().lock().cancel();
+        let _ = app.emit(
+            OVERLAY_RECENTERED_EVENT,
+            OverlayRecenteredPayload { flash: false },
+        );
+        return Ok(());
+    }
+
+    let (token, webview_ready) = {
+        let mut state = flash_state().lock();
+        let token = state.begin_flash();
+        (token, state.webview_ready)
+    };
+    let _ = app.emit(
+        OVERLAY_RECENTERED_EVENT,
+        OverlayRecenteredPayload { flash: true },
+    );
+
+    if was_flashing {
+        // 连续双击刷新闪现：窗口已可见，直接续期自动隐藏倒计时。
+        let app_for_main = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            present_flash_window_on_main(&app_for_main, token);
+        });
+        spawn_recenter_flash_hide_task(app, token, RECENTER_FLASH_DURATION);
+        return Ok(());
+    }
+
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if !webview_ready {
+            // 首次冷启动创建胶囊窗口时，等待前端挂载监听，避免首帧白屏或旧状态穿帮。
+            let deadline = std::time::Instant::now() + RECENTER_FLASH_READY_TIMEOUT;
+            while std::time::Instant::now() < deadline {
+                let (still_active, ready) = {
+                    let state = flash_state().lock();
+                    (state.is_active_token(token), state.webview_ready)
+                };
+                if !still_active {
+                    return;
+                }
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            }
+        }
+        // 给前端留出极短的 DOM 切态绘制时间，保证上屏首帧即是「已移到屏幕中央」。
+        tokio::time::sleep(RECENTER_FLASH_PAINT_LEAD).await;
+        if !flash_state().lock().is_active_token(token) {
+            return;
+        }
+        let app_for_main = app_for_task.clone();
+        if app_for_task
+            .run_on_main_thread(move || {
+                present_flash_window_on_main(&app_for_main, token);
+            })
+            .is_err()
+        {
+            return;
+        }
+        run_recenter_flash_hide(app_for_task, token, RECENTER_FLASH_DURATION).await;
+    });
+
+    Ok(())
+}
+
+pub fn reset_overlay_position(app: AppHandle) -> Result<(), String> {
+    recenter_and_flash_overlay(app)
+}
+
+fn present_flash_window_on_main(app: &AppHandle, token: u64) {
+    if !flash_state().lock().is_active_token(token) {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::NSApplication;
+        if let Some(mtm) = MainThreadMarker::new() {
+            let ns_app = NSApplication::sharedApplication(mtm);
+            if ns_app.isHidden() {
+                ns_app.unhideWithoutActivation();
+            }
+        }
+    }
+    if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
+        let _ = window.set_focusable(false);
+        let _ = window.show();
+        let _ = window.set_focusable(true);
+        let _ = window.set_always_on_top(true);
+        #[cfg(target_os = "macos")]
+        macos_hover::order_overlay_front_regardless(app);
+        #[cfg(target_os = "macos")]
+        macos_hover::sync_initial_hover_if_pointer_inside(app);
+    }
+}
+
+fn spawn_recenter_flash_hide_task(
+    app: AppHandle,
+    token: u64,
+    hold_duration: std::time::Duration,
+) {
+    tauri::async_runtime::spawn(async move {
+        run_recenter_flash_hide(app, token, hold_duration).await;
+    });
+}
+
+async fn run_recenter_flash_hide(
+    app: AppHandle,
+    token: u64,
+    hold_duration: std::time::Duration,
+) {
+    tokio::time::sleep(hold_duration).await;
+    if !flash_state().lock().is_active_token(token) {
+        return;
+    }
+    // 用户正在拖拽闪现中的胶囊微调位置：先不藏，松手后会重新排期淡出。
+    if hover_state().lock().dragging {
+        return;
+    }
+    let _ = app.emit(OVERLAY_FLASH_FADING_EVENT, ());
+    tokio::time::sleep(RECENTER_FLASH_FADE_DURATION).await;
+    if !flash_state().lock().is_active_token(token) {
+        return;
+    }
+    if hover_state().lock().dragging {
+        // 淡出瞬间刚好开始拖拽：撤回淡出态，等拖拽结束后再收起。
+        let _ = app.emit(
+            OVERLAY_RECENTERED_EVENT,
+            OverlayRecenteredPayload { flash: true },
+        );
+        return;
+    }
+    let app_for_main = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        finish_recenter_flash_on_main(&app_for_main, token);
+    });
+}
+
+fn finish_recenter_flash_on_main(app: &AppHandle, token: u64) {
+    if !flash_state().lock().finish_if_matches(token) {
+        return;
+    }
+    reset_hover_on_hide(app);
+    if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
+        let _ = window.hide();
+    }
+    collapse_hidden_overlay(app);
+    let _ = app.emit(OVERLAY_FLASH_ENDED_EVENT, ());
+    release_recenter_flash_foreground(app);
+}
+
+/// 闪现结束时不要误切回旧听写记录的 `remembered_frontmost_app`；
+/// 若当前 JackVoice 仍处于「前台但无其他可见窗口」（如双击 Dock 激活后），
+/// 通过 `NSApplication.hide(None)` 把激活权原样交还给双击前的真实前台应用。
+fn release_recenter_flash_foreground(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        if has_visible_windows(app) {
+            return;
+        }
+        if frontmost_pid() != Some(std::process::id() as i32) {
+            return;
+        }
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::NSApplication;
+        if let Some(mtm) = MainThreadMarker::new() {
+            let ns_app = NSApplication::sharedApplication(mtm);
+            ns_app.hide(None);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
+}
+
+fn reschedule_recenter_flash_after_drag(app: &AppHandle) {
+    if let Some(token) = flash_state().lock().bump_if_active() {
+        spawn_recenter_flash_hide_task(app.clone(), token, RECENTER_FLASH_POST_DRAG_DURATION);
+    }
 }
 
 /// 在用户鼠标刚滑入胶囊、尚未点击夺焦时记录此刻的前台窗口，
@@ -1032,6 +1358,11 @@ pub fn restore_overlay_focus(app: &AppHandle) {
                 }
             }
             None => {
+                if is_recenter_flash_active() {
+                    // 闪现居中期间没有记录外部焦点时，不切去可能过期的旧听写目标，
+                    // 等闪现收尾再由 `release_recenter_flash_foreground` 原样交还前台。
+                    return;
+                }
                 if focus_snapshot().lock().own_window.is_some() {
                     refocus_own_window(app);
                 } else if !main_is_visible(app) {
@@ -1082,6 +1413,7 @@ pub async fn start_overlay_drag(app: AppHandle) -> Result<bool, String> {
                 .start_dragging()
                 .map_err(|e| format!("开始拖拽失败：{e}"))?;
             persist_current_overlay_position(&app);
+            reschedule_recenter_flash_after_drag(&app);
             return Ok(true);
         }
         Ok(false)
@@ -1111,8 +1443,8 @@ mod macos_hover {
     use super::{
         cocoa_point_to_web, hover_state, note_overlay_interaction,
         persist_current_overlay_position, point_in_rect, record_pre_interaction_focus,
-        restore_overlay_focus, should_emit_hover_move, OverlayCursor, OverlayHoverPayload,
-        OVERLAY_HOVER_EVENT, OVERLAY_LABEL,
+        reschedule_recenter_flash_after_drag, restore_overlay_focus, should_emit_hover_move,
+        OverlayCursor, OverlayHoverPayload, OVERLAY_HOVER_EVENT, OVERLAY_LABEL,
     };
 
     const RTLD_DEFAULT: *mut c_void = (-2isize) as *mut c_void;
@@ -1500,6 +1832,16 @@ mod macos_hover {
             .unwrap_or(false)
     }
 
+    /// 即便应用处于非激活态（如程序坞右键菜单触发居中），也保证胶囊浮到屏幕最前方。
+    pub fn order_overlay_front_regardless(app: &AppHandle) {
+        if MainThreadMarker::new().is_none() {
+            return;
+        }
+        let _ = with_overlay_ns_window(app, |win| {
+            win.orderFrontRegardless();
+        });
+    }
+
     /// 胶囊刚好弹在鼠标指针正下方时，立刻同步一次 hover 状态和后台抓手光标。
     pub fn sync_initial_hover_if_pointer_inside(app: &AppHandle) {
         let Some(window) = app.get_webview_window(OVERLAY_LABEL) else {
@@ -1640,6 +1982,7 @@ mod macos_hover {
 
                     persist_current_overlay_position(&app_for_main);
                     restore_overlay_focus(&app_for_main);
+                    reschedule_recenter_flash_after_drag(&app_for_main);
 
                     if still_inside {
                         set_ns_cursor(OverlayCursor::Grab);
@@ -1841,5 +2184,44 @@ mod tests {
         // 再挤也不比单行矮。
         let (_, h) = resized_geometry(GrowAnchor::Down, 980.0, 46.0, 200.0, 25.0, 1000.0);
         assert_eq!(h, OVERLAY_HEIGHT);
+    }
+
+    #[test]
+    fn recenter_flash_state_tracks_tokens_and_cancellation() {
+        let mut state = RecenterFlashState::default();
+        assert!(!state.mark_ready());
+        assert!(state.webview_ready);
+
+        let t1 = state.begin_flash();
+        assert!(state.is_active_token(t1));
+        assert!(state.mark_ready());
+
+        // 连续触发居中会推进 token，旧定时器失效。
+        let t2 = state.begin_flash();
+        assert_ne!(t1, t2);
+        assert!(!state.is_active_token(t1));
+        assert!(!state.finish_if_matches(t1));
+        assert!(state.is_active_token(t2));
+
+        // 拖拽结束后延后隐藏会再次推进 token。
+        let t3 = state
+            .bump_if_active()
+            .expect("active flash should bump after drag");
+        assert_ne!(t2, t3);
+        assert!(!state.is_active_token(t2));
+        assert!(state.is_active_token(t3));
+
+        // 正常结束只消费匹配的最新 token。
+        assert!(state.finish_if_matches(t3));
+        assert!(!state.active);
+        assert!(!state.finish_if_matches(t3));
+        assert_eq!(state.bump_if_active(), None);
+
+        // 听写开始打断闪现：cancel 返回 true 并使旧 token 失效。
+        let t4 = state.begin_flash();
+        assert!(state.cancel());
+        assert!(!state.cancel());
+        assert!(!state.is_active_token(t4));
+        assert!(!state.finish_if_matches(t4));
     }
 }

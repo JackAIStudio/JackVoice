@@ -4,6 +4,7 @@ mod credentials;
 mod delivery;
 mod dock_icon;
 mod dock_menu;
+mod dock_reopen;
 mod history;
 mod hotwords;
 mod input_signal;
@@ -667,6 +668,12 @@ fn note_overlay_interaction() {
     crate::overlay::note_overlay_interaction();
 }
 
+/// 胶囊前端挂载完监听后调用，返回当前是否正处于「居中闪现」态，避免冷启动首帧漏接事件。
+#[tauri::command]
+fn overlay_ready() -> bool {
+    crate::overlay::overlay_ready()
+}
+
 /// 结果卡片常驻期间，用户可能切去别的应用并点进输入框，再回来点「重试」或
 /// 「复制」。在鼠标滑入胶囊（尚未点击夺焦）时刷新一次当前前台目标。
 #[tauri::command]
@@ -756,6 +763,7 @@ fn clear_completed_memos(app: AppHandle) -> Result<Vec<crate::memos::MemoItem>, 
 
 #[tauri::command]
 fn open_settings_window(app: AppHandle) -> Result<(), String> {
+    dock_reopen::cancel_pending();
     main_window::show_main_window(&app)
 }
 
@@ -989,6 +997,7 @@ pub fn run() {
             copy_last_transcript,
             retry_last_transcript,
             note_overlay_interaction,
+            overlay_ready,
             refresh_overlay_target,
             dismiss_overlay,
             toggle_session_pin,
@@ -1011,21 +1020,15 @@ pub fn run() {
                 dock_menu::setup(app);
                 dock_icon::setup(app);
             }
-            // Dock icon click opens settings, except when the capsule itself
-            // just caused this activation. A Dock click during dictation is an
-            // explicit user request: show the window instead of swallowing it
-            // (delivery re-activates its target before pasting anyway).
+            // Dock single-click opens settings; Dock double-click recenters
+            // and briefly flashes the preview capsule without popping settings.
+            // Reopen events triggered by clicking the capsule itself are ignored.
             tauri::RunEvent::Reopen { .. } => {
                 if overlay::suppress_reopen_for_overlay(app) {
                     eprintln!("[main-window] 忽略 Reopen：来自胶囊自身的激活");
                     return;
                 }
-                // 程序坞点击时 AppKit 已经把应用激活了；这里只负责把窗口
-                // 显示出来并设成 key window。再调 activate() 会把用户刚点
-                // 进来的激活顺序打乱，反而可能落到别的窗口。
-                if let Err(error) = main_window::show_main_window(app) {
-                    eprintln!("[main-window] Dock 唤起失败：{error}");
-                }
+                dock_reopen::handle_reopen(app);
             }
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
                 if let Some(state) = app.try_state::<AppState>() {
