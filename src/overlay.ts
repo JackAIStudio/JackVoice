@@ -125,18 +125,17 @@ function resetAudioMeter() {
 }
 
 /**
- * Result mode: dictation ended but insertion was NOT detected.
- * The capsule comes back with a manual "copy" button so the user can
- * re-copy the text themselves and nothing gets silently lost.
+ * Result mode: dictation ended but insertion was NOT detected (or stopped
+ * automatically). The capsule stays visible with retry and copy actions
+ * until the user clicks Copy, retries successfully, closes it, or starts
+ * a new dictation session.
  */
 let resultActive = false;
-/** 这张结果卡片来自自动结束：人多半不在，卡片不自动消失，「重试」改叫「插入」。 */
+/** 这张结果卡片来自自动结束：「重试」改叫「插入」。 */
 let resultAuto = false;
 let resultStatusText = "未检测到插入";
-let resultDismissTimer: number | undefined;
 let copyDismissTimer: number | undefined;
 
-const RESULT_AUTO_DISMISS_MS = 12000;
 const COPY_FEEDBACK_MS = 900;
 
 function paintResultChrome() {
@@ -159,38 +158,46 @@ function enterResultMode(state?: UiState | null) {
   resultAuto = autoText !== null;
   resultStatusText = autoText ?? "未检测到插入";
   const retry = retryBtn();
+  const copy = copyBtn();
   if (retry) {
+    retry.disabled = false;
     retry.textContent = resultAuto ? "插入" : "重试";
     retry.title = resultAuto
       ? "插入，保持剪贴板不变"
       : "重新尝试插入，保持剪贴板不变";
   }
-  paintResultChrome();
-  if (resultDismissTimer) window.clearTimeout(resultDismissTimer);
-  resultDismissTimer = undefined;
-  // 自动结束的卡片要等人回来，不自动消失。
-  if (!resultAuto) {
-    resultDismissTimer = window.setTimeout(() => {
-      void dismissResult();
-    }, RESULT_AUTO_DISMISS_MS);
+  if (copy) {
+    copy.disabled = false;
   }
-  syncExpansion(state ?? lastState);
+  paintResultChrome();
+  // 切入结果模式后右侧按钮区宽度发生变化，重新测量单行截断与溢出状态。
+  const effective = state ?? lastState;
+  if (effective) {
+    renderPreview(effective);
+    syncExpansion(effective);
+    window.requestAnimationFrame(() => {
+      if (resultActive && lastState) {
+        renderPreview(lastState);
+        syncExpansion(lastState);
+      }
+    });
+  }
 }
 
 function exitResultMode() {
   resultActive = false;
   resultAuto = false;
-  if (resultDismissTimer) {
-    window.clearTimeout(resultDismissTimer);
-    resultDismissTimer = undefined;
-  }
   if (copyDismissTimer) {
     window.clearTimeout(copyDismissTimer);
     copyDismissTimer = undefined;
   }
+  const retry = retryBtn();
+  const copy = copyBtn();
+  if (retry) retry.disabled = false;
+  if (copy) copy.disabled = false;
   capsule()?.classList.remove("result");
-  retryBtn()?.classList.add("hidden");
-  copyBtn()?.classList.add("hidden");
+  retry?.classList.add("hidden");
+  copy?.classList.add("hidden");
 }
 
 async function dismissResult() {
@@ -344,13 +351,13 @@ function renderClock() {
 }
 
 async function copyResult() {
+  const retry = retryBtn();
+  const copy = copyBtn();
+  if (retry) retry.disabled = true;
+  if (copy) copy.disabled = true;
   try {
     await invoke("copy_last_transcript");
     resultStatusText = "已复制到剪贴板";
-    if (resultDismissTimer) {
-      window.clearTimeout(resultDismissTimer);
-      resultDismissTimer = undefined;
-    }
     const status = statusEl();
     if (status) status.textContent = resultStatusText;
     if (copyDismissTimer) window.clearTimeout(copyDismissTimer);
@@ -361,6 +368,8 @@ async function copyResult() {
     resultStatusText = "复制失败，请重试";
     const status = statusEl();
     if (status) status.textContent = resultStatusText;
+    if (retry) retry.disabled = false;
+    if (copy) copy.disabled = false;
   }
 }
 
@@ -797,6 +806,12 @@ function noteInteraction() {
 
 window.addEventListener("DOMContentLoaded", async () => {
   document.querySelector("#capsule")?.addEventListener("mousedown", noteInteraction, true);
+  document.querySelector("#capsule")?.addEventListener("mouseenter", () => {
+    if (!resultActive) return;
+    void invoke("refresh_overlay_target").catch(() => {
+      // 刷新失败沿用原目标，不影响重试或复制。
+    });
+  });
   capsule()?.addEventListener("animationend", (e) => {
     if (e.animationName === "long-take-pulse") capsule()?.classList.remove("long-pulse");
   });

@@ -219,9 +219,7 @@ async fn push_glossary_to_tos(
 }
 
 #[tauri::command]
-async fn sync_glossary(
-    state: tauri::State<'_, AppState>,
-) -> Result<tos_sync::SyncReport, String> {
+async fn sync_glossary(state: tauri::State<'_, AppState>) -> Result<tos_sync::SyncReport, String> {
     state.sync_glossary().await
 }
 
@@ -659,15 +657,26 @@ fn note_overlay_interaction() {
     crate::overlay::note_overlay_interaction();
 }
 
-/// Hide the capsule from the frontend (e.g. after manual copy or timeout).
+/// 结果卡片常驻期间，用户可能切去别的应用并点进输入框，再回来点「重试」或
+/// 「复制」。在鼠标滑入胶囊（尚未点击夺焦）时刷新一次当前前台目标。
+#[tauri::command]
+fn refresh_overlay_target(app: AppHandle, state: tauri::State<'_, AppState>) {
+    if state.dictation_running() {
+        return;
+    }
+    crate::overlay::remember_frontmost_app(&app);
+}
+
+/// Hide the capsule from the frontend (e.g. after manual copy or explicit close).
 ///
-/// 前端只会在结果卡片的计时器到点时来藏胶囊。计时器和新一轮开始可能撞在
-/// 一起：那时胶囊已经归新一轮，不能藏。
+/// 前端在复制完成或手动关闭时会请求收起胶囊。若新一轮听写已经开始，不能把
+/// 新一轮的胶囊藏掉。
 #[tauri::command]
 fn dismiss_overlay(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     if state.dictation_running() {
         return Ok(());
     }
+    state.clear_copy_prompt();
     crate::overlay::hide_overlay(&app);
     Ok(())
 }
@@ -968,6 +977,7 @@ pub fn run() {
             copy_last_transcript,
             retry_last_transcript,
             note_overlay_interaction,
+            refresh_overlay_target,
             dismiss_overlay,
             toggle_session_pin,
             set_session_pin,

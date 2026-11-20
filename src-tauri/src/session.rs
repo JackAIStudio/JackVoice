@@ -485,6 +485,10 @@ impl AppState {
         ui.clone()
     }
 
+    pub fn clear_copy_prompt(&self) {
+        self.ui.lock().needs_copy_prompt = false;
+    }
+
     pub fn shortcut(&self) -> String {
         self.settings.lock().shortcut.clone()
     }
@@ -2753,7 +2757,12 @@ async fn deliver_finalized_text(
     if !still_the_latest_session(app, session_id) {
         return None;
     }
-    let probe = delivery::probe_insertion_target(target);
+    let probe_target = target.cloned();
+    let probe = tokio::task::spawn_blocking(move || {
+        delivery::probe_insertion_target(probe_target.as_ref())
+    })
+    .await
+    .unwrap_or(delivery::InsertionProbe::Unknown);
     Some(delivery::deliver_text_to(app, text, probe, target.map(|target| target.pid)).await)
 }
 
@@ -3336,13 +3345,13 @@ pub type SharedDelivery = DeliveryResult;
 
 #[cfg(test)]
 mod volc_connection_error_tests {
+    use super::{check_silence, AutoStop, SilenceCheck, SPEECH_LEVEL_THRESHOLD};
     use super::{
         format_volc_connection_error, initial_volc_credential_status, route_finished_transcript,
         stop_is_stuck, sync_resolved_input_device, update_audio_device_state, AppSettings,
         FinishedTranscriptRoute, MicFallbackState, UiState, VolcCredentialStatus,
         MAX_DICTATION_DURATION, STUCK_STOP_TIMEOUT,
     };
-    use super::{check_silence, AutoStop, SilenceCheck, SPEECH_LEVEL_THRESHOLD};
     use crate::audio::{ActiveInputDevice, AudioNotice, InputDeviceInfo, InputDevicePreference};
     use crate::session::{
         decide_delivery_turn, finished_overlay, owns_ui, DeliveryTurn, FinishedOverlay,
@@ -3503,7 +3512,10 @@ mod volc_connection_error_tests {
     #[test]
     fn stops_after_three_silent_minutes() {
         assert_eq!(check_silence(Duration::from_secs(180)), SilenceCheck::Stop);
-        assert_eq!(check_silence(Duration::from_secs(45 * 60)), SilenceCheck::Stop);
+        assert_eq!(
+            check_silence(Duration::from_secs(45 * 60)),
+            SilenceCheck::Stop
+        );
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::{AppHandle, Runtime};
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -6,6 +8,12 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 /// Electron / 大段文本读取剪贴板可能晚于 500ms，恢复得太早会把听写文字
 /// 换成旧内容，表现为“光标在闪却粘贴不进去”。
 const CLIPBOARD_RESTORE_DELAY: std::time::Duration = std::time::Duration::from_millis(900);
+/// 目标应用触发读取后，再短暂保留临时剪贴板的宽限时间：
+/// 部分应用（如 Chromium / Electron）一次粘贴可能连续读取多次。
+#[cfg(target_os = "macos")]
+const POST_CONSUME_GRACE_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+#[cfg(target_os = "macos")]
+const PASTE_CONSUME_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(15);
 /// 用户按完 Option+Space 后可能还按着修饰键，此时合成的 Cmd+V 会变成
 /// ⌥⌘V，多数应用不会粘贴。等修饰键松开再发按键。
 const MODIFIER_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(900);
@@ -38,12 +46,8 @@ pub enum InsertionProbe {
 const TEXT_ROLES: &[&str] = &["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"];
 
 /// Roles that definitely represent non-text, read-only system or UI controls
-/// where Cmd+V paste makes no sense and should be skipped.
-///
-/// 这张表只能放「确定不是输入位置」的控件。窗口、滚动区、WebArea、Group 这类
-/// 容器角色必须排除：浏览器 contenteditable、Electron 自定义编辑器、笔记类
-/// 应用都会把真实光标报告成这些容器角色。把它们判成不可输入，就会出现
-/// 「光标明明在闪，JackVoice 却说不没检测到输入焦点」。
+/// where Cmd+V paste makes no sense and should be skipped (unless the element
+/// explicitly reports editable attributes).
 const DEFINITELY_NON_TEXT_ROLES: &[&str] = &[
     "AXMenuBar",
     "AXMenuBarItem",
@@ -61,15 +65,11 @@ const DEFINITELY_NON_TEXT_ROLES: &[&str] = &[
     "AXStaticText",
 ];
 
-/// 容器 / 结构性角色：可能包着真实光标（网页 contenteditable、Electron 编辑器），
-/// 也可能只是窗口本身。没有别的证据时按 Unknown 处理，允许 best-effort 粘贴。
-const AMBIGUOUS_CONTAINER_ROLES: &[&str] = &[
-    "AXWindow",
-    "AXSheet",
-    "AXDrawer",
-    "AXScrollArea",
-    "AXWebArea",
-    "AXGroup",
+/// 结构/列表/空白网页角色：自身不可编辑、且无 `AXEditableAncestor`、且
+/// `AXSelectedTextRange` 也不可写时，属于明确的无光标区域（如 Chrome/Safari
+/// 空白网页、Finder/IDE 文件树、Telegram 列表、DaVinci Resolve 分屏），
+/// 直接跳过 Cmd+V，既避免误触发网页全局 onpaste，也免去系统错误提示音。
+const NON_EDITABLE_STRUCTURE_ROLES: &[&str] = &[
     "AXToolbar",
     "AXTabGroup",
     "AXTable",
@@ -80,6 +80,19 @@ const AMBIGUOUS_CONTAINER_ROLES: &[&str] = &[
     "AXCell",
     "AXRow",
     "AXColumn",
+    "AXSplitGroup",
+    "AXWebArea",
+];
+
+/// 通用窗口/容器角色：在严格遵守原生 AppKit AX 树的苹果系统应用里，没有
+/// 可编辑属性就说明没有激活光标；在第三方自绘应用（如 GPU 终端、远程桌面）
+/// 里仍可能承载真实光标，按 Unknown 放行并交由剪贴板消费确认裁决。
+const GENERIC_CONTAINER_ROLES: &[&str] = &[
+    "AXWindow",
+    "AXSheet",
+    "AXDrawer",
+    "AXScrollArea",
+    "AXGroup",
     "AXUnknown",
     "AXLayoutArea",
     "AXLayoutItem",
@@ -130,16 +143,18 @@ pub async fn deliver_text_to<R: Runtime>(
     // preservation is an outer transaction only; it must never replace the
     // proven paste path with an AXSelectedText write. Multi-line AXTextArea
     // controls can report that such writes succeeded while discarding them.
+    //
+    // 主线程只负责建立剪贴板事务（含延迟数据提供者）后立即返回，把 Cmd+V
+    // 投递放到后台线程：这样目标应用读取剪贴板时，AppKit 主线程 RunLoop
+    // 处于完全空闲状态，可以微秒级回调 provideDataForType:，不会发生死锁。
     let app_handle = app.clone();
     let owned_text = text.to_string();
     let prepared = run_on_main_thread(app, move || {
-        let transaction = ClipboardTransaction::begin(&app_handle, &owned_text)?;
-        let paste_triggered = simulate_paste();
-        Ok::<_, String>((transaction, paste_triggered))
+        ClipboardTransaction::begin(&app_handle, &owned_text)
     })
     .await;
 
-    let (transaction, paste_triggered) = match prepared {
+    let transaction = match prepared {
         Ok(Ok(value)) => value,
         Ok(Err(error)) | Err(error) => {
             eprintln!("[delivery] 无法建立透明剪贴板事务：{error}");
@@ -151,7 +166,7 @@ pub async fn deliver_text_to<R: Runtime>(
                 write_temporary_text_ignoring_previous(&app_handle, &fallback_text)
             })
             .await;
-            if fallback.is_err() {
+            if !matches!(fallback, Ok(Ok(()))) {
                 return DeliveryResult {
                     pasted: false,
                     copied: false,
@@ -159,7 +174,9 @@ pub async fn deliver_text_to<R: Runtime>(
                         .into(),
                 };
             }
-            let paste_triggered = simulate_paste();
+            let paste_triggered = tokio::task::spawn_blocking(simulate_paste)
+                .await
+                .unwrap_or(false);
             if paste_triggered {
                 tokio::time::sleep(CLIPBOARD_RESTORE_DELAY).await;
             }
@@ -175,9 +192,31 @@ pub async fn deliver_text_to<R: Runtime>(
         }
     };
 
-    if paste_triggered {
-        tokio::time::sleep(CLIPBOARD_RESTORE_DELAY).await;
-    }
+    let consumed_flag = transaction.consumed_flag();
+    let paste_triggered = tokio::task::spawn_blocking(simulate_paste)
+        .await
+        .unwrap_or(false);
+
+    let waited_consumed = if paste_triggered {
+        if let Some(flag) = consumed_flag.as_ref() {
+            #[cfg(target_os = "macos")]
+            {
+                wait_for_paste_consumption(flag, CLIPBOARD_RESTORE_DELAY, POST_CONSUME_GRACE_DELAY)
+                    .await
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = flag;
+                tokio::time::sleep(CLIPBOARD_RESTORE_DELAY).await;
+                true
+            }
+        } else {
+            tokio::time::sleep(CLIPBOARD_RESTORE_DELAY).await;
+            true
+        }
+    } else {
+        false
+    };
 
     let app_handle = app.clone();
     let restored = run_on_main_thread(app, move || transaction.finish(&app_handle)).await;
@@ -208,6 +247,35 @@ pub async fn deliver_text_to<R: Runtime>(
         };
     }
 
+    let target_consumed = match consumed_flag.as_ref() {
+        Some(flag) => waited_consumed || flag.load(Ordering::Acquire),
+        None => true,
+    };
+
+    if !target_consumed {
+        eprintln!(
+            "[delivery] 目标应用在 {}ms 内未读取临时剪贴板，判定未检测到输入焦点",
+            CLIPBOARD_RESTORE_DELAY.as_millis()
+        );
+        return DeliveryResult {
+            pasted: false,
+            copied: false,
+            message: match restore_outcome {
+                ClipboardRestoreOutcome::Restored => {
+                    "未检测到输入焦点，未自动插入；原剪贴板保持不变。可重试或点击“复制”。".into()
+                }
+                ClipboardRestoreOutcome::ExternalChangePreserved => {
+                    "未检测到输入焦点，未自动插入；已保留你刚刚复制的新内容。可重试或点击“复制”。"
+                        .into()
+                }
+                ClipboardRestoreOutcome::Failed => {
+                    "未检测到输入焦点，且恢复原剪贴板失败。请检查剪贴板，并从听写历史找回文字。"
+                        .into()
+                }
+            },
+        };
+    }
+
     let message = match restore_outcome {
         ClipboardRestoreOutcome::Restored => "已插入到当前输入位置，原剪贴板已恢复。".into(),
         ClipboardRestoreOutcome::ExternalChangePreserved => {
@@ -222,6 +290,33 @@ pub async fn deliver_text_to<R: Runtime>(
         pasted: true,
         copied: false,
         message,
+    }
+}
+
+/// 异步等待目标应用从延迟剪贴板提供者中读取听写文字。
+///
+/// 一旦检测到 `consumed` 变为 `true`，再宽限 `post_consume_grace` 后提前结束，
+/// 既给多阶段读取的应用（如 Electron）留足窗口，又比死等 900ms 更快归还剪贴板。
+#[cfg(target_os = "macos")]
+async fn wait_for_paste_consumption(
+    consumed: &Arc<AtomicBool>,
+    timeout: std::time::Duration,
+    post_consume_grace: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if consumed.load(Ordering::Acquire) {
+            if !post_consume_grace.is_zero() {
+                tokio::time::sleep(post_consume_grace).await;
+            }
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return consumed.load(Ordering::Acquire);
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        tokio::time::sleep(remaining.min(PASTE_CONSUME_POLL_INTERVAL)).await;
     }
 }
 
@@ -323,9 +418,86 @@ struct ClipboardSnapshot {
 }
 
 #[cfg(target_os = "macos")]
+mod macos_pasteboard_provider {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use objc2::rc::Retained;
+    use objc2::{define_class, msg_send, AnyThread, DefinedClass};
+    use objc2_app_kit::{
+        NSPasteboard, NSPasteboardItem, NSPasteboardItemDataProvider, NSPasteboardType,
+        NSPasteboardTypeString,
+    };
+    use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
+
+    #[derive(Debug)]
+    pub struct ProviderIvars {
+        text: String,
+        consumed: Arc<AtomicBool>,
+    }
+
+    define_class!(
+        /// 仅对 `NSPasteboardTypeString` 延迟供数，用来精确感知目标应用是否
+        /// 真的在收到 Cmd+V 后读取了听写文字。安全标记（TransientType 等）
+        /// 仍直接写入，避免剪贴板管理器查询标记时误触发回调。
+        #[unsafe(super(NSObject))]
+        #[name = "JVTemporaryPasteboardProvider"]
+        #[ivars = ProviderIvars]
+        #[derive(Debug)]
+        pub struct TemporaryTextProvider;
+
+        unsafe impl NSObjectProtocol for TemporaryTextProvider {}
+
+        unsafe impl NSPasteboardItemDataProvider for TemporaryTextProvider {
+            #[unsafe(method(pasteboard:item:provideDataForType:))]
+            fn provide_data_for_type(
+                &self,
+                _pasteboard: Option<&NSPasteboard>,
+                item: &NSPasteboardItem,
+                r#type: &NSPasteboardType,
+            ) {
+                let string_type = unsafe { NSPasteboardTypeString };
+                if r#type == string_type {
+                    let text = NSString::from_str(&self.ivars().text);
+                    if item.setString_forType(&text, string_type) {
+                        self.ivars().consumed.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+    );
+
+    impl TemporaryTextProvider {
+        pub fn new(text: String, consumed: Arc<AtomicBool>) -> Retained<Self> {
+            let this = Self::alloc().set_ivars(ProviderIvars { text, consumed });
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    /// 强持有延迟提供者直到事务结束（恢复原剪贴板之后）再释放。
+    ///
+    /// SAFETY: 仅在主线程构造、通过 AppKit 回调访问并在主线程 `finish()` 中释放；
+    /// 内部 ivars 均为 `Send + Sync`，即便任务中途被取消在后台 drop，Objective-C
+    /// `objc_release` 与 Rust 字段析构均线程安全。
+    pub struct ProviderGuard {
+        _inner: Retained<TemporaryTextProvider>,
+    }
+
+    unsafe impl Send for ProviderGuard {}
+
+    impl ProviderGuard {
+        pub fn new(provider: Retained<TemporaryTextProvider>) -> Self {
+            Self { _inner: provider }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 struct ClipboardTransaction {
     snapshot: ClipboardSnapshot,
     temporary_change_count: isize,
+    consumed: Arc<AtomicBool>,
+    _provider: macos_pasteboard_provider::ProviderGuard,
 }
 
 #[cfg(target_os = "macos")]
@@ -339,46 +511,64 @@ impl ClipboardTransaction {
         if pasteboard.changeCount() != original_change_count {
             return Err("读取期间剪贴板发生了变化，已保留用户的新内容".into());
         }
-        if let Err(error) = write_temporary_macos_text(&pasteboard, text, original_change_count) {
-            if !error.live_clipboard_changed {
-                return Err(error.message);
+        let consumed = Arc::new(AtomicBool::new(false));
+        let provider = match write_temporary_macos_text(
+            &pasteboard,
+            text,
+            original_change_count,
+            Arc::clone(&consumed),
+        ) {
+            Ok(provider) => provider,
+            Err(error) => {
+                if !error.live_clipboard_changed {
+                    return Err(error.message);
+                }
+                return match write_macos_snapshot(&pasteboard, &snapshot) {
+                    Ok(()) => Err(error.message),
+                    Err(restore_error) => Err(format!(
+                        "{}；恢复原剪贴板也失败：{restore_error}",
+                        error.message
+                    )),
+                };
             }
-            return match write_macos_snapshot(&pasteboard, &snapshot) {
-                Ok(()) => Err(error.message),
-                Err(restore_error) => Err(format!(
-                    "{}；恢复原剪贴板也失败：{restore_error}",
-                    error.message
-                )),
-            };
-        }
+        };
 
         Ok(Self {
             snapshot,
             temporary_change_count: pasteboard.changeCount(),
+            consumed,
+            _provider: macos_pasteboard_provider::ProviderGuard::new(provider),
         })
+    }
+
+    fn consumed_flag(&self) -> Option<Arc<AtomicBool>> {
+        Some(Arc::clone(&self.consumed))
     }
 
     fn finish<R: Runtime>(self, _app: &AppHandle<R>) -> ClipboardRestoreOutcome {
         use objc2_app_kit::NSPasteboard;
 
         let pasteboard = NSPasteboard::generalPasteboard();
-        if !clipboard_is_still_temporary(
+        let outcome = if !clipboard_is_still_temporary(
             self.temporary_change_count,
             pasteboard.changeCount(),
             macos_clipboard_has_temporary_marker(&pasteboard),
         ) {
             // The user (or another app) copied something while JackVoice was
             // delivering. Their newest clipboard always wins.
-            return ClipboardRestoreOutcome::ExternalChangePreserved;
-        }
-
-        match write_macos_snapshot(&pasteboard, &self.snapshot) {
-            Ok(()) => ClipboardRestoreOutcome::Restored,
-            Err(error) => {
-                eprintln!("[delivery] 恢复 macOS 剪贴板失败：{error}");
-                ClipboardRestoreOutcome::Failed
+            ClipboardRestoreOutcome::ExternalChangePreserved
+        } else {
+            match write_macos_snapshot(&pasteboard, &self.snapshot) {
+                Ok(()) => ClipboardRestoreOutcome::Restored,
+                Err(error) => {
+                    eprintln!("[delivery] 恢复 macOS 剪贴板失败：{error}");
+                    ClipboardRestoreOutcome::Failed
+                }
             }
-        }
+        };
+        // 确保在剪贴板恢复完成之后才释放延迟提供者。
+        drop(self._provider);
+        outcome
     }
 }
 
@@ -432,20 +622,30 @@ fn write_temporary_macos_text(
     pasteboard: &objc2_app_kit::NSPasteboard,
     text: &str,
     expected_change_count: isize,
-) -> Result<(), MacosTemporaryWriteError> {
+    consumed: Arc<AtomicBool>,
+) -> Result<
+    objc2::rc::Retained<macos_pasteboard_provider::TemporaryTextProvider>,
+    MacosTemporaryWriteError,
+> {
+    use objc2::runtime::ProtocolObject;
     use objc2::AnyThread;
-    use objc2_app_kit::{NSPasteboardItem, NSPasteboardTypeString};
+    use objc2_app_kit::{NSPasteboardContentsOptions, NSPasteboardItem, NSPasteboardTypeString};
     use objc2_foundation::{NSArray, NSData, NSString};
 
     let item = NSPasteboardItem::init(NSPasteboardItem::alloc());
-    let text = NSString::from_str(text);
-    if !item.setString_forType(&text, unsafe { NSPasteboardTypeString }) {
+    let provider =
+        macos_pasteboard_provider::TemporaryTextProvider::new(text.to_string(), consumed);
+    let string_type = unsafe { NSPasteboardTypeString };
+    let lazy_types = NSArray::from_slice(&[string_type]);
+    if !item.setDataProvider_forTypes(ProtocolObject::from_ref(&*provider), &lazy_types) {
         return Err(MacosTemporaryWriteError {
             message: "无法把听写文字写入临时剪贴板".into(),
             live_clipboard_changed: false,
         });
     }
 
+    // 三个防记录标记直接写入，不走 lazy provider：
+    // 剪贴板管理器查看 types 或标记值时不会误触发 consumed。
     let empty = NSData::with_bytes(&[]);
     for marker in [
         MACOS_TRANSIENT_TYPE,
@@ -461,17 +661,17 @@ fn write_temporary_macos_text(
         }
     }
 
-    let objects =
-        NSArray::from_retained_slice(&[objc2::runtime::ProtocolObject::from_retained(item)]);
+    let objects = NSArray::from_retained_slice(&[ProtocolObject::from_retained(item)]);
     if pasteboard.changeCount() != expected_change_count {
         return Err(MacosTemporaryWriteError {
             message: "写入前剪贴板发生了变化，已保留用户的新内容".into(),
             live_clipboard_changed: false,
         });
     }
-    pasteboard.clearContents();
+    // CurrentHostOnly 阻止 Universal Clipboard / Handoff 跨设备拉取临时听写文字。
+    pasteboard.prepareForNewContentsWithOptions(NSPasteboardContentsOptions::CurrentHostOnly);
     if pasteboard.writeObjects(&objects) {
-        Ok(())
+        Ok(provider)
     } else {
         Err(MacosTemporaryWriteError {
             message: "系统拒绝写入临时剪贴板".into(),
@@ -548,6 +748,10 @@ impl ClipboardTransaction {
         })
     }
 
+    fn consumed_flag(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
+
     fn finish<R: Runtime>(self, app: &AppHandle<R>) -> ClipboardRestoreOutcome {
         if app.clipboard().read_text().ok().as_deref() != Some(self.temporary_text.as_str()) {
             return ClipboardRestoreOutcome::ExternalChangePreserved;
@@ -618,6 +822,10 @@ impl ClipboardTransaction {
             formats,
             temporary_sequence,
         })
+    }
+
+    fn consumed_flag(&self) -> Option<Arc<AtomicBool>> {
+        None
     }
 
     fn finish<R: Runtime>(self, _app: &AppHandle<R>) -> ClipboardRestoreOutcome {
@@ -711,8 +919,151 @@ pub fn is_unsupported_ax_app(name: Option<&str>) -> bool {
         || lower.starts_with("electron")
 }
 
-/// Probe the target app's focused UI element through the macOS Accessibility
-/// API (via osascript) and decide whether there is a real text insertion point.
+/// 严格遵循原生 AppKit AX 树的苹果系统应用：只要真的有光标激活，它们
+/// 必定会暴露 `AXTextField` / `AXTextArea` / `AXSearchField` / `AXComboBox`
+/// 或可写属性；如果焦点停在无焦点 / `AXWindow` / `AXScrollArea` / `AXGroup`
+/// 且没有任何可编辑属性，就可以 100% 确定当前没有光标，直接跳过 Cmd+V，
+/// 既免去系统错误提示音，又防止向画布误粘贴。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn is_strict_native_ax_app(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    matches!(
+        lower.as_str(),
+        "finder"
+            | "访达"
+            | "notes"
+            | "备忘录"
+            | "preview"
+            | "预览"
+            | "photos"
+            | "照片"
+            | "system settings"
+            | "system preferences"
+            | "系统设置"
+            | "系统偏好设置"
+            | "activity monitor"
+            | "活动监视器"
+            | "app store"
+            | "mail"
+            | "邮件"
+            | "textedit"
+            | "文本编辑"
+            | "calendar"
+            | "日历"
+            | "reminders"
+            | "提醒事项"
+            | "music"
+            | "音乐"
+            | "keynote"
+            | "pages"
+            | "numbers"
+    )
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct AxFocusElement {
+    pub app_name: String,
+    pub role: String,
+    pub subrole: String,
+    pub value_settable: bool,
+    pub selected_text_settable: bool,
+    pub selected_text_range_settable: bool,
+    pub has_editable_ancestor: bool,
+    pub has_selected_text: bool,
+    pub has_selected_text_range: bool,
+    pub insertion_point_line: Option<f64>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AxFocusProbe {
+    /// 目标进程存在，但未暴露 `AXFocusedUIElement`（如 `kAXErrorNoValue`）。
+    Missing { app_name: String },
+    /// 探针不可用（未授权辅助功能、应用无响应/超时、PID 无效等）。
+    Unavailable,
+    /// 成功读到目标应用的当前焦点元素及其可编辑信号。
+    Element(AxFocusElement),
+}
+
+/// 根据焦点元素的真实可编辑信号判定当前是否存在文本插入点。
+///
+/// 实测中，空白 Chrome 网页 (`AXWebArea`)、链接 (`AXLink`)、Qt 列表
+/// (`Telegram AXList`)、达芬奇分屏 (`DaVinci Resolve AXSplitGroup`) 都会暴露
+/// 只读的 `AXSelectedTextRange` 或 `AXInsertionPointLineNumber = 0`，但它们的
+/// `value_settable` / `selected_text_settable` / `selected_text_range_settable`
+/// / `has_editable_ancestor` 全为 false。因此不能仅凭 range 存在就判为可插入。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn classify_ax_focus(probe: &AxFocusProbe) -> InsertionProbe {
+    match probe {
+        AxFocusProbe::Unavailable => InsertionProbe::Unknown,
+        AxFocusProbe::Missing { app_name } => {
+            if is_strict_native_ax_app(app_name) {
+                eprintln!(
+                    "[delivery] native AX app {app_name} has no focused element; treating as NotInsertable"
+                );
+                InsertionProbe::NotInsertable
+            } else {
+                // 微信 / Electron / Chrome PWA 等自绘或跨进程应用常不暴露
+                // AXFocusedUIElement，按 Unknown 放行并交由剪贴板消费确认裁决。
+                let known_unsupported = is_unsupported_ax_app(Some(app_name));
+                eprintln!(
+                    "[delivery] target app {app_name} returned no focused element (known unsupported AX app: {known_unsupported}); treating as Unknown"
+                );
+                InsertionProbe::Unknown
+            }
+        }
+        AxFocusProbe::Element(el) => {
+            let role = el.role.trim();
+            let is_text_role = TEXT_ROLES.contains(&role);
+            let is_directly_editable =
+                el.value_settable || el.selected_text_settable || el.has_editable_ancestor;
+            let is_non_text_role = DEFINITELY_NON_TEXT_ROLES.contains(&role);
+            let is_non_editable_structure = NON_EDITABLE_STRUCTURE_ROLES.contains(&role);
+            let is_generic_container = GENERIC_CONTAINER_ROLES.contains(&role) || role.is_empty();
+
+            let result = if is_text_role || is_directly_editable {
+                InsertionProbe::Insertable
+            } else if is_non_text_role {
+                InsertionProbe::NotInsertable
+            } else if el.selected_text_range_settable {
+                // 虽未报告可写值或 AXEditableAncestor，但选区范围可写（如特殊
+                // 富文本或自定义编辑器）：交由剪贴板消费确认裁决，绝不误杀。
+                InsertionProbe::Unknown
+            } else if is_non_editable_structure
+                || (is_generic_container && is_strict_native_ax_app(&el.app_name))
+            {
+                InsertionProbe::NotInsertable
+            } else {
+                // 第三方应用的通用容器（GPU 终端、远程桌面、自绘窗口）无法仅凭
+                // 角色断定没有光标：放行 Unknown，由剪贴板消费确认最终裁决。
+                InsertionProbe::Unknown
+            };
+
+            eprintln!(
+                "[delivery] ax-probe app={} role={} subrole={} valSet={} selSet={} rangeSet={} editableAnc={} ins={:?} -> {:?}",
+                el.app_name,
+                role,
+                el.subrole,
+                el.value_settable,
+                el.selected_text_settable,
+                el.selected_text_range_settable,
+                el.has_editable_ancestor,
+                el.insertion_point_line,
+                result
+            );
+            result
+        }
+    }
+}
+
+/// Probe the target app's focused UI element directly via macOS native
+/// `AXUIElement` APIs (no `osascript` subprocess, no Automation permission
+/// required, bounded 500ms messaging timeout).
 ///
 /// Prefer the remembered process PID so a development JackAICut is not
 /// confused with the production install of the same product name.
@@ -720,55 +1071,18 @@ pub fn probe_insertion_target(target: Option<&crate::overlay::FrontmostApp>) -> 
     #[cfg(target_os = "macos")]
     {
         let Some(target) = target else {
-            // 没有可识别的目标应用时不要断言「不可输入」：胶囊可能刚抢过焦点，
-            // 而用户的光标其实还在原应用里。按 Unknown 放行 best-effort 粘贴。
-            eprintln!("[delivery] no frontmost target app; treating as Unknown");
-            return InsertionProbe::Unknown;
+            eprintln!("[delivery] no target app; treating as NotInsertable");
+            return InsertionProbe::NotInsertable;
         };
-
-        let selector = process_selector(Some(target));
-        // Also report whether the focused element exposes a live insertion
-        // point. Chrome exposes a focused <textarea> as AXGroup, and some
-        // Electron/web surfaces only expose AXWebArea — role alone is not
-        // enough to tell a blinking caret from page-level focus.
-        //
-        // AXSelectedTextRange 是比 AXSelectedText 更可靠的「有光标」证据：
-        // 没有选中任何文字时 AXSelectedText 是空串，但 range 依然存在。
-        let script = format!(
-            concat!(
-                "tell application \"System Events\"\n",
-                "\t{selector}\n",
-                "\tset actualName to \"\"\n",
-                "\ttry\n",
-                "\t\tset actualName to (name of p as string)\n",
-                "\tend try\n",
-                "\ttry\n",
-                "\t\tset el to value of attribute \"AXFocusedUIElement\" of p\n",
-                "\t\tif el is missing value then return actualName & \"|__missing__\"\n",
-                "\t\tset r to value of attribute \"AXRole\" of el as string\n",
-                "\t\tset sel to \"absent\"\n",
-                "\t\ttry\n",
-                "\t\t\tset selVal to (value of attribute \"AXSelectedText\" of el as string)\n",
-                "\t\t\tif selVal is not \"missing value\" and selVal is not \"\" then set sel to \"present\"\n",
-                "\t\tend try\n",
-                "\t\tset ins to \"missing\"\n",
-                "\t\ttry\n",
-                "\t\t\tset ins to (value of attribute \"AXInsertionPointLineNumber\" of el) as string\n",
-                "\t\tend try\n",
-                "\t\tset rng to \"absent\"\n",
-                "\t\ttry\n",
-                "\t\t\tset rangeVal to value of attribute \"AXSelectedTextRange\" of el\n",
-                "\t\t\tif rangeVal is not missing value then set rng to \"present\"\n",
-                "\t\tend try\n",
-                "\t\treturn actualName & \"|\" & r & \"|\" & sel & \"|\" & ins & \"|\" & rng\n",
-                "\ton error\n",
-                "\t\treturn \"__error__\"\n",
-                "\tend try\n",
-                "end tell"
-            ),
-            selector = selector
-        );
-        run_probe_script(&script)
+        if target.pid <= 0 {
+            eprintln!(
+                "[delivery] invalid target pid={}; treating as NotInsertable",
+                target.pid
+            );
+            return InsertionProbe::NotInsertable;
+        }
+        let focus = macos_ax::probe_application_focus(target.pid, &target.name);
+        classify_ax_focus(&focus)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -778,149 +1092,170 @@ pub fn probe_insertion_target(target: Option<&crate::overlay::FrontmostApp>) -> 
     }
 }
 
-pub(crate) fn process_selector(target: Option<&crate::overlay::FrontmostApp>) -> String {
-    match target {
-        Some(app) if app.pid > 0 => {
-            format!(
-                "set p to first application process whose unix id is {}",
-                app.pid
-            )
-        }
-        Some(app) if !app.name.trim().is_empty() => {
-            let escaped = app.name.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("set p to first application process whose name is \"{escaped}\"")
-        }
-        _ => "set p to first application process whose frontmost is true".to_string(),
-    }
-}
-
 #[cfg(target_os = "macos")]
-fn run_probe_script(script: &str) -> InsertionProbe {
-    use std::io::Read;
+mod macos_ax {
+    use core_foundation::base::{CFGetTypeID, CFRelease, CFTypeRef, TCFType};
+    use core_foundation::number::{CFNumber, CFNumberRef};
+    use core_foundation::string::{CFString, CFStringRef};
+    use std::ffi::c_void;
+    use std::ptr;
 
-    let mut child = match std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return InsertionProbe::Unknown,
-    };
+    use super::{AxFocusElement, AxFocusProbe};
 
-    // Bound the wait: AX queries against unresponsive apps can hang.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut out = String::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    let _ = stdout.read_to_string(&mut out);
-                }
-                if !status.success() {
-                    return InsertionProbe::Unknown;
-                }
-                let line = out.trim();
-                return parse_probe_output(line);
+    type AXUIElementRef = *mut c_void;
+    type AXError = i32;
+
+    const K_AX_ERROR_SUCCESS: AXError = 0;
+    const K_AX_ERROR_ATTRIBUTE_UNSUPPORTED: AXError = -25205;
+    const K_AX_ERROR_NOT_IMPLEMENTED: AXError = -25208;
+    const K_AX_ERROR_API_DISABLED: AXError = -25211;
+    const K_AX_ERROR_NO_VALUE: AXError = -25212;
+    const AX_MESSAGING_TIMEOUT_SECS: f32 = 0.5;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
+        fn AXUIElementSetMessagingTimeout(
+            element: AXUIElementRef,
+            timeout_in_seconds: f32,
+        ) -> AXError;
+        fn AXUIElementCopyAttributeValue(
+            element: AXUIElementRef,
+            attribute: CFStringRef,
+            value: *mut CFTypeRef,
+        ) -> AXError;
+        fn AXUIElementIsAttributeSettable(
+            element: AXUIElementRef,
+            attribute: CFStringRef,
+            settable: *mut u8,
+        ) -> AXError;
+    }
+
+    struct OwnedCf(CFTypeRef);
+
+    impl Drop for OwnedCf {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CFRelease(self.0) };
             }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return InsertionProbe::Unknown;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+    }
+
+    fn copy_attr(element: AXUIElementRef, name: &str) -> Result<OwnedCf, AXError> {
+        let attr = CFString::new(name);
+        let mut value: CFTypeRef = ptr::null();
+        let err = unsafe {
+            AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value)
+        };
+        if err != K_AX_ERROR_SUCCESS {
+            return Err(err);
+        }
+        if value.is_null() {
+            return Err(K_AX_ERROR_NO_VALUE);
+        }
+        Ok(OwnedCf(value))
+    }
+
+    fn copy_string_attr(element: AXUIElementRef, name: &str) -> Option<String> {
+        let owned = copy_attr(element, name).ok()?;
+        let is_string = unsafe { CFGetTypeID(owned.0) == CFString::type_id() };
+        if !is_string {
+            return None;
+        }
+        let s = unsafe { CFString::wrap_under_get_rule(owned.0 as CFStringRef) };
+        Some(s.to_string())
+    }
+
+    fn copy_f64_attr(element: AXUIElementRef, name: &str) -> Option<f64> {
+        let owned = copy_attr(element, name).ok()?;
+        let is_number = unsafe { CFGetTypeID(owned.0) == CFNumber::type_id() };
+        if !is_number {
+            return None;
+        }
+        let n = unsafe { CFNumber::wrap_under_get_rule(owned.0 as CFNumberRef) };
+        n.to_f64()
+    }
+
+    fn is_attr_settable(element: AXUIElementRef, name: &str) -> bool {
+        let attr = CFString::new(name);
+        let mut settable: u8 = 0;
+        let err = unsafe {
+            AXUIElementIsAttributeSettable(element, attr.as_concrete_TypeRef(), &mut settable)
+        };
+        err == K_AX_ERROR_SUCCESS && settable != 0
+    }
+
+    pub fn probe_application_focus(pid: i32, app_name: &str) -> AxFocusProbe {
+        let app_ref = unsafe { AXUIElementCreateApplication(pid) };
+        if app_ref.is_null() {
+            return AxFocusProbe::Unavailable;
+        }
+        let _app_guard = OwnedCf(app_ref as CFTypeRef);
+        unsafe {
+            let _ = AXUIElementSetMessagingTimeout(app_ref, AX_MESSAGING_TIMEOUT_SECS);
+        }
+
+        let focused = match copy_attr(app_ref, "AXFocusedUIElement") {
+            Ok(el) => el,
+            Err(
+                K_AX_ERROR_NO_VALUE | K_AX_ERROR_ATTRIBUTE_UNSUPPORTED | K_AX_ERROR_NOT_IMPLEMENTED,
+            ) => {
+                return AxFocusProbe::Missing {
+                    app_name: app_name.to_string(),
+                };
             }
-            Err(_) => return InsertionProbe::Unknown,
+            Err(K_AX_ERROR_API_DISABLED) => {
+                eprintln!("[delivery] AX API disabled; falling back to Unknown");
+                return AxFocusProbe::Unavailable;
+            }
+            Err(code) => {
+                eprintln!(
+                    "[delivery] AXFocusedUIElement failed for pid={pid} ({app_name}) err={code}"
+                );
+                return AxFocusProbe::Unavailable;
+            }
+        };
+
+        let el = focused.0 as AXUIElementRef;
+        unsafe {
+            let _ = AXUIElementSetMessagingTimeout(el, AX_MESSAGING_TIMEOUT_SECS);
         }
+
+        let role = copy_string_attr(el, "AXRole").unwrap_or_default();
+        let subrole = copy_string_attr(el, "AXSubrole").unwrap_or_default();
+        let value_settable = is_attr_settable(el, "AXValue");
+        let selected_text_settable = is_attr_settable(el, "AXSelectedText");
+        let selected_text_range_settable = is_attr_settable(el, "AXSelectedTextRange");
+        let has_editable_ancestor = copy_attr(el, "AXEditableAncestor").is_ok()
+            || copy_attr(el, "AXHighestEditableAncestor").is_ok();
+        let has_selected_text =
+            copy_string_attr(el, "AXSelectedText").is_some_and(|text| !text.is_empty());
+        let has_selected_text_range = copy_attr(el, "AXSelectedTextRange").is_ok();
+        let insertion_point_line = copy_f64_attr(el, "AXInsertionPointLineNumber")
+            .filter(|v| (0.0..1_000_000_000.0).contains(v));
+
+        AxFocusProbe::Element(AxFocusElement {
+            app_name: app_name.to_string(),
+            role,
+            subrole,
+            value_settable,
+            selected_text_settable,
+            selected_text_range_settable,
+            has_editable_ancestor,
+            has_selected_text,
+            has_selected_text_range,
+            insertion_point_line,
+        })
     }
-}
-
-/// Parse the probe script output line.
-///
-/// Output formats:
-/// - `appName|__missing__`: Target app exposes no focused element.
-/// - `appName|ROLE|SEL|INS`: Target app element attributes.
-/// - Legacy `__missing__`, `__error__`, or empty string.
-#[cfg(target_os = "macos")]
-fn parse_probe_output(line: &str) -> InsertionProbe {
-    if line.is_empty() || line == "__error__" {
-        return InsertionProbe::Unknown;
-    }
-
-    if let Some((app_name, rest)) = line.split_once('|') {
-        if rest == "__missing__" {
-            // 「应用没有暴露 AXFocusedUIElement」不等于「没有光标」：
-            // 大量 Electron / 自绘 / 沙盒应用都拿不到焦点元素，但 Cmd+V
-            // 依然能落进它们自己的输入框。这里只能按 Unknown 处理，
-            // 真正确定不可粘贴的情况交给 classify_probe_line 的控件角色判断。
-            let known_unsupported = is_unsupported_ax_app(Some(app_name));
-            eprintln!(
-                "[delivery] target app {app_name} returned __missing__ (known unsupported AX app: {known_unsupported}); treating as Unknown"
-            );
-            return InsertionProbe::Unknown;
-        }
-        return classify_probe_line(app_name, rest);
-    }
-
-    match line {
-        "__missing__" => InsertionProbe::Unknown,
-        _ => classify_probe_line("", line),
-    }
-}
-
-/// Classify the probe output line `ROLE|SEL|INS`.
-///
-/// Insertable when the focused element is a known text role, or when it
-/// exposes a sane `AXInsertionPointLineNumber` (a live caret) or AXSelectedTextRange.
-/// Definitely non-text elements (such as buttons, menus, dock, sliders, static text) without
-/// a caret are classified as NotInsertable. Container roles stay Unknown so a
-/// web / Electron caret is never mistaken for "no focus".
-#[cfg(target_os = "macos")]
-fn classify_probe_line(app_name: &str, rest: &str) -> InsertionProbe {
-    let mut parts = rest.split('|');
-    let role = parts.next().unwrap_or("").trim();
-    let sel = parts.next().unwrap_or("").trim();
-    let ins = parts.next().unwrap_or("").trim();
-    let range = parts.next().unwrap_or("").trim();
-
-    let ins_line = ins.parse::<f64>().ok();
-    let has_caret = matches!(ins_line, Some(v) if (0.0..1_000_000_000.0).contains(&v));
-    let has_selection = sel == "present";
-    // AXSelectedTextRange 是真正的「有插入点」证据：文本控件即使没有选中内容，
-    // 也会暴露一个合法 range；网页 contenteditable 同样如此。
-    let has_text_range = range == "present";
-
-    let is_text_role = TEXT_ROLES.contains(&role);
-    let is_non_text_role = DEFINITELY_NON_TEXT_ROLES.contains(&role);
-    let is_ambiguous_container = AMBIGUOUS_CONTAINER_ROLES.contains(&role) || role.is_empty();
-
-    let insertable =
-        is_text_role || has_caret || has_text_range || (has_selection && !is_non_text_role);
-    let probe = if insertable {
-        InsertionProbe::Insertable
-    } else if is_non_text_role {
-        InsertionProbe::NotInsertable
-    } else {
-        // 容器 / 未知角色无法证明「没有光标」，按 Unknown 放行 best-effort
-        // 粘贴：宁可多试一次 Cmd+V，也不要对着闪烁的光标说没焦点。
-        let _ = is_ambiguous_container;
-        InsertionProbe::Unknown
-    };
-
-    eprintln!(
-        "[delivery] probe app={app_name} role={role} selectedText={sel} insertionPointLine={ins} selectedTextRange={range} -> {probe:?}"
-    );
-    probe
 }
 
 /// Best-effort paste trigger used only inside a guarded clipboard transaction.
 /// The caller restores the original clipboard unless newer user data has replaced it.
 ///
-/// This runs on the main thread and must never block on a subprocess: a hung
-/// `osascript` freezes the whole app (global shortcut, Dock reopen, capsule)
-/// until it exits. Core Graphics posting is synchronous and cannot hang.
+/// Runs on a blocking worker thread so the AppKit main thread stays completely
+/// idle and can fulfill lazy `NSPasteboardItemDataProvider` callbacks immediately.
+/// Core Graphics posting is synchronous and cannot hang; the osascript fallback
+/// carries a bounded watchdog.
 fn simulate_paste() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -1113,101 +1448,303 @@ mod clipboard_transaction_tests {
         assert!(!is_unsupported_ax_app(Some("")));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn probe_output_parsing_never_blocks_a_live_caret() {
-        use super::{parse_probe_output, InsertionProbe};
+    fn probe_classifies_real_editable_controls_as_insertable() {
+        use super::{classify_ax_focus, AxFocusElement, AxFocusProbe, InsertionProbe};
 
-        // 拿不到焦点元素不等于没有光标：Electron / 自绘 / 沙盒应用都这样。
-        // 这些情况必须放行 best-effort 粘贴，否则就是「光标在闪却不粘」。
+        // 原生文本控件：文本编辑 / 备忘录 / 终端（终端 valSet=false 但 role=AXTextArea）
         assert_eq!(
-            parse_probe_output("WeChat|__missing__"),
-            InsertionProbe::Unknown
-        );
-        assert_eq!(
-            parse_probe_output("微信|__missing__"),
-            InsertionProbe::Unknown
-        );
-        assert_eq!(
-            parse_probe_output("JackDSH|__missing__"),
-            InsertionProbe::Unknown
-        );
-        assert_eq!(
-            parse_probe_output("app_mode_loader|__missing__"),
-            InsertionProbe::Unknown
-        );
-        assert_eq!(
-            parse_probe_output("Finder|__missing__"),
-            InsertionProbe::Unknown
-        );
-
-        // 明确是文本控件：可插入
-        assert_eq!(
-            parse_probe_output("Terminal|AXTextArea|present|0|present"),
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "文本编辑".into(),
+                role: "AXTextArea".into(),
+                value_settable: true,
+                selected_text_settable: true,
+                selected_text_range_settable: true,
+                has_selected_text_range: true,
+                ..Default::default()
+            })),
             InsertionProbe::Insertable
         );
         assert_eq!(
-            parse_probe_output("Notes|AXTextArea|absent|12|present"),
-            InsertionProbe::Insertable
-        );
-        // 网页 contenteditable：角色是容器，但 AXSelectedTextRange 存在，
-        // 说明有真实插入点。
-        assert_eq!(
-            parse_probe_output("Google Chrome|AXGroup|absent|missing|present"),
-            InsertionProbe::Insertable
-        );
-        assert_eq!(
-            parse_probe_output("Google Chrome|AXWebArea|absent|missing|present"),
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "终端".into(),
+                role: "AXTextArea".into(),
+                selected_text_range_settable: true,
+                has_selected_text_range: true,
+                insertion_point_line: Some(8.0),
+                ..Default::default()
+            })),
             InsertionProbe::Insertable
         );
         assert_eq!(
-            parse_probe_output("Slack|AXGroup|absent|missing|present"),
-            InsertionProbe::Insertable
-        );
-        // 只有光标行号、没有 range 也算有光标
-        assert_eq!(
-            parse_probe_output("Code|AXTextArea|absent|0|absent"),
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "Code".into(),
+                role: "AXTextArea".into(),
+                insertion_point_line: Some(0.0),
+                ..Default::default()
+            })),
             InsertionProbe::Insertable
         );
 
-        // 确定不是输入位置的控件：跳过粘贴
+        // Chrome / Electron 的 contenteditable（如 X 回复框、Notion、Slack）：
+        // 即使 role 是 AXWebArea / AXGroup，只要带 AXEditableAncestor 或可写属性，
+        // 就必须判为可插入。
         assert_eq!(
-            parse_probe_output("System Settings|AXButton|absent|missing|absent"),
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "Google Chrome".into(),
+                role: "AXWebArea".into(),
+                has_editable_ancestor: true,
+                has_selected_text_range: true,
+                selected_text_range_settable: true,
+                ..Default::default()
+            })),
+            InsertionProbe::Insertable
+        );
+        assert_eq!(
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "Google Chrome".into(),
+                role: "AXGroup".into(),
+                value_settable: true,
+                ..Default::default()
+            })),
+            InsertionProbe::Insertable
+        );
+        assert_eq!(
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "Slack".into(),
+                role: "AXGroup".into(),
+                selected_text_settable: true,
+                ..Default::default()
+            })),
+            InsertionProbe::Insertable
+        );
+    }
+
+    #[test]
+    fn probe_rejects_read_only_pages_lists_and_native_apps_without_caret() {
+        use super::{classify_ax_focus, AxFocusElement, AxFocusProbe, InsertionProbe};
+
+        // 确定不是输入位置的系统控件
+        for (app_name, role) in [
+            ("System Settings", "AXButton"),
+            ("Finder", "AXMenuBarItem"),
+            ("Finder", "AXStaticText"),
+            ("ego lite", "AXLink"),
+        ] {
+            assert_eq!(
+                classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                    app_name: app_name.into(),
+                    role: role.into(),
+                    // 实测 Chromium 链接也会暴露只读 range，绝不能因此误判可插入
+                    has_selected_text_range: true,
+                    ..Default::default()
+                })),
+                InsertionProbe::NotInsertable,
+                "{app_name} {role} 不应被判为可插入"
+            );
+        }
+
+        // Chrome / WKWebView 空白网页（实测带只读 range，但无任何可写/可编辑属性）
+        assert_eq!(
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "Google Chrome".into(),
+                role: "AXWebArea".into(),
+                has_selected_text_range: true,
+                ..Default::default()
+            })),
             InsertionProbe::NotInsertable
         );
         assert_eq!(
-            parse_probe_output("Finder|AXMenuBarItem|absent|missing|absent"),
-            InsertionProbe::NotInsertable
-        );
-        assert_eq!(
-            parse_probe_output("Finder|AXStaticText|absent|missing|absent"),
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "JackAICut".into(),
+                role: "AXWebArea".into(),
+                ..Default::default()
+            })),
             InsertionProbe::NotInsertable
         );
 
-        // 容器角色但没有光标证据：不能断言不可粘贴，按 Unknown 放行。
+        // Qt 应用（Telegram 列表 / DaVinci Resolve 分屏）实测默认暴露只读 ins=0 和 range
         assert_eq!(
-            parse_probe_output("Google Chrome|AXWebArea|absent|9.223372036855E+18|absent"),
-            InsertionProbe::Unknown
-        );
-        // X（Twitter）的回复框在 Chrome 里就是这样：AXWebArea、没有选中文本、
-        // 行号是 AXValueNotFound 的哨兵值，只有 AXSelectedTextRange 存在。
-        // 光标确实在闪，必须判为可插入。
-        assert_eq!(
-            parse_probe_output("Google Chrome|AXWebArea|absent|9.223372036855E+18|present"),
-            InsertionProbe::Insertable
-        );
-        assert_eq!(
-            parse_probe_output("Notes|AXWindow|absent|missing|absent"),
-            InsertionProbe::Unknown
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "Telegram".into(),
+                role: "AXList".into(),
+                insertion_point_line: Some(0.0),
+                has_selected_text_range: true,
+                ..Default::default()
+            })),
+            InsertionProbe::NotInsertable
         );
         assert_eq!(
-            parse_probe_output("Code|AXOutline|absent|9.223372036855E+18|absent"),
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "DaVinci Resolve".into(),
+                role: "AXSplitGroup".into(),
+                insertion_point_line: Some(0.0),
+                has_selected_text_range: true,
+                ..Default::default()
+            })),
+            InsertionProbe::NotInsertable
+        );
+
+        // IDE 文件树 / Finder 列表
+        assert_eq!(
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "Code".into(),
+                role: "AXOutline".into(),
+                ..Default::default()
+            })),
+            InsertionProbe::NotInsertable
+        );
+        assert_eq!(
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "访达".into(),
+                role: "AXOutline".into(),
+                ..Default::default()
+            })),
+            InsertionProbe::NotInsertable
+        );
+
+        // 苹果原生 AppKit 应用无光标（桌面 / 窗口背景 / 照片滚动区 / 预览无焦点）
+        assert_eq!(
+            classify_ax_focus(&AxFocusProbe::Missing {
+                app_name: "Finder".into(),
+            }),
+            InsertionProbe::NotInsertable
+        );
+        assert_eq!(
+            classify_ax_focus(&AxFocusProbe::Missing {
+                app_name: "访达".into(),
+            }),
+            InsertionProbe::NotInsertable
+        );
+        assert_eq!(
+            classify_ax_focus(&AxFocusProbe::Missing {
+                app_name: "预览".into(),
+            }),
+            InsertionProbe::NotInsertable
+        );
+        assert_eq!(
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "备忘录".into(),
+                role: "AXWindow".into(),
+                ..Default::default()
+            })),
+            InsertionProbe::NotInsertable
+        );
+        assert_eq!(
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "照片".into(),
+                role: "AXScrollArea".into(),
+                ..Default::default()
+            })),
+            InsertionProbe::NotInsertable
+        );
+
+        // 没有目标应用或无效 PID 时直接判定不可插入
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                super::probe_insertion_target(None),
+                InsertionProbe::NotInsertable
+            );
+            assert_eq!(
+                super::probe_insertion_target(Some(&app(0, "Finder"))),
+                InsertionProbe::NotInsertable
+            );
+        }
+    }
+
+    #[test]
+    fn non_native_missing_and_generic_containers_defer_to_paste_consumption() {
+        use super::{classify_ax_focus, AxFocusElement, AxFocusProbe, InsertionProbe};
+
+        // 微信 / Electron / Chrome PWA 拿不到焦点元素时必须放行 Unknown，
+        // 再由延迟剪贴板消费确认精确区分「有光标」和「没光标」。
+        for app_name in [
+            "WeChat",
+            "微信",
+            "Cursor",
+            "ChatGPT",
+            "Feishu",
+            "Obsidian",
+            "app_mode_loader",
+            "Firefox",
+            "Some App Nobody Has Heard Of",
+        ] {
+            assert_eq!(
+                classify_ax_focus(&AxFocusProbe::Missing {
+                    app_name: app_name.into(),
+                }),
+                InsertionProbe::Unknown,
+                "{app_name} 应放行至剪贴板消费确认"
+            );
+        }
+
+        // GPU 终端 / 远程桌面 / 第三方自绘容器同样放行 Unknown
+        assert_eq!(
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "Ghostty".into(),
+                role: "AXWindow".into(),
+                ..Default::default()
+            })),
             InsertionProbe::Unknown
         );
 
-        // Error or empty string falls back to Unknown
-        assert_eq!(parse_probe_output("__error__"), InsertionProbe::Unknown);
-        assert_eq!(parse_probe_output(""), InsertionProbe::Unknown);
+        // 任何支持可写 AXSelectedTextRange 的自定义编辑器也不应被误杀
+        assert_eq!(
+            classify_ax_focus(&AxFocusProbe::Element(AxFocusElement {
+                app_name: "Google Chrome".into(),
+                role: "AXWebArea".into(),
+                selected_text_range_settable: true,
+                has_selected_text_range: true,
+                ..Default::default()
+            })),
+            InsertionProbe::Unknown
+        );
+
+        // 探针超时或未授权时退回 Unknown
+        assert_eq!(
+            classify_ax_focus(&AxFocusProbe::Unavailable),
+            InsertionProbe::Unknown
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn paste_consumption_wait_returns_early_on_read_and_false_on_timeout() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        // 无人消费：超时返回 false
+        let never_consumed = Arc::new(AtomicBool::new(false));
+        let ok = super::wait_for_paste_consumption(
+            &never_consumed,
+            Duration::from_millis(60),
+            Duration::from_millis(20),
+        )
+        .await;
+        assert!(!ok);
+
+        // 很快消费：提前返回 true，不等满整个 timeout
+        let consumed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&consumed);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            flag.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let ok = super::wait_for_paste_consumption(
+            &consumed,
+            Duration::from_millis(800),
+            Duration::from_millis(20),
+        )
+        .await;
+        assert!(ok);
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "消费后应提前结束等待，实际耗时 {:?}",
+            started.elapsed()
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1220,45 +1757,6 @@ mod clipboard_transaction_tests {
             for original_representation in original_item {
                 assert!(captured_item.contains(original_representation));
             }
-        }
-    }
-
-    /// 「应用没暴露 AXFocusedUIElement」不能被当成「没有输入焦点」。
-    /// 微信 / Electron / PWA 都这样，误判会让用户看着闪烁的光标却粘不进去。
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn missing_focused_element_never_blocks_the_paste() {
-        use super::{parse_probe_output, InsertionProbe};
-        for app in [
-            "WeChat",
-            "微信",
-            "Cursor",
-            "ChatGPT",
-            "Feishu",
-            "Notes",
-            "Finder",
-            "Some App Nobody Has Heard Of",
-        ] {
-            assert_eq!(
-                parse_probe_output(&format!("{app}|__missing__")),
-                InsertionProbe::Unknown,
-                "{app} 拿不到焦点元素时应该放行 best-effort 粘贴"
-            );
-        }
-    }
-
-    /// 网页 / Electron 的 contenteditable 常被暴露成 AXGroup / AXWebArea。
-    /// 只要 AXSelectedTextRange 在，就必须认定有光标。
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn container_roles_with_a_text_range_count_as_insertable() {
-        use super::{parse_probe_output, InsertionProbe};
-        for role in ["AXGroup", "AXWebArea", "AXScrollArea", "AXWindow"] {
-            assert_eq!(
-                parse_probe_output(&format!("Google Chrome|{role}|absent|missing|present")),
-                InsertionProbe::Insertable,
-                "{role} + AXSelectedTextRange 说明有真实插入点"
-            );
         }
     }
 
@@ -1314,24 +1812,6 @@ mod clipboard_transaction_tests {
         assert_eq!(freeze_delivery_target(None, None), None);
     }
 
-    #[test]
-    fn probe_selects_the_remembered_process_by_pid() {
-        let target = crate::overlay::FrontmostApp {
-            pid: 12345,
-            name: "JackAICut for DaVinci Resolve Studio".into(),
-        };
-        let selector = super::process_selector(Some(&target));
-        assert_eq!(
-            selector,
-            "set p to first application process whose unix id is 12345"
-        );
-        assert!(!selector.contains("name is"));
-        assert_eq!(
-            super::process_selector(None),
-            "set p to first application process whose frontmost is true"
-        );
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_snapshot_round_trips_multiple_items_and_formats() {
@@ -1376,12 +1856,14 @@ mod clipboard_transaction_tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn temporary_text_is_marked_and_original_snapshot_can_be_restored() {
+    fn temporary_text_tracks_consumption_and_restores_original_snapshot() {
         use super::{
             capture_macos_clipboard, macos_clipboard_has_temporary_marker, write_macos_snapshot,
             write_temporary_macos_text, ClipboardRepresentation, ClipboardSnapshot,
         };
-        use objc2_app_kit::NSPasteboard;
+        use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
 
         let pasteboard = NSPasteboard::pasteboardWithUniqueName();
         let original = ClipboardSnapshot {
@@ -1392,14 +1874,48 @@ mod clipboard_transaction_tests {
         };
         write_macos_snapshot(&pasteboard, &original).expect("seed image clipboard");
 
+        // 场景 1：写入并检查 Transient 标记、直接恢复原剪贴板，不应误报已消费
         let original_change_count = pasteboard.changeCount();
-        write_temporary_macos_text(&pasteboard, "临时听写", original_change_count)
-            .expect("write temporary text");
+        let unconsumed = Arc::new(AtomicBool::new(false));
+        let provider = write_temporary_macos_text(
+            &pasteboard,
+            "临时听写",
+            original_change_count,
+            Arc::clone(&unconsumed),
+        )
+        .expect("write temporary text");
         assert!(macos_clipboard_has_temporary_marker(&pasteboard));
+        assert!(
+            !unconsumed.load(Ordering::Acquire),
+            "仅写入和检查标记不应触发 consumed"
+        );
 
         write_macos_snapshot(&pasteboard, &original).expect("restore image clipboard");
+        drop(provider);
+        assert!(
+            !unconsumed.load(Ordering::Acquire),
+            "无人粘贴直接恢复原剪贴板后 consumed 必须保持为 false"
+        );
         let restored = capture_macos_clipboard(&pasteboard).expect("read restored clipboard");
         assert_snapshot_preserves_original(&restored, &original);
+
+        // 场景 2：真实读取字符串时，返回完整文本并置 consumed = true
+        let change_count = pasteboard.changeCount();
+        let consumed = Arc::new(AtomicBool::new(false));
+        let provider = write_temporary_macos_text(
+            &pasteboard,
+            "你好 JackVoice",
+            change_count,
+            Arc::clone(&consumed),
+        )
+        .expect("write temporary text for read");
+        let read_back = pasteboard
+            .stringForType(unsafe { NSPasteboardTypeString })
+            .map(|s| s.to_string());
+        assert_eq!(read_back.as_deref(), Some("你好 JackVoice"));
+        assert!(consumed.load(Ordering::Acquire));
+        write_macos_snapshot(&pasteboard, &original).expect("restore clipboard again");
+        drop(provider);
     }
 
     #[cfg(target_os = "macos")]
@@ -1410,6 +1926,8 @@ mod clipboard_transaction_tests {
             ClipboardRepresentation, ClipboardSnapshot,
         };
         use objc2_app_kit::NSPasteboard;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
 
         let pasteboard = NSPasteboard::pasteboardWithUniqueName();
         let old = ClipboardSnapshot {
@@ -1429,8 +1947,13 @@ mod clipboard_transaction_tests {
         };
         write_macos_snapshot(&pasteboard, &newer).expect("simulate newer user copy");
 
-        let error = write_temporary_macos_text(&pasteboard, "不得覆盖", stale_change_count)
-            .expect_err("stale transaction must be rejected");
+        let error = write_temporary_macos_text(
+            &pasteboard,
+            "不得覆盖",
+            stale_change_count,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect_err("stale transaction must be rejected");
         assert!(!error.live_clipboard_changed);
         let current = capture_macos_clipboard(&pasteboard).expect("read newer clipboard");
         assert_snapshot_preserves_original(&current, &newer);
