@@ -39,9 +39,17 @@ body {
   color: #f3f5f7;
   cursor: grab;
   overflow: hidden;
+  transition: border-color 0.16s ease, background-color 0.16s ease;
 }
 
-.capsule:active {
+.capsule:hover,
+.capsule.hovered {
+  background: rgba(28, 28, 32, 0.98);
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.capsule:active,
+.capsule.dragging {
   cursor: grabbing;
 }
 
@@ -135,7 +143,8 @@ body {
   bottom: 12px;
 }
 
-.jump-btn:hover {
+.jump-btn:hover,
+.jump-btn.hovered {
   color: #fff;
   background: rgba(56, 56, 60, 0.98);
 }
@@ -166,16 +175,15 @@ body {
 }
 
 .expand-btn:hover,
-.content.expandable:hover .expand-btn {
+.expand-btn.hovered,
+.content.expandable:hover .expand-btn,
+.content.expandable.hovered .expand-btn {
   color: rgba(255, 255, 255, 0.9);
 }
 
-.expand-btn:hover {
+.expand-btn:hover,
+.expand-btn.hovered {
   background: rgba(255, 255, 255, 0.1);
-}
-
-.content.expandable {
-  cursor: pointer;
 }
 
 /* 展开后单行预览让位给卡片；保留宽度以便继续判断是否溢出。 */
@@ -297,7 +305,8 @@ body {
   font-size: 13px;
 }
 
-.icon-btn:hover {
+.icon-btn:hover,
+.icon-btn.hovered {
   filter: brightness(1.08);
 }
 
@@ -305,12 +314,27 @@ body {
   border-color: rgba(42, 214, 170, 0.28);
 }
 
+.capsule.recording:hover,
+.capsule.recording.hovered {
+  border-color: rgba(42, 214, 170, 0.52);
+}
+
 .capsule.finalizing {
   border-color: rgba(255, 177, 74, 0.28);
 }
 
+.capsule.finalizing:hover,
+.capsule.finalizing.hovered {
+  border-color: rgba(255, 177, 74, 0.52);
+}
+
 .capsule.error {
   border-color: rgba(255, 120, 120, 0.35);
+}
+
+.capsule.error:hover,
+.capsule.error.hovered {
+  border-color: rgba(255, 120, 120, 0.58);
 }
 
 /* Transient mic notice highlights the capsule while the live transcript stays visible. */
@@ -318,9 +342,19 @@ body {
   border-color: rgba(255, 177, 74, 0.45);
 }
 
+.capsule.notice:hover,
+.capsule.notice.hovered {
+  border-color: rgba(255, 177, 74, 0.68);
+}
+
 /* Result mode: insertion was not detected, offer safe retry and explicit copy. */
 .capsule.result {
   border-color: rgba(255, 177, 74, 0.45);
+}
+
+.capsule.result:hover,
+.capsule.result.hovered {
+  border-color: rgba(255, 177, 74, 0.68);
 }
 
 .capsule.result .bar {
@@ -378,7 +412,8 @@ body {
   transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-.pin-btn:hover {
+.pin-btn:hover,
+.pin-btn.hovered {
   color: rgba(255, 255, 255, 0.85);
   background: rgba(255, 255, 255, 0.16);
 }
@@ -425,7 +460,9 @@ body {
 }
 
 .result-btn:hover,
-.copy-btn:hover {
+.result-btn.hovered,
+.copy-btn:hover,
+.copy-btn.hovered {
   filter: brightness(1.08);
 }
 

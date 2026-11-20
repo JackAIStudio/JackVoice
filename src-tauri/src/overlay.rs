@@ -15,6 +15,80 @@ const DEFAULT_DOCK_RESERVE: f64 = 78.0;
 const EXPAND_EDGE_MARGIN: f64 = 4.0;
 /// 胶囊藏起来时缩回单行，通知前端撤掉卡片排版。
 const OVERLAY_COLLAPSED_EVENT: &str = "jackvoice://overlay-collapsed";
+/// 后台鼠标悬停状态同步给前端（含窗口内逻辑坐标），保证非激活态也能即时高亮与切光标。
+const OVERLAY_HOVER_EVENT: &str = "jackvoice://overlay-hover";
+/// 后台鼠标移动同步给前端的最小间隔，兼顾跟手度与零多余 IPC 压力。
+const HOVER_MOVE_THROTTLE: std::time::Duration = std::time::Duration::from_millis(16);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverlayCursor {
+    #[default]
+    Default,
+    Grab,
+    Grabbing,
+    Pointer,
+}
+
+impl OverlayCursor {
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim() {
+            "grab" => Self::Grab,
+            "grabbing" => Self::Grabbing,
+            "pointer" => Self::Pointer,
+            _ => Self::Default,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OverlayHoverPayload {
+    inside: bool,
+    x: f64,
+    y: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreInteractionFocus {
+    External(FrontmostApp),
+    OwnWindow(String),
+}
+
+#[derive(Debug, Default)]
+struct HoverState {
+    inside: bool,
+    dragging: bool,
+    desired_cursor: OverlayCursor,
+    cursor_applied_in_background: bool,
+    last_move_emit: Option<std::time::Instant>,
+    pre_interaction_focus: Option<PreInteractionFocus>,
+}
+
+static HOVER_STATE: std::sync::OnceLock<parking_lot::Mutex<HoverState>> =
+    std::sync::OnceLock::new();
+
+fn hover_state() -> &'static parking_lot::Mutex<HoverState> {
+    HOVER_STATE.get_or_init(|| parking_lot::Mutex::new(HoverState::default()))
+}
+
+/// 纯判定：屏幕坐标点 `(px, py)` 是否落在矩形 `(rx, ry, rw, rh)` 内。
+fn point_in_rect(px: f64, py: f64, rx: f64, ry: f64, rw: f64, rh: f64) -> bool {
+    rw > 0.0 && rh > 0.0 && px >= rx && px <= rx + rw && py >= ry && py <= ry + rh
+}
+
+/// Cocoa 窗口内坐标（左下角原点）转为 Web 视口坐标（左上角原点），并夹紧在可视范围内。
+fn cocoa_point_to_web(loc_x: f64, loc_y: f64, width: f64, height: f64) -> (f64, f64) {
+    let max_x = (width - 1.0).max(0.0);
+    let max_y = (height - 1.0).max(0.0);
+    let x = loc_x.clamp(0.0, max_x);
+    let y = (height - loc_y).clamp(0.0, max_y);
+    (x, y)
+}
+
+/// 后台移动事件节流判定。
+fn should_emit_hover_move(last_emit: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last_emit.is_none_or(|last| now.saturating_duration_since(last) >= HOVER_MOVE_THROTTLE)
+}
 
 /// 胶囊展开成多行卡片时往哪边长。按钮那一行始终钉在原处，
 /// 说着话伸手去点「确认」时不会点歪。
@@ -183,14 +257,8 @@ pub fn set_overlay_height(app: &AppHandle, height: f64) -> Result<OverlayGeometr
                 height: current,
             });
         };
-        let (new_top, h) = resized_geometry(
-            anchor,
-            top,
-            current,
-            OVERLAY_HEIGHT,
-            work_top,
-            work_bottom,
-        );
+        let (new_top, h) =
+            resized_geometry(anchor, top, current, OVERLAY_HEIGHT, work_top, work_bottom);
         apply_overlay_height(&window, anchor, x, new_top, h)?;
         return Ok(OverlayGeometry {
             grow: "none",
@@ -318,6 +386,7 @@ pub fn ensure_overlay(app: &AppHandle) -> Result<(), String> {
         .skip_taskbar(true)
         .visible(false)
         .focused(false)
+        .accept_first_mouse(true)
         // Critical on macOS: window shadow creates the weird rectangular corners
         // around a transparent rounded capsule.
         .shadow(false)
@@ -328,6 +397,12 @@ pub fn ensure_overlay(app: &AppHandle) -> Result<(), String> {
         let _ = window.set_position(tauri::LogicalPosition::new(saved.x, saved.y));
     } else if let Some((x, y)) = default_bottom_center(app) {
         let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        macos_hover::enable_background_cursor_updates();
+        macos_hover::install_hover_tracker(app, &window);
     }
 
     Ok(())
@@ -363,6 +438,8 @@ pub fn show_overlay(app: &AppHandle) {
         // 目标应用，但中间整段听写期间光标都不在原处，粘贴时机稍有偏差就会
         // 落空。这里把焦点还回去。
         restore_focus_after_overlay_show();
+        #[cfg(target_os = "macos")]
+        macos_hover::sync_initial_hover_if_pointer_inside(app);
     }
 }
 
@@ -391,6 +468,7 @@ fn restore_focus_after_overlay_show() {
 }
 
 pub fn hide_overlay(app: &AppHandle) {
+    reset_hover_on_hide(app);
     if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
         let _ = window.hide();
     }
@@ -406,6 +484,7 @@ pub fn hide_overlay_for_delivery(app: &AppHandle, reactivate_target: bool) {
         hide_overlay(app);
         return;
     }
+    reset_hover_on_hide(app);
     if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
         let _ = window.hide();
     }
@@ -626,9 +705,24 @@ const OVERLAY_REOPEN_SUPPRESS_WINDOW: std::time::Duration = std::time::Duration:
 ///
 /// 之前的实现是「胶囊可见且聚焦就一律忽略 Reopen」，于是只要结果胶囊还挂在
 /// 屏幕上（未插入时的复制提示会停留 12 秒），用户点程序坞图标就永远没反应。
-pub fn suppress_reopen_for_overlay(_app: &AppHandle) -> bool {
+pub fn suppress_reopen_for_overlay(app: &AppHandle) -> bool {
     let last = *overlay_interaction_slot().lock();
-    should_suppress_reopen(last, std::time::Instant::now())
+    if should_suppress_reopen(last, std::time::Instant::now()) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // 首击穿透（accept_first_mouse）下，macOS 激活窗口并派发 Reopen 可能
+        // 抢在前端异步 `note_overlay_interaction` IPC 之前到达。此时鼠标指针
+        // 正落在可见的胶囊窗口内（Dock 点击则位于屏幕底端 Dock 上），可准确区分。
+        if macos_hover::pointer_inside_visible_overlay(app) {
+            note_overlay_interaction();
+            return true;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
+    false
 }
 
 /// 纯判定：只有「距离胶囊交互不超过窗口」的那次 Reopen 才算自己人。
@@ -867,13 +961,711 @@ pub fn reset_overlay_position(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-pub fn start_overlay_drag(app: AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
-        window
-            .start_dragging()
-            .map_err(|e| format!("开始拖拽失败：{e}"))?;
+/// 在用户鼠标刚滑入胶囊、尚未点击夺焦时记录此刻的前台窗口，
+/// 拖完或点完轻量操作后原样把焦点还回去。
+fn record_pre_interaction_focus(app: &AppHandle) {
+    if hover_state().lock().dragging {
+        return;
     }
-    Ok(())
+    if let Some(own) = own_input_window(app) {
+        hover_state().lock().pre_interaction_focus =
+            Some(PreInteractionFocus::OwnWindow(own.label().to_string()));
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(front) = read_frontmost_app() {
+        hover_state().lock().pre_interaction_focus = Some(PreInteractionFocus::External(front));
+    }
+}
+
+/// 胶囊隐藏时清掉所有后台悬停态，并确保不把抓手光标遗留在屏幕上。
+fn reset_hover_on_hide(app: &AppHandle) {
+    let restore_cursor = {
+        let mut state = hover_state().lock();
+        state.inside = false;
+        state.dragging = false;
+        state.desired_cursor = OverlayCursor::Default;
+        state.last_move_emit = None;
+        state.pre_interaction_focus = None;
+        let had_bg = state.cursor_applied_in_background;
+        state.cursor_applied_in_background = false;
+        had_bg
+    };
+    let _ = app.emit(
+        OVERLAY_HOVER_EVENT,
+        OverlayHoverPayload {
+            inside: false,
+            x: -1.0,
+            y: -1.0,
+        },
+    );
+    #[cfg(target_os = "macos")]
+    if restore_cursor {
+        macos_hover::reset_cursor_to_arrow(app);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = restore_cursor;
+}
+
+/// 拖拽或点击胶囊上的非结束按钮（置顶、展开/收起）后，把焦点还给交互前用户正在用的窗口。
+pub fn restore_overlay_focus(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        if frontmost_pid() != Some(std::process::id() as i32) {
+            return;
+        }
+        let target = hover_state().lock().pre_interaction_focus.clone();
+        match target {
+            Some(PreInteractionFocus::OwnWindow(label)) => {
+                if label != OVERLAY_LABEL {
+                    if let Some(win) = app.get_webview_window(&label) {
+                        if win.is_visible().unwrap_or(false) && !win.is_minimized().unwrap_or(false)
+                        {
+                            let _ = win.set_focus();
+                        }
+                    }
+                }
+            }
+            Some(PreInteractionFocus::External(ext)) => {
+                if !is_self_app(&ext, std::process::id()) {
+                    activate_running_process(ext.pid);
+                }
+            }
+            None => {
+                if focus_snapshot().lock().own_window.is_some() {
+                    refocus_own_window(app);
+                } else if !main_is_visible(app) {
+                    if let Some(rem) = remembered_frontmost_app() {
+                        if !is_self_app(&rem, std::process::id()) {
+                            activate_running_process(rem.pid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
+}
+
+/// 由前端按当前悬停目标同步系统光标（抓手 / 握拳 / 指向手 / 默认）。
+pub fn set_overlay_cursor(app: &AppHandle, cursor: &str) {
+    let parsed = OverlayCursor::parse(cursor);
+    #[cfg(target_os = "macos")]
+    {
+        macos_hover::apply_cursor(app, parsed);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, parsed);
+    }
+}
+
+fn persist_current_overlay_position(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
+        if let Ok((x, top, _, _, _)) = overlay_frame(&window) {
+            let _ = save_overlay_position(app.clone(), x, top);
+        }
+    }
+}
+
+pub async fn start_overlay_drag(app: AppHandle) -> Result<bool, String> {
+    note_overlay_interaction();
+    #[cfg(target_os = "macos")]
+    {
+        macos_hover::perform_overlay_drag(app).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
+            window
+                .start_dragging()
+                .map_err(|e| format!("开始拖拽失败：{e}"))?;
+            persist_current_overlay_position(&app);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos_hover {
+    use std::ffi::{c_void, CStr};
+    use std::panic::AssertUnwindSafe;
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    use std::sync::{Once, OnceLock};
+
+    use core_foundation::base::{CFTypeRef, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::string::{CFString, CFStringRef};
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{define_class, msg_send, AnyThread, MainThreadMarker, MainThreadOnly};
+    use objc2_app_kit::{
+        NSApplication, NSCursor, NSEvent, NSEventModifierFlags, NSEventType, NSTrackingArea,
+        NSTrackingAreaOptions, NSWindow,
+    };
+    use objc2_foundation::{NSObject, NSProcessInfo, NSRect};
+    use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
+
+    use super::{
+        cocoa_point_to_web, hover_state, note_overlay_interaction,
+        persist_current_overlay_position, point_in_rect, record_pre_interaction_focus,
+        restore_overlay_focus, should_emit_hover_move, OverlayCursor, OverlayHoverPayload,
+        OVERLAY_HOVER_EVENT, OVERLAY_LABEL,
+    };
+
+    const RTLD_DEFAULT: *mut c_void = (-2isize) as *mut c_void;
+
+    unsafe extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const std::ffi::c_char) -> *mut c_void;
+    }
+
+    type CgsConnectionId = u32;
+    type CgsMainConnectionIdFn = unsafe extern "C" fn() -> CgsConnectionId;
+    type CgsSetConnectionPropertyFn =
+        unsafe extern "C" fn(CgsConnectionId, CgsConnectionId, CFStringRef, CFTypeRef) -> i32;
+
+    static BG_CURSOR_INIT: Once = Once::new();
+    static OVERLAY_APP: OnceLock<AppHandle> = OnceLock::new();
+    static TRACKER_INSTANCE: AtomicPtr<OverlayHoverTracker> = AtomicPtr::new(std::ptr::null_mut());
+
+    /// 允许后台（非激活态）应用在鼠标悬停到胶囊窗口时更新系统光标。
+    pub fn enable_background_cursor_updates() {
+        BG_CURSOR_INIT.call_once(|| unsafe {
+            let main_conn_sym = lookup_symbol(c"CGSMainConnectionID")
+                .or_else(|| lookup_symbol(c"_CGSDefaultConnection"));
+            let set_prop_sym = lookup_symbol(c"CGSSetConnectionProperty");
+            let (Some(main_conn_ptr), Some(set_prop_ptr)) = (main_conn_sym, set_prop_sym) else {
+                eprintln!("[overlay] 未找到 CoreGraphics 后台光标符号，跳过启用");
+                return;
+            };
+            let main_conn: CgsMainConnectionIdFn = std::mem::transmute(main_conn_ptr);
+            let set_prop: CgsSetConnectionPropertyFn = std::mem::transmute(set_prop_ptr);
+            let cid = main_conn();
+            let key = CFString::from_static_string("SetsCursorInBackground");
+            let value = CFBoolean::true_value();
+            let status = set_prop(cid, cid, key.as_concrete_TypeRef(), value.as_CFTypeRef());
+            if status != 0 {
+                eprintln!("[overlay] 启用后台光标更新返回非零状态：{status}");
+            }
+        });
+    }
+
+    unsafe fn lookup_symbol(name: &CStr) -> Option<*mut c_void> {
+        let ptr = unsafe { dlsym(RTLD_DEFAULT, name.as_ptr()) };
+        (!ptr.is_null()).then_some(ptr)
+    }
+
+    fn set_ns_cursor(cursor: OverlayCursor) {
+        let ns_cursor = match cursor {
+            OverlayCursor::Default => NSCursor::arrowCursor(),
+            OverlayCursor::Grab => NSCursor::openHandCursor(),
+            OverlayCursor::Grabbing => NSCursor::closedHandCursor(),
+            OverlayCursor::Pointer => NSCursor::pointingHandCursor(),
+        };
+        ns_cursor.set();
+    }
+
+    fn pointer_inside_window(ns_window: &NSWindow) -> bool {
+        let frame = ns_window.frame();
+        let loc = NSEvent::mouseLocation();
+        point_in_rect(
+            loc.x,
+            loc.y,
+            frame.origin.x,
+            frame.origin.y,
+            frame.size.width,
+            frame.size.height,
+        )
+    }
+
+    fn window_is_background(mtm: MainThreadMarker, ns_window: &NSWindow) -> bool {
+        let ns_app = NSApplication::sharedApplication(mtm);
+        !ns_app.isActive() || !ns_window.isKeyWindow()
+    }
+
+    fn web_coords_from_event(ns_window: &NSWindow, event: &NSEvent) -> (f64, f64) {
+        let loc = event.locationInWindow();
+        let bounds = ns_window
+            .contentView()
+            .map(|view| view.bounds())
+            .unwrap_or_else(|| ns_window.frame());
+        cocoa_point_to_web(loc.x, loc.y, bounds.size.width, bounds.size.height)
+    }
+
+    fn web_coords_from_pointer(ns_window: &NSWindow) -> (f64, f64) {
+        let loc = ns_window.convertPointFromScreen(NSEvent::mouseLocation());
+        let bounds = ns_window
+            .contentView()
+            .map(|view| view.bounds())
+            .unwrap_or_else(|| ns_window.frame());
+        cocoa_point_to_web(loc.x, loc.y, bounds.size.width, bounds.size.height)
+    }
+
+    fn with_overlay_ns_window<R>(app: &AppHandle, f: impl FnOnce(&NSWindow) -> R) -> Option<R> {
+        let window = app.get_webview_window(OVERLAY_LABEL)?;
+        let ptr = window.ns_window().ok()? as *const NSWindow;
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: only called on the main thread while `window` is alive.
+        Some(f(unsafe { &*ptr }))
+    }
+
+    define_class!(
+        /// 挂在胶囊 contentView 上的原生鼠标追踪器（ActiveAlways），
+        /// 保证应用在后台时也能 0 延迟响应移入、移动、移出与光标刷新。
+        #[unsafe(super(NSObject))]
+        #[name = "JackVoiceOverlayHoverTracker"]
+        #[thread_kind = MainThreadOnly]
+        struct OverlayHoverTracker;
+
+        impl OverlayHoverTracker {
+            #[unsafe(method(mouseEntered:))]
+            fn mouse_entered(&self, event: &NSEvent) {
+                let Some(mtm) = MainThreadMarker::new() else {
+                    return;
+                };
+                let Some(app) = OVERLAY_APP.get() else {
+                    return;
+                };
+                record_pre_interaction_focus(app);
+
+                let Some((is_bg, web_x, web_y, visible)) = with_overlay_ns_window(app, |win| {
+                    let (x, y) = web_coords_from_event(win, event);
+                    (window_is_background(mtm, win), x, y, win.isVisible())
+                }) else {
+                    return;
+                };
+                if !visible {
+                    return;
+                }
+
+                let cursor_to_apply = {
+                    let mut state = hover_state().lock();
+                    state.inside = true;
+                    state.last_move_emit = Some(std::time::Instant::now());
+                    if !state.dragging && state.desired_cursor == OverlayCursor::Default {
+                        state.desired_cursor = OverlayCursor::Grab;
+                    }
+                    let cursor = state.desired_cursor;
+                    if is_bg && cursor != OverlayCursor::Default {
+                        state.cursor_applied_in_background = true;
+                    }
+                    cursor
+                };
+
+                if is_bg {
+                    set_ns_cursor(cursor_to_apply);
+                }
+                let _ = app.emit(
+                    OVERLAY_HOVER_EVENT,
+                    OverlayHoverPayload {
+                        inside: true,
+                        x: web_x,
+                        y: web_y,
+                    },
+                );
+            }
+
+            #[unsafe(method(mouseMoved:))]
+            fn mouse_moved(&self, event: &NSEvent) {
+                let Some(mtm) = MainThreadMarker::new() else {
+                    return;
+                };
+                let Some(app) = OVERLAY_APP.get() else {
+                    return;
+                };
+                let Some((is_bg, web_x, web_y, visible)) = with_overlay_ns_window(app, |win| {
+                    let (x, y) = web_coords_from_event(win, event);
+                    (window_is_background(mtm, win), x, y, win.isVisible())
+                }) else {
+                    return;
+                };
+                if !visible || !is_bg {
+                    return;
+                }
+
+                let now = std::time::Instant::now();
+                let (should_emit, cursor) = {
+                    let mut state = hover_state().lock();
+                    if state.dragging {
+                        return;
+                    }
+                    state.inside = true;
+                    if state.desired_cursor == OverlayCursor::Default {
+                        state.desired_cursor = OverlayCursor::Grab;
+                    }
+                    let cursor = state.desired_cursor;
+                    state.cursor_applied_in_background = cursor != OverlayCursor::Default;
+                    let emit = should_emit_hover_move(state.last_move_emit, now);
+                    if emit {
+                        state.last_move_emit = Some(now);
+                    }
+                    (emit, cursor)
+                };
+
+                set_ns_cursor(cursor);
+                if should_emit {
+                    let _ = app.emit(
+                        OVERLAY_HOVER_EVENT,
+                        OverlayHoverPayload {
+                            inside: true,
+                            x: web_x,
+                            y: web_y,
+                        },
+                    );
+                }
+            }
+
+            #[unsafe(method(cursorUpdate:))]
+            fn cursor_update(&self, _event: &NSEvent) {
+                let Some(mtm) = MainThreadMarker::new() else {
+                    return;
+                };
+                let Some(app) = OVERLAY_APP.get() else {
+                    return;
+                };
+                let is_bg = with_overlay_ns_window(app, |win| {
+                    win.isVisible() && window_is_background(mtm, win)
+                })
+                .unwrap_or(false);
+                if !is_bg {
+                    return;
+                }
+                let cursor = {
+                    let mut state = hover_state().lock();
+                    if !state.inside || state.dragging {
+                        return;
+                    }
+                    if state.desired_cursor == OverlayCursor::Default {
+                        state.desired_cursor = OverlayCursor::Grab;
+                    }
+                    state.cursor_applied_in_background = true;
+                    state.desired_cursor
+                };
+                set_ns_cursor(cursor);
+            }
+
+            #[unsafe(method(mouseExited:))]
+            fn mouse_exited(&self, _event: &NSEvent) {
+                let Some(app) = OVERLAY_APP.get() else {
+                    return;
+                };
+                let (dragging, restore_cursor) = {
+                    let mut state = hover_state().lock();
+                    state.inside = false;
+                    state.last_move_emit = None;
+                    if state.dragging {
+                        (true, false)
+                    } else {
+                        state.desired_cursor = OverlayCursor::Default;
+                        let had_bg = state.cursor_applied_in_background;
+                        state.cursor_applied_in_background = false;
+                        (false, had_bg)
+                    }
+                };
+                if dragging {
+                    return;
+                }
+                if restore_cursor {
+                    NSCursor::arrowCursor().set();
+                }
+                let _ = app.emit(
+                    OVERLAY_HOVER_EVENT,
+                    OverlayHoverPayload {
+                        inside: false,
+                        x: -1.0,
+                        y: -1.0,
+                    },
+                );
+            }
+        }
+    );
+
+    impl OverlayHoverTracker {
+        fn new(mtm: MainThreadMarker) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(());
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    pub fn install_hover_tracker(app: &AppHandle, window: &WebviewWindow) {
+        let _ = OVERLAY_APP.set(app.clone());
+        let Ok(ns_window_ptr) = window.ns_window() else {
+            return;
+        };
+        let ns_window_addr = ns_window_ptr as usize;
+        let _ = window.run_on_main_thread(move || {
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            // SAFETY: pointer belongs to the live overlay window and runs on main thread.
+            let ns_window = unsafe { &*(ns_window_addr as *const NSWindow) };
+            let Some(content_view) = ns_window.contentView() else {
+                return;
+            };
+
+            let tracker_ptr = if TRACKER_INSTANCE.load(Ordering::Acquire).is_null() {
+                let tracker = OverlayHoverTracker::new(mtm);
+                let raw = Retained::into_raw(tracker);
+                TRACKER_INSTANCE.store(raw, Ordering::Release);
+                raw
+            } else {
+                TRACKER_INSTANCE.load(Ordering::Acquire)
+            };
+
+            let options = NSTrackingAreaOptions::MouseEnteredAndExited
+                | NSTrackingAreaOptions::MouseMoved
+                | NSTrackingAreaOptions::CursorUpdate
+                | NSTrackingAreaOptions::ActiveAlways
+                | NSTrackingAreaOptions::InVisibleRect;
+            let owner = unsafe { &*(tracker_ptr as *const AnyObject) };
+            let area = unsafe {
+                NSTrackingArea::initWithRect_options_owner_userInfo(
+                    NSTrackingArea::alloc(),
+                    NSRect::ZERO,
+                    options,
+                    Some(owner),
+                    None,
+                )
+            };
+            content_view.addTrackingArea(&area);
+        });
+    }
+
+    pub fn apply_cursor(app: &AppHandle, cursor: OverlayCursor) {
+        {
+            let mut state = hover_state().lock();
+            if state.dragging && cursor != OverlayCursor::Grabbing {
+                return;
+            }
+            if !state.inside
+                && cursor != OverlayCursor::Grabbing
+                && cursor != OverlayCursor::Default
+            {
+                return;
+            }
+            state.desired_cursor = cursor;
+        }
+
+        let Some(window) = app.get_webview_window(OVERLAY_LABEL) else {
+            return;
+        };
+        let app_clone = app.clone();
+        let _ = window.run_on_main_thread(move || {
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            let Some((visible, is_bg)) = with_overlay_ns_window(&app_clone, |win| {
+                (win.isVisible(), window_is_background(mtm, win))
+            }) else {
+                return;
+            };
+            if !visible {
+                return;
+            }
+            let effective = {
+                let mut state = hover_state().lock();
+                if state.dragging {
+                    OverlayCursor::Grabbing
+                } else if !state.inside && state.desired_cursor != OverlayCursor::Default {
+                    return;
+                } else {
+                    if is_bg {
+                        state.cursor_applied_in_background =
+                            state.desired_cursor != OverlayCursor::Default;
+                    }
+                    state.desired_cursor
+                }
+            };
+            set_ns_cursor(effective);
+        });
+    }
+
+    pub fn reset_cursor_to_arrow(app: &AppHandle) {
+        if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
+            let _ = window.run_on_main_thread(|| {
+                NSCursor::arrowCursor().set();
+            });
+        }
+    }
+
+    pub fn pointer_inside_visible_overlay(app: &AppHandle) -> bool {
+        if MainThreadMarker::new().is_none() {
+            return false;
+        }
+        with_overlay_ns_window(app, |win| win.isVisible() && pointer_inside_window(win))
+            .unwrap_or(false)
+    }
+
+    /// 胶囊刚好弹在鼠标指针正下方时，立刻同步一次 hover 状态和后台抓手光标。
+    pub fn sync_initial_hover_if_pointer_inside(app: &AppHandle) {
+        let Some(window) = app.get_webview_window(OVERLAY_LABEL) else {
+            return;
+        };
+        let app_clone = app.clone();
+        let _ = window.run_on_main_thread(move || {
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            let Some((inside, is_bg, web_x, web_y)) = with_overlay_ns_window(&app_clone, |win| {
+                let inside = win.isVisible() && pointer_inside_window(win);
+                let (x, y) = if inside {
+                    web_coords_from_pointer(win)
+                } else {
+                    (-1.0, -1.0)
+                };
+                (inside, window_is_background(mtm, win), x, y)
+            }) else {
+                return;
+            };
+            if !inside {
+                return;
+            }
+            {
+                let mut state = hover_state().lock();
+                state.inside = true;
+                if !state.dragging && state.desired_cursor == OverlayCursor::Default {
+                    state.desired_cursor = OverlayCursor::Grab;
+                }
+                if is_bg {
+                    state.cursor_applied_in_background = true;
+                }
+            }
+            if is_bg {
+                set_ns_cursor(OverlayCursor::Grab);
+            }
+            let _ = app_clone.emit(
+                OVERLAY_HOVER_EVENT,
+                OverlayHoverPayload {
+                    inside: true,
+                    x: web_x,
+                    y: web_y,
+                },
+            );
+        });
+    }
+
+    pub async fn perform_overlay_drag(app: AppHandle) -> Result<bool, String> {
+        let Some(window) = app.get_webview_window(OVERLAY_LABEL) else {
+            return Ok(false);
+        };
+        let ns_window_addr = window
+            .ns_window()
+            .map_err(|e| format!("读取胶囊窗口失败：{e}"))? as usize;
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<bool, String>>();
+        let app_for_main = app.clone();
+        window
+            .run_on_main_thread(move || {
+                let result = (|| -> Result<bool, String> {
+                    let Some(mtm) = MainThreadMarker::new() else {
+                        return Err("胶囊拖拽必须在主线程执行。".into());
+                    };
+                    // 如果用户极快轻点空白处已经松开鼠标左键，不再启动拖拽循环，
+                    // 但仍需把刚才首击激活抢到的焦点还回原窗口。
+                    if (NSEvent::pressedMouseButtons() & 1) == 0 {
+                        restore_overlay_focus(&app_for_main);
+                        return Ok(false);
+                    }
+
+                    // SAFETY: pointer belongs to the live overlay window and runs on main thread.
+                    let ns_window = unsafe { &*(ns_window_addr as *const NSWindow) };
+                    let ns_app = NSApplication::sharedApplication(mtm);
+
+                    // 优先复用当前有效的 LeftMouseDown / LeftMouseDragged；
+                    // 后台首击或异步 IPC 时 currentEvent 可能是 AppKitDefined 等非鼠标事件，
+                    // 此时用当前指针窗口局部坐标构造合法的 LeftMouseDown，避免拖拽失效。
+                    let drag_event = ns_app
+                        .currentEvent()
+                        .filter(|ev| {
+                            let ty = ev.r#type();
+                            (ty == NSEventType::LeftMouseDown
+                                || ty == NSEventType::LeftMouseDragged)
+                                && ev.windowNumber() == ns_window.windowNumber()
+                        })
+                        .or_else(|| {
+                            let win_loc =
+                                ns_window.convertPointFromScreen(NSEvent::mouseLocation());
+                            let uptime = NSProcessInfo::processInfo().systemUptime();
+                            NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                                NSEventType::LeftMouseDown,
+                                win_loc,
+                                NSEventModifierFlags::empty(),
+                                uptime,
+                                ns_window.windowNumber(),
+                                None,
+                                0,
+                                1,
+                                1.0,
+                            )
+                        });
+
+                    let Some(drag_event) = drag_event else {
+                        return Ok(false);
+                    };
+
+                    {
+                        let mut state = hover_state().lock();
+                        state.dragging = true;
+                        state.desired_cursor = OverlayCursor::Grabbing;
+                    }
+                    set_ns_cursor(OverlayCursor::Grabbing);
+
+                    let drag_outcome = objc2::exception::catch(AssertUnwindSafe(|| {
+                        ns_window.performWindowDragWithEvent(&drag_event);
+                    }));
+
+                    note_overlay_interaction();
+                    let still_inside = ns_window.isVisible() && pointer_inside_window(ns_window);
+                    let (web_x, web_y) = if still_inside {
+                        web_coords_from_pointer(ns_window)
+                    } else {
+                        (-1.0, -1.0)
+                    };
+
+                    {
+                        let mut state = hover_state().lock();
+                        state.dragging = false;
+                        state.inside = still_inside;
+                        state.desired_cursor = if still_inside {
+                            OverlayCursor::Grab
+                        } else {
+                            OverlayCursor::Default
+                        };
+                        state.cursor_applied_in_background = still_inside;
+                    }
+
+                    persist_current_overlay_position(&app_for_main);
+                    restore_overlay_focus(&app_for_main);
+
+                    if still_inside {
+                        set_ns_cursor(OverlayCursor::Grab);
+                    } else {
+                        set_ns_cursor(OverlayCursor::Default);
+                    }
+                    let _ = app_for_main.emit(
+                        OVERLAY_HOVER_EVENT,
+                        OverlayHoverPayload {
+                            inside: still_inside,
+                            x: web_x,
+                            y: web_y,
+                        },
+                    );
+
+                    if drag_outcome.is_err() {
+                        return Err("系统窗口拖拽出现异常。".into());
+                    }
+                    Ok(true)
+                })();
+                let _ = tx.send(result);
+            })
+            .map_err(|e| format!("派发胶囊拖拽失败：{e}"))?;
+
+        rx.await.map_err(|_| "胶囊拖拽意外中断。".to_string())?
+    }
 }
 
 #[cfg(test)]
@@ -885,6 +1677,46 @@ mod tests {
             pid,
             name: name.into(),
         }
+    }
+
+    #[test]
+    fn parses_overlay_cursor_variants() {
+        assert_eq!(OverlayCursor::parse("grab"), OverlayCursor::Grab);
+        assert_eq!(OverlayCursor::parse("grabbing"), OverlayCursor::Grabbing);
+        assert_eq!(OverlayCursor::parse("pointer"), OverlayCursor::Pointer);
+        assert_eq!(OverlayCursor::parse("default"), OverlayCursor::Default);
+        assert_eq!(OverlayCursor::parse("  grab  "), OverlayCursor::Grab);
+        assert_eq!(OverlayCursor::parse("unknown"), OverlayCursor::Default);
+    }
+
+    #[test]
+    fn checks_point_inside_overlay_rect_bounds() {
+        assert!(point_in_rect(100.0, 50.0, 100.0, 50.0, 376.0, 46.0));
+        assert!(point_in_rect(476.0, 96.0, 100.0, 50.0, 376.0, 46.0));
+        assert!(point_in_rect(250.0, 72.0, 100.0, 50.0, 376.0, 46.0));
+        assert!(!point_in_rect(99.9, 72.0, 100.0, 50.0, 376.0, 46.0));
+        assert!(!point_in_rect(250.0, 49.9, 100.0, 50.0, 376.0, 46.0));
+        assert!(!point_in_rect(250.0, 72.0, 100.0, 50.0, 0.0, 46.0));
+    }
+
+    #[test]
+    fn converts_cocoa_local_coordinates_to_clamped_web_coordinates() {
+        assert_eq!(cocoa_point_to_web(10.0, 46.0, 376.0, 46.0), (10.0, 0.0));
+        assert_eq!(cocoa_point_to_web(10.0, 0.0, 376.0, 46.0), (10.0, 45.0));
+        assert_eq!(cocoa_point_to_web(20.0, 30.0, 376.0, 46.0), (20.0, 16.0));
+        assert_eq!(cocoa_point_to_web(-5.0, 80.0, 376.0, 46.0), (0.0, 0.0));
+        assert_eq!(cocoa_point_to_web(999.0, -5.0, 376.0, 46.0), (375.0, 45.0));
+    }
+
+    #[test]
+    fn throttles_background_hover_move_events() {
+        let now = std::time::Instant::now();
+        assert!(should_emit_hover_move(None, now));
+        assert!(!should_emit_hover_move(
+            Some(now - std::time::Duration::from_millis(5)),
+            now
+        ));
+        assert!(should_emit_hover_move(Some(now - HOVER_MOVE_THROTTLE), now));
     }
 
     #[test]

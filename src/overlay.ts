@@ -793,6 +793,85 @@ async function persistPosition() {
   }
 }
 
+type OverlayCursorKind = "default" | "grab" | "grabbing" | "pointer";
+type OverlayHoverEvent = {
+  inside: boolean;
+  x: number;
+  y: number;
+};
+
+let activeCursor: OverlayCursorKind = "default";
+let dragInFlight = false;
+let hoveredControl: HTMLElement | null = null;
+let capsuleHovered = false;
+let lastHoverPoint: { x: number; y: number } | null = null;
+
+function syncNativeCursor(next: OverlayCursorKind) {
+  if (next === activeCursor) return;
+  activeCursor = next;
+  void invoke("set_overlay_cursor", { cursor: next }).catch(() => {
+    // 同步光标失败不影响胶囊功能。
+  });
+}
+
+function restoreOverlayFocus() {
+  void invoke("restore_overlay_focus").catch(() => {
+    // 归还焦点失败不影响听写主流程。
+  });
+}
+
+function updateHoverTarget(target: HTMLElement | null) {
+  const nextControl = target?.closest<HTMLButtonElement>("button:not(:disabled)") ?? null;
+  if (hoveredControl !== nextControl) {
+    hoveredControl?.classList.remove("hovered");
+    nextControl?.classList.add("hovered");
+    hoveredControl = nextControl;
+  }
+  const onContent = Boolean(target?.closest("#drag-region"));
+  contentEl()?.classList.toggle("hovered", onContent);
+  if (!dragInFlight) {
+    syncNativeCursor(nextControl ? "pointer" : "grab");
+  }
+}
+
+function clearHoverVisuals() {
+  capsuleHovered = false;
+  lastHoverPoint = null;
+  capsule()?.classList.remove("hovered");
+  hoveredControl?.classList.remove("hovered");
+  hoveredControl = null;
+  contentEl()?.classList.remove("hovered");
+  if (!dragInFlight) {
+    syncNativeCursor("default");
+  }
+}
+
+function refreshResultTargetIfNeeded() {
+  if (!resultActive) return;
+  void invoke("refresh_overlay_target").catch(() => {
+    // 刷新失败沿用原目标，不影响重试或复制。
+  });
+}
+
+function applyNativeHover(payload: OverlayHoverEvent) {
+  if (!payload.inside) {
+    clearHoverVisuals();
+    return;
+  }
+  if (!capsuleHovered) {
+    capsuleHovered = true;
+    refreshResultTargetIfNeeded();
+  }
+  capsule()?.classList.add("hovered");
+  if (payload.x >= 0 && payload.y >= 0) {
+    lastHoverPoint = { x: payload.x, y: payload.y };
+    const hit = document.elementFromPoint(payload.x, payload.y) as HTMLElement | null;
+    updateHoverTarget(hit);
+  } else if (!dragInFlight) {
+    syncNativeCursor("grab");
+  }
+}
+
 /**
  * 胶囊自己会把 JackVoice 激活到前台，macOS 随后补发一个 Reopen（相当于
  * 点了程序坞图标）。把「刚刚是胶囊被点」这件事告诉后端，它才只吞掉紧跟着
@@ -806,11 +885,25 @@ function noteInteraction() {
 
 window.addEventListener("DOMContentLoaded", async () => {
   document.querySelector("#capsule")?.addEventListener("mousedown", noteInteraction, true);
-  document.querySelector("#capsule")?.addEventListener("mouseenter", () => {
-    if (!resultActive) return;
-    void invoke("refresh_overlay_target").catch(() => {
-      // 刷新失败沿用原目标，不影响重试或复制。
-    });
+  capsule()?.addEventListener("mouseenter", (e) => {
+    if (!capsuleHovered) {
+      capsuleHovered = true;
+      refreshResultTargetIfNeeded();
+    }
+    lastHoverPoint = { x: e.clientX, y: e.clientY };
+    capsule()?.classList.add("hovered");
+    updateHoverTarget(e.target as HTMLElement | null);
+  });
+  capsule()?.addEventListener("mousemove", (e) => {
+    if (!capsuleHovered) {
+      capsuleHovered = true;
+      capsule()?.classList.add("hovered");
+    }
+    lastHoverPoint = { x: e.clientX, y: e.clientY };
+    updateHoverTarget(e.target as HTMLElement | null);
+  });
+  capsule()?.addEventListener("mouseleave", () => {
+    clearHoverVisuals();
   });
   capsule()?.addEventListener("animationend", (e) => {
     if (e.animationName === "long-take-pulse") capsule()?.classList.remove("long-pulse");
@@ -843,6 +936,8 @@ window.addEventListener("DOMContentLoaded", async () => {
       }
     } catch (err) {
       console.error("toggle session pin failed", err);
+    } finally {
+      restoreOverlayFocus();
     }
   });
   copyBtn()?.addEventListener("click", (e) => {
@@ -857,12 +952,14 @@ window.addEventListener("DOMContentLoaded", async () => {
   expandBtn()?.addEventListener("click", (e) => {
     e.stopPropagation();
     toggleExpanded();
+    restoreOverlayFocus();
   });
   jumpBtn()?.addEventListener("click", (e) => {
     e.stopPropagation();
     setFollowLatest(true);
     const el = sheetScrollEl();
     el?.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    restoreOverlayFocus();
   });
 
   // 只有用户自己滚动才改变「跟随最新」：新文字撑高、窗口变高引起的滚动不算。
@@ -886,18 +983,59 @@ window.addEventListener("DOMContentLoaded", async () => {
     { passive: true },
   );
 
-  // 按住拖动胶囊；没挪动就松开算点击：点状态和文字那一栏也能展开 / 收起。
+  async function beginOverlayDrag() {
+    if (dragInFlight) return;
+    dragInFlight = true;
+    capsule()?.classList.add("dragging");
+    syncNativeCursor("grabbing");
+    try {
+      await invoke<boolean>("start_overlay_drag");
+    } catch {
+      try {
+        await getCurrentWindow().startDragging();
+      } catch {
+        // no-op
+      }
+      await persistPosition();
+      restoreOverlayFocus();
+    } finally {
+      dragInFlight = false;
+      capsule()?.classList.remove("dragging");
+      activeCursor = "default";
+      if (capsuleHovered) {
+        if (lastHoverPoint) {
+          const hit = document.elementFromPoint(
+            lastHoverPoint.x,
+            lastHoverPoint.y,
+          ) as HTMLElement | null;
+          updateHoverTarget(hit);
+        } else {
+          syncNativeCursor("grab");
+        }
+      }
+      // 拖到屏幕另一半后，下次展开的方向也跟着变。
+      if (overflowing && !expanded) void refreshGrowDirection();
+    }
+  }
+
+  // 非展开文字区按下去即刻拖拽；可展开文字栏通过 3px 阈值区分点击展开与拖动。
   let press: { x: number; y: number; onContent: boolean } | null = null;
   capsule()?.addEventListener("mousedown", (e) => {
     if (e.button !== 0) return;
     const target = e.target as HTMLElement | null;
     if (target?.closest("button")) return;
     e.preventDefault();
-    press = {
-      x: e.screenX,
-      y: e.screenY,
-      onContent: Boolean(target?.closest("#drag-region")),
-    };
+    const onContent = Boolean(target?.closest("#drag-region"));
+    if (onContent && (overflowing || expanded)) {
+      press = {
+        x: e.screenX,
+        y: e.screenY,
+        onContent: true,
+      };
+      syncNativeCursor("grabbing");
+      return;
+    }
+    void beginOverlayDrag();
   });
 
   window.addEventListener("mousemove", (e) => {
@@ -905,26 +1043,22 @@ window.addEventListener("DOMContentLoaded", async () => {
     const moved = Math.abs(e.screenX - press.x) + Math.abs(e.screenY - press.y);
     if (moved < DRAG_THRESHOLD_PX) return;
     press = null;
-    void (async () => {
-      try {
-        await invoke("start_overlay_drag");
-      } catch {
-        try {
-          await getCurrentWindow().startDragging();
-        } catch {
-          // no-op
-        }
-      }
-    })();
+    void beginOverlayDrag();
   });
 
   window.addEventListener("mouseup", () => {
     const clicked = press;
     press = null;
-    if (clicked?.onContent && (overflowing || expanded)) toggleExpanded();
-    void persistPosition();
-    // 拖到屏幕另一半后，下次展开的方向也跟着变。
-    if (overflowing && !expanded) void refreshGrowDirection();
+    if (clicked?.onContent && (overflowing || expanded)) {
+      toggleExpanded();
+      restoreOverlayFocus();
+      if (!dragInFlight) syncNativeCursor(capsuleHovered ? "grab" : "default");
+      return;
+    }
+    if (!dragInFlight) {
+      void persistPosition();
+      if (overflowing && !expanded) void refreshGrowDirection();
+    }
   });
 
   let lastWidth = window.innerWidth;
@@ -952,6 +1086,10 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   await listen("jackvoice://overlay-collapsed", () => {
     dropExpandedLayout();
+  });
+
+  await listen<OverlayHoverEvent>("jackvoice://overlay-hover", (event) => {
+    applyNativeHover(event.payload);
   });
 
   await listen<number>("jackvoice://level", (event) => {

@@ -574,8 +574,18 @@ fn reset_overlay_position(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn start_overlay_drag(app: AppHandle) -> Result<(), String> {
-    crate::overlay::start_overlay_drag(app)
+async fn start_overlay_drag(app: AppHandle) -> Result<bool, String> {
+    crate::overlay::start_overlay_drag(app).await
+}
+
+#[tauri::command]
+fn set_overlay_cursor(app: AppHandle, cursor: String) {
+    crate::overlay::set_overlay_cursor(&app, &cursor);
+}
+
+#[tauri::command]
+fn restore_overlay_focus(app: AppHandle) {
+    crate::overlay::restore_overlay_focus(&app);
 }
 
 #[tauri::command]
@@ -972,6 +982,8 @@ pub fn run() {
             save_overlay_position,
             reset_overlay_position,
             start_overlay_drag,
+            set_overlay_cursor,
+            restore_overlay_focus,
             overlay_grow_direction,
             set_overlay_height,
             copy_last_transcript,
